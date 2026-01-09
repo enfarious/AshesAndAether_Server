@@ -1,0 +1,26 @@
+module.exports = {
+  preset: 'ts-jest',
+  testEnvironment: 'node',
+  roots: ['<rootDir>/src'],
+  testMatch: ['**/__tests__/**/*.ts', '**/?(*.)+(spec|test).ts'],
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/src/$1',
+    '^@network/(.*)$': '<rootDir>/src/network/$1',
+    '^@world/(.*)$': '<rootDir>/src/world/$1',
+    '^@entities/(.*)$': '<rootDir>/src/entities/$1',
+    '^@pathfinding/(.*)$': '<rootDir>/src/pathfinding/$1',
+    '^@combat/(.*)$': '<rootDir>/src/combat/$1',
+    '^@ai/(.*)$': '<rootDir>/src/ai/$1',
+    '^@database/(.*)$': '<rootDir>/src/database/$1',
+    '^@systems/(.*)$': '<rootDir>/src/systems/$1',
+    '^@llm/(.*)$': '<rootDir>/src/llm/$1',
+    '^@utils/(.*)$': '<rootDir>/src/utils/$1',
+  },
+  collectCoverageFrom: [
+    'src/**/*.ts',
+    '!src/**/*.test.ts',
+    '!src/**/*.spec.ts',
+  ],
+  coverageDirectory: 'coverage',
+  verbose: true,
+};
