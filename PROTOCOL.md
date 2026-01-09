@@ -231,7 +231,8 @@ Once character is selected/created, server sends the initial world state:
       "description": "A weathered crossroads where five ancient paths converge. Moss-covered stones mark each direction, their inscriptions long faded. A sense of anticipation hangs in the air.",
       "weather": "clear",
       "timeOfDay": "dusk",
-      "lighting": "dim"
+      "lighting": "dim",
+      "contentRating": "T"  // T (Teen 13+), M (Mature 17+), AO (Adults Only 18+)
     },
 
     // Nearby entities (players, NPCs, objects)
@@ -588,9 +589,34 @@ Server can send error responses:
 
 ---
 
+## Content Ratings
+
+Every zone has a content rating that clients should display to users. This helps set expectations for mature content.
+
+### Rating Levels
+
+- **T (Teen)** - 13+: Fantasy violence, mild blood, mild profanity, suggestive themes
+- **M (Mature)** - 17+: Intense violence, blood/gore, strong profanity, sexual themes (fade-to-black)
+- **AO (Adults Only)** - 18+: Graphic violence, explicit content (with consent), extreme themes
+
+### Client Display
+
+Clients should:
+1. Display the zone's content rating prominently when entering a new zone
+2. Show a warning when entering M or AO rated zones
+3. Color code ratings for quick recognition (suggested: T=green, M=yellow, AO=red)
+4. Allow users to set content filters in their settings
+
+### Zone Transitions
+
+When a player attempts to enter a zone with a higher rating than their account allows, the server will send an `error` message with code `CONTENT_RESTRICTED`.
+
+---
+
 ## Notes
 
 - All coordinates use right-handed coordinate system: X = east/west, Y = up/down, Z = north/south
 - Timestamps are Unix epoch milliseconds
 - All string content should support UTF-8
 - Consider rate limiting on client messages (TBD: specific limits)
+- Minimum game rating is Teen (T) - combat is a core gameplay element

@@ -169,6 +169,11 @@ function displayWorld(worldEntry) {
   log(`${zone.description}`, 'reset');
   log(`Weather: ${zone.weather} | Time: ${zone.timeOfDay} | Lighting: ${zone.lighting}`, 'blue');
 
+  // Content rating display
+  const ratingNames = { T: 'Teen (13+)', M: 'Mature (17+)', AO: 'Adults Only (18+)' };
+  const ratingColor = zone.contentRating === 'AO' ? 'red' : zone.contentRating === 'M' ? 'yellow' : 'green';
+  log(`Content Rating: ${ratingNames[zone.contentRating] || zone.contentRating}`, ratingColor);
+
   // Entities
   if (worldEntry.entities.length > 0) {
     log('\nNearby:', 'yellow');

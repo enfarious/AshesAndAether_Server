@@ -227,6 +227,7 @@ export class ClientSession {
         weather: 'clear',
         timeOfDay: 'dusk',
         lighting: 'dim',
+        contentRating: 'T',  // Teen - public area with fantasy combat
       },
       entities: [
         {

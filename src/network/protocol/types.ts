@@ -134,6 +134,7 @@ export interface ZoneInfo {
   weather: string;
   timeOfDay: string;
   lighting: string;
+  contentRating: ContentRating;  // Zone's content rating
 }
 
 export interface Entity {
@@ -299,6 +300,38 @@ export interface ErrorMessage {
     originalMessage?: unknown;
   };
 }
+
+// ========== Content Ratings ==========
+
+export type ContentRating = 'T' | 'M' | 'AO';  // Teen (13+), Mature (17+), Adults Only (18+)
+
+export interface ContentRatingInfo {
+  rating: ContentRating;
+  name: string;
+  description: string;
+  ageRequirement: number;
+}
+
+export const CONTENT_RATINGS: Record<ContentRating, ContentRatingInfo> = {
+  T: {
+    rating: 'T',
+    name: 'Teen',
+    description: 'Fantasy violence, mild blood, mild profanity, suggestive themes',
+    ageRequirement: 13,
+  },
+  M: {
+    rating: 'M',
+    name: 'Mature',
+    description: 'Intense violence, blood and gore, strong profanity, sexual themes',
+    ageRequirement: 17,
+  },
+  AO: {
+    rating: 'AO',
+    name: 'Adults Only',
+    description: 'Graphic violence, explicit content, extreme themes',
+    ageRequirement: 18,
+  },
+};
 
 // ========== Union Type for All Messages ==========
 
