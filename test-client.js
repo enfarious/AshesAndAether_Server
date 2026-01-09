@@ -163,6 +163,12 @@ function displayWorld(worldEntry) {
   log(`Stamina: ${char.stamina.current}/${char.stamina.max}`, 'green');
   log(`Position: (${char.position.x}, ${char.position.y}, ${char.position.z})`, 'blue');
 
+  // Movement info
+  const headingNames = { 0: 'N', 45: 'NE', 90: 'E', 135: 'SE', 180: 'S', 225: 'SW', 270: 'W', 315: 'NW' };
+  const facingDir = headingNames[char.heading] || `${char.heading}°`;
+  const speedText = char.currentSpeed === 'stop' ? 'stationary' : `${char.currentSpeed}ing`;
+  log(`Facing: ${facingDir} (${char.heading}°) | Status: ${speedText}`, 'cyan');
+
   // Zone info
   const zone = worldEntry.zone;
   log(`\nLocation: ${zone.name}`, 'yellow');

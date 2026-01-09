@@ -210,6 +210,7 @@ export class ClientSession {
         id: this.characterId,
         name: 'Test Character',
         position: { x: 100, y: 0, z: 250 },
+        heading: 0,  // Facing north
         rotation: { x: 0, y: 0, z: 0 },
         health: { current: 100, max: 100 },
         stamina: { current: 100, max: 100 },
@@ -218,6 +219,7 @@ export class ClientSession {
           agility: 10,
           intelligence: 10,
         },
+        currentSpeed: 'stop',  // Not moving initially
       },
       zone: {
         id: 'zone-crossroads',

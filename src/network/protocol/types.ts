@@ -121,10 +121,12 @@ export interface CharacterState {
   id: string;
   name: string;
   position: Vector3;
-  rotation: Vector3;
+  heading: number;  // 0-360 degrees, 0 = north, 90 = east, 180 = south, 270 = west
+  rotation: Vector3;  // Full 3D rotation for VR/3D clients (pitch, yaw, roll)
   health: { current: number; max: number };
   stamina: { current: number; max: number };
   stats: Record<string, number>;
+  currentSpeed?: 'walk' | 'jog' | 'run' | 'stop';  // Current movement speed (optional)
 }
 
 export interface ZoneInfo {
@@ -196,14 +198,25 @@ export interface StateUpdateMessage {
 
 // ========== Player Actions ==========
 
-export type MoveMethod = 'direction' | 'position' | 'path';
+export type MoveMethod = 'heading' | 'position' | 'compass';
+export type MovementSpeed = 'walk' | 'jog' | 'run' | 'stop';
+export type CompassDirection = 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
 
 export interface MoveMessage {
   type: 'move';
   payload: {
     method: MoveMethod;
-    direction?: string; // For text clients
-    position?: Vector3; // For graphical clients
+
+    // For heading method (all clients)
+    speed?: MovementSpeed;    // walk, jog, run, stop
+    heading?: number;          // 0-360 degrees (optional, uses current if omitted)
+
+    // For compass method (text clients, converted to heading)
+    compass?: CompassDirection; // N, NE, E, SE, S, SW, W, NW
+
+    // For position method (direct position - 3D/VR clients)
+    position?: Vector3;
+
     timestamp: number;
   };
 }
@@ -332,6 +345,35 @@ export const CONTENT_RATINGS: Record<ContentRating, ContentRatingInfo> = {
     ageRequirement: 18,
   },
 };
+
+// ========== Movement Helpers ==========
+
+// Compass direction to heading conversion
+export const COMPASS_TO_HEADING: Record<CompassDirection, number> = {
+  N: 0,
+  NE: 45,
+  E: 90,
+  SE: 135,
+  S: 180,
+  SW: 225,
+  W: 270,
+  NW: 315,
+};
+
+// Speed multipliers for movement calculations
+export const SPEED_MULTIPLIERS: Record<MovementSpeed, number> = {
+  walk: 1.0,
+  jog: 2.0,
+  run: 3.5,
+  stop: 0.0,
+};
+
+// Text-specific movement info sent to text clients
+export interface TextMovementInfo {
+  availableDirections: CompassDirection[];  // Valid directions from navmesh
+  currentHeading: number;                   // Current facing direction (0-360)
+  currentSpeed: MovementSpeed;              // Current movement speed
+}
 
 // ========== Union Type for All Messages ==========
 

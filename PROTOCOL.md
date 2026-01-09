@@ -328,18 +328,49 @@ The server sends periodic updates about world changes:
 
 #### Movement:
 
+The server uses a unified 3D movement system with heading (0-360°). See [MOVEMENT_SYSTEM.md](docs/MOVEMENT_SYSTEM.md) for complete details.
+
+**Method 1: Heading (Universal)**
 ```json
 {
   "type": "move",
   "payload": {
-    "method": "direction",  // "direction" | "position" | "path"
-    "direction": "north",  // For text clients: "north", "south", etc.
-    // OR
-    "position": { "x": 105, "y": 0, "z": 245 },  // For graphical clients
+    "method": "heading",
+    "speed": "jog",        // "walk" | "jog" | "run" | "stop"
+    "heading": 45,         // 0-360 degrees (0=north, optional: uses current if omitted)
     "timestamp": 1234567890
   }
 }
 ```
+
+**Method 2: Compass (Text Clients)**
+```json
+{
+  "type": "move",
+  "payload": {
+    "method": "compass",
+    "speed": "walk",
+    "compass": "NE",       // "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW"
+    "timestamp": 1234567890
+  }
+}
+```
+
+**Method 3: Position (3D/VR Clients)**
+```json
+{
+  "type": "move",
+  "payload": {
+    "method": "position",
+    "position": { "x": 105, "y": 0, "z": 245 },
+    "timestamp": 1234567890
+  }
+}
+```
+
+**Text Command Format:** `Speed.Direction`
+- Examples: `Walk.N`, `Jog.NE`, `Run.045`, `Stop`
+- Perfect for LLM integration
 
 #### Chat/Communication:
 
