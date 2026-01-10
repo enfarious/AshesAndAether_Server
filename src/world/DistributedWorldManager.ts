@@ -2,7 +2,8 @@ import { logger } from '@/utils/logger';
 import { ZoneService } from '@/database';
 import { ZoneManager } from './ZoneManager';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
-import type { Character } from '@prisma/client';
+import { NPCAIController, LLMService } from '@/ai';
+import type { Character, Companion } from '@prisma/client';
 
 /**
  * Distributed World Manager - manages zones across multiple servers
@@ -13,13 +14,18 @@ import type { Character } from '@prisma/client';
 export class DistributedWorldManager {
   private zones: Map<string, ZoneManager> = new Map();
   private characterToZone: Map<string, string> = new Map();
+  private npcControllers: Map<string, NPCAIController> = new Map(); // companionId -> controller
+  private llmService: LLMService;
+  private recentChatMessages: Map<string, { sender: string; channel: string; message: string; timestamp: number }[]> = new Map(); // zoneId -> messages
 
   constructor(
     private messageBus: MessageBus,
     private zoneRegistry: ZoneRegistry,
     private serverId: string,
     private assignedZoneIds: string[] = [] // Zones this server should manage
-  ) {}
+  ) {
+    this.llmService = new LLMService();
+  }
 
   /**
    * Initialize world manager - load assigned zones
@@ -46,6 +52,9 @@ export class DistributedWorldManager {
       await zoneManager.initialize();
       this.zones.set(zone.id, zoneManager);
 
+      // Initialize NPC AI controllers for this zone
+      await this.initializeNPCsForZone(zoneId);
+
       // Register zone in registry
       await this.zoneRegistry.assignZone(zoneId, this.serverId);
     }
@@ -53,7 +62,26 @@ export class DistributedWorldManager {
     // Subscribe to zone input messages
     await this.subscribeToZoneMessages();
 
-    logger.info(`Distributed world manager initialized with ${this.zones.size} zones`);
+    logger.info(
+      {
+        zoneCount: this.zones.size,
+        npcCount: this.npcControllers.size,
+      },
+      'Distributed world manager initialized'
+    );
+  }
+
+  /**
+   * Initialize NPC AI controllers for a zone
+   */
+  private async initializeNPCsForZone(zoneId: string): Promise<void> {
+    const companions = await ZoneService.getCompanionsInZone(zoneId);
+
+    for (const companion of companions) {
+      const controller = new NPCAIController(companion);
+      this.npcControllers.set(companion.id, controller);
+      logger.debug({ companionId: companion.id, name: companion.name, zone: zoneId }, 'NPC AI controller initialized');
+    }
   }
 
   /**
@@ -233,7 +261,175 @@ export class DistributedWorldManager {
       });
     }
 
+    // Track message for NPC AI context
+    this.trackChatMessage(zoneId, sender.name, channel, formattedMessage);
+
+    // Trigger NPC responses
+    await this.triggerNPCResponses(zoneId, senderPosition, range);
+
     logger.debug({ characterId, channel, recipientCount: nearbySocketIds.length }, 'Chat message broadcast');
+  }
+
+  /**
+   * Track recent chat messages for NPC AI context
+   */
+  private trackChatMessage(zoneId: string, sender: string, channel: string, message: string): void {
+    if (!this.recentChatMessages.has(zoneId)) {
+      this.recentChatMessages.set(zoneId, []);
+    }
+
+    const messages = this.recentChatMessages.get(zoneId)!;
+    messages.push({ sender, channel, message, timestamp: Date.now() });
+
+    // Keep only last 20 messages, cleanup old ones (>5 min)
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    this.recentChatMessages.set(
+      zoneId,
+      messages.filter(m => m.timestamp > fiveMinutesAgo).slice(-20)
+    );
+  }
+
+  /**
+   * Trigger NPC AI responses for NPCs in range of the message
+   */
+  private async triggerNPCResponses(zoneId: string, messageOrigin: { x: number; y: number; z: number }, range: number): Promise<void> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    // Get recent messages for this zone
+    const recentMessages = this.recentChatMessages.get(zoneId) || [];
+    const contextMessages = recentMessages.slice(-5).map(m => ({
+      sender: m.sender,
+      channel: m.channel,
+      message: m.message,
+    }));
+
+    // Find NPCs in range
+    const nearbyNPCs = await this.getNearbyNPCs(zoneId, messageOrigin, range);
+
+    // Trigger AI response for each nearby NPC
+    for (const companion of nearbyNPCs) {
+      const controller = this.npcControllers.get(companion.id);
+      if (!controller) continue;
+
+      // Calculate proximity roster for this NPC
+      const npcPosition = {
+        x: companion.positionX,
+        y: companion.positionY,
+        z: companion.positionZ,
+      };
+      const roster = zoneManager.calculateProximityRoster(companion.id);
+      if (!roster) continue;
+
+      // Generate and broadcast NPC response
+      this.handleNPCResponse(companion, roster, contextMessages, zoneId);
+    }
+  }
+
+  /**
+   * Get NPCs near a position
+   */
+  private async getNearbyNPCs(zoneId: string, position: { x: number; y: number; z: number }, range: number): Promise<Companion[]> {
+    const companions = await ZoneService.getCompanionsInZone(zoneId);
+
+    return companions.filter(companion => {
+      const dx = companion.positionX - position.x;
+      const dy = companion.positionY - position.y;
+      const dz = companion.positionZ - position.z;
+      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      return distance <= range;
+    });
+  }
+
+  /**
+   * Handle NPC AI response (async, doesn't block)
+   */
+  private async handleNPCResponse(
+    companion: Companion,
+    proximityRoster: any,
+    recentMessages: { sender: string; channel: string; message: string }[],
+    zoneId: string
+  ): Promise<void> {
+    try {
+      const response = await this.llmService.generateNPCResponse(
+        companion,
+        proximityRoster,
+        recentMessages,
+        [] // TODO: Load conversation history from database
+      );
+
+      if (response.action === 'none') return;
+
+      // Broadcast NPC response
+      await this.broadcastNPCMessage(companion, response, zoneId);
+
+      logger.debug({
+        companionId: companion.id,
+        action: response.action,
+        channel: response.channel,
+      }, 'NPC responded');
+
+    } catch (error) {
+      logger.error({ error, companionId: companion.id }, 'NPC AI response failed');
+    }
+  }
+
+  /**
+   * Broadcast NPC chat/emote message
+   */
+  private async broadcastNPCMessage(companion: Companion, response: any, zoneId: string): Promise<void> {
+    if (!response.message) return;
+
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const ranges = {
+      say: 6.096,     // 20 feet
+      shout: 45.72,   // 150 feet
+      emote: 45.72,   // 150 feet
+    };
+
+    const range = ranges[response.channel as keyof typeof ranges] || 6.096;
+    const npcPosition = {
+      x: companion.positionX,
+      y: companion.positionY,
+      z: companion.positionZ,
+    };
+
+    // Get nearby player socket IDs
+    const nearbySocketIds = zoneManager.getPlayerSocketIdsInRange(npcPosition, range);
+
+    // Format message
+    let formattedMessage = response.message;
+    if (response.channel === 'emote') {
+      formattedMessage = `${companion.name} ${response.message}`;
+    }
+
+    // Track NPC message
+    this.trackChatMessage(zoneId, companion.name, response.channel, formattedMessage);
+
+    // Broadcast to nearby players
+    for (const socketId of nearbySocketIds) {
+      const clientMessage: ClientMessagePayload = {
+        socketId,
+        event: 'chat',
+        data: {
+          channel: response.channel,
+          sender: companion.name,
+          senderId: companion.id,
+          message: formattedMessage,
+          timestamp: Date.now(),
+        },
+      };
+
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: '',
+        socketId,
+        payload: clientMessage,
+        timestamp: Date.now(),
+      });
+    }
   }
 
   /**
