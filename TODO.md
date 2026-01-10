@@ -76,13 +76,13 @@ All clients connect to the same server, see the same world, interact with same p
 
 ### Phase 2: LLM Integration
 
-4. **LLM Airlock Completion**
+1. **LLM Airlock Completion**
    - Natural language command processing
    - LLM-controlled NPCs
    - Dynamic dialogue system
    - Narrator personality and tone
 
-5. **NPC Intelligence**
+2. **NPC Intelligence**
    - LLMs control NPC behavior
    - Contextual responses
    - Quest generation
@@ -90,25 +90,25 @@ All clients connect to the same server, see the same world, interact with same p
 
 ### Phase 3: Additional Clients
 
-6. **2D Web Client**
+1. **2D Web Client**
    - Browser-based, top-down view
    - WebGL or Canvas rendering
    - Point-and-click interface
    - Guild management features
 
-7. **3D Client (Unity/Godot)**
+2. **3D Client (Unity/Godot)**
    - Traditional MMO experience
    - Full 3D rendering of upstate NY
    - Keyboard+mouse controls
    - No VR required
 
-8. **AR Client**
+3. **AR Client**
    - Mobile GPS-based exploration
    - Real-world location = game location
    - Camera overlay
    - Casual/exploration focus
 
-9. **VR Client**
+4. **VR Client**
    - Full immersion option
    - Same world as other clients
    - Hand tracking, voice commands
@@ -117,12 +117,14 @@ All clients connect to the same server, see the same world, interact with same p
 ## Technical Roadmap
 
 **Immediate (Week 1-2):**
+
 - [ ] Test distributed server with Redis
 - [ ] Build basic text client
 - [ ] Implement core commands (move, look, say, examine)
 - [ ] Add narrator responses to actions
 
 **Short-term (Month 1):**
+
 - [ ] Import OpenStreetMap data for Stephentown region
 - [ ] Generate zones from real geography
 - [ ] Implement LLM narrator system
@@ -131,6 +133,7 @@ All clients connect to the same server, see the same world, interact with same p
 - [ ] Create character races (Changed types)
 
 **Medium-term (Months 2-3):**
+
 - [ ] Expand to full 4-county region
 - [ ] Build 2D web client
 - [ ] Implement crafting system
@@ -139,6 +142,7 @@ All clients connect to the same server, see the same world, interact with same p
 - [ ] Quest generation via LLM
 
 **Long-term (Months 4-6):**
+
 - [ ] 3D client (Unity/Godot)
 - [ ] Combat system refinement
 - [ ] AR client prototype

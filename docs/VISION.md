@@ -9,9 +9,11 @@ A post-apocalyptic MMO set in upstate New York, 100 years after The 37-Hour War 
 ## What Makes This Different
 
 ### 1. Single-Shard Architecture
+
 No "World 1, World 2" separation. Everyone plays in the same universe. Meet anyone, anywhere, regardless of which client they use.
 
 ### 2. Real Geography
+
 - **Actual locations**: Stephentown NY, Berkshire County MA, Rensselaer/Albany Counties NY
 - **OpenStreetMap data**: Real roads, real buildings, real landmarks
 - **Transformed by The Event**: Familiar places made strange and dangerous
@@ -22,36 +24,42 @@ No "World 1, World 2" separation. Everyone plays in the same universe. Meet anyo
 All connect to the same server, see the same world, interact with the same players:
 
 **Text Client (MUD/MOO)**
+
 - Classic text commands (`look`, `move`, `say`, `examine`)
 - Screen reader accessible
 - Low bandwidth, work-friendly
 - Pure nostalgia for MUD veterans
 
 **LLM Airlock**
+
 - Natural language interface
 - AI Narrator for critical moments
 - LLM-controlled NPCs
 - Dynamic storytelling
 
 **2D Client (Web)**
+
 - Browser-based, isometric/top-down
 - Point-and-click interface
 - Quick sessions, guild management
 - Low-spec friendly
 
 **3D Client (Unity/Godot)**
+
 - Traditional MMO experience
 - Keyboard + mouse controls
 - Full 3D world, no VR required
 - Main experience for many
 
 **VR Client**
+
 - Full immersion option
 - Same world as other clients
 - Hand tracking, voice commands
 - Deep dive experience
 
 **AR Client (Mobile)**
+
 - GPS-based real-world exploration
 - Camera overlay
 - Walk around actual Stephentown
@@ -60,6 +68,7 @@ All connect to the same server, see the same world, interact with the same playe
 ### 4. The Unreliable Narrator
 
 An AI voice that appears during critical moments:
+
 - When you roll dice
 - When danger approaches
 - When you discover something
@@ -89,6 +98,7 @@ Players learn to read the Narrator's tone, silences, and level of detail.
 World War III was declared. Nukes launched... but never landed.
 
 For exactly 37 hours, AI-deployed nanotech swept the planet:
+
 - Billions died
 - Humanity transformed
 - Reality became flexible
@@ -115,6 +125,7 @@ Some barely changed. Others transformed completely:
 **Upstate New York Testing Grounds**
 
 This area experienced unique anomalies during The Event:
+
 - Higher transformation rates
 - Nanotech corruption zones
 - Reality fluctuations
@@ -141,6 +152,7 @@ This area experienced unique anomalies during The Event:
 ### Server Architecture
 
 **Built for scale from day one:**
+
 - Distributed zones across servers
 - Redis message bus
 - Single-shard world state
@@ -148,6 +160,7 @@ This area experienced unique anomalies during The Event:
 - Horizontal scaling
 
 **Six clients, one protocol:**
+
 - All send same messages (`move`, `chat`, `interact`)
 - All receive same updates (`proximity_roster`, `world_state`)
 - Client type doesn't matter to server
@@ -156,6 +169,7 @@ This area experienced unique anomalies during The Event:
 ### Development Priorities
 
 **Phase 1: Foundation**
+
 1. Text client (fastest validation)
 2. Narrator system
 3. OpenStreetMap world generation
@@ -173,6 +187,7 @@ This area experienced unique anomalies during The Event:
 ### Design Principles
 
 **Accessibility First**
+
 - Text client = screen reader compatible
 - Multiple difficulty modes
 - Colorblind-friendly UI
@@ -180,6 +195,7 @@ This area experienced unique anomalies during The Event:
 - No pay-to-win
 
 **Hobby Project Values**
+
 - Take our time
 - Iterate freely
 - Experiment boldly
@@ -187,6 +203,7 @@ This area experienced unique anomalies during The Event:
 - Quality over speed
 
 **Community Focused**
+
 - Single shard = everyone together
 - Cross-client interaction
 - Real geography = local communities
@@ -196,12 +213,15 @@ This area experienced unique anomalies during The Event:
 ## The Experience
 
 ### AR Player
+
 "I'm walking to the coffee shop. My phone shows corruption zones glowing near the old covered bridge. I collect nanotech essence. A dragon alert pops up - someone spotted one at Mt. Greylock."
 
 ### VR Player
+
 "I'm standing in the transformed Stephentown square. Around me, other players - some human, some Changed. I see the text player who just said hello. I wave. They see it. We team up for a raid."
 
 ### Text Player
+
 ```
 > look
 You stand in Stephentown Square. The old church looms to the north,
@@ -214,6 +234,7 @@ Narrator: "They smile. You sense no threat... yet."
 ```
 
 ### 3D Player
+
 "I'm exploring the Berkshire Mountains in full 3D. My keyboard controls feel natural. I spot an AR player's marker - they're at the actual location IRL. We both investigate the same corruption zone, them with their phone camera, me with my PC."
 
 **All in the same world. All experiencing the same event. All making choices that matter.**
@@ -228,6 +249,7 @@ Narrator: "They smile. You sense no threat... yet."
 **Traditional MMOs** - One client type, separate servers
 
 **We're building:**
+
 - One world
 - All client types
 - Same server
@@ -238,6 +260,7 @@ Narrator: "They smile. You sense no threat... yet."
 ### Technical Feasibility
 
 **We already have:**
+
 - Distributed server architecture
 - Message bus (Redis)
 - Database persistence
@@ -245,6 +268,7 @@ Narrator: "They smile. You sense no threat... yet."
 - Real-time updates
 
 **We need to add:**
+
 - Text client (easiest)
 - LLM integration (partially done)
 - Map generation (OpenStreetMap APIs available)
@@ -280,17 +304,20 @@ Narrator: "They smile. You sense no threat... yet."
 This is a **hobby project**. We iterate. We experiment. We build what's fun.
 
 **Current Status:**
+
 - Server architecture: ✅ Complete
 - Distributed zones: ✅ Complete
 - Database: ✅ Working
 - Proximity system: ✅ Working
 
 **Next Steps:**
+
 - Text client (prove the concept)
 - Narrator system (add the magic)
 - World generation (make it real)
 
 **Timeline:**
+
 - There isn't one
 - It's done when it's fun
 - We pivot when inspired
