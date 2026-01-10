@@ -161,12 +161,18 @@ export class GatewayClientSession {
 
       case 'chat':
         messageType = MessageType.PLAYER_CHAT;
+        const chatData = data as ChatMessage['payload'];
         await this.messageBus.publish(channel, {
           type: messageType,
           zoneId: this.currentZoneId,
           characterId: this.characterId,
           socketId: this.socket.id,
-          payload: data,
+          payload: {
+            characterId: this.characterId,
+            zoneId: this.currentZoneId,
+            channel: chatData.channel,
+            text: chatData.message,
+          },
           timestamp: Date.now(),
         });
         break;

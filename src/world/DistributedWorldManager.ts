@@ -167,8 +167,73 @@ export class DistributedWorldManager {
    * Handle player chat message
    */
   private async handlePlayerChat(message: MessageEnvelope): Promise<void> {
-    // TODO: Implement chat handling with range-based broadcasting
-    logger.debug({ message }, 'Chat message received (not yet implemented)');
+    const { characterId, zoneId, channel, text } = message.payload as {
+      characterId: string;
+      zoneId: string;
+      channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch';
+      text: string;
+    };
+
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    // Get sender character from database
+    const { CharacterService } = await import('@/database');
+    const sender = await CharacterService.findById(characterId);
+    if (!sender) {
+      logger.warn({ characterId }, 'Sender character not found for chat');
+      return;
+    }
+
+    // Determine range based on channel
+    const ranges = {
+      touch: 1.524,   // ~5 feet
+      say: 6.096,     // 20 feet
+      shout: 45.72,   // 150 feet
+      emote: 45.72,   // 150 feet
+      cfh: 76.2,      // 250 feet
+    };
+
+    const range = ranges[channel];
+    const senderPosition = {
+      x: sender.positionX,
+      y: sender.positionY,
+      z: sender.positionZ,
+    };
+
+    // Get nearby player socket IDs
+    const nearbySocketIds = zoneManager.getPlayerSocketIdsInRange(senderPosition, range, characterId);
+
+    // Format message based on channel
+    let formattedMessage = text;
+    if (channel === 'emote') {
+      formattedMessage = `${sender.name} ${text}`;
+    }
+
+    // Broadcast chat message to nearby players
+    for (const socketId of nearbySocketIds) {
+      const clientMessage: ClientMessagePayload = {
+        socketId,
+        event: 'chat',
+        data: {
+          channel,
+          sender: sender.name,
+          senderId: characterId,
+          message: formattedMessage,
+          timestamp: Date.now(),
+        },
+      };
+
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: '', // Don't know recipient ID from socket ID
+        socketId,
+        payload: clientMessage,
+        timestamp: Date.now(),
+      });
+    }
+
+    logger.debug({ characterId, channel, recipientCount: nearbySocketIds.length }, 'Chat message broadcast');
   }
 
   /**

@@ -109,33 +109,84 @@ socket.on('world_entry', (data) => {
   // Display the world in text format
   displayWorld(data);
 
-  // Test movement - move towards The Old Merchant
-  let moveCount = 0;
-  const moveInterval = setInterval(() => {
-    moveCount++;
+  // Test sequence: move + chat variations
+  let actionCount = 0;
+  const actions = [
+    // Move 1
+    () => {
+      const newZ = data.character.position.z - 10;
+      log(`\n>>> Moving north (1/3)...`, 'yellow');
+      socket.emit('move', {
+        position: { x: data.character.position.x, y: data.character.position.y, z: newZ },
+        heading: 0,
+        speed: 'walk',
+      });
+      data.character.position.z = newZ;
+    },
+    // Say
+    () => {
+      log(`\n>>> Saying hello...`, 'yellow');
+      socket.emit('chat', {
+        channel: 'say',
+        message: 'Hello, anyone nearby?',
+      });
+    },
+    // Move 2
+    () => {
+      const newZ = data.character.position.z - 10;
+      log(`\n>>> Moving north (2/3)...`, 'yellow');
+      socket.emit('move', {
+        position: { x: data.character.position.x, y: data.character.position.y, z: newZ },
+        heading: 0,
+        speed: 'walk',
+      });
+      data.character.position.z = newZ;
+    },
+    // Shout
+    () => {
+      log(`\n>>> Shouting...`, 'yellow');
+      socket.emit('chat', {
+        channel: 'shout',
+        message: 'Is anyone out there?!',
+      });
+    },
+    // Move 3
+    () => {
+      const newZ = data.character.position.z - 10;
+      log(`\n>>> Moving north (3/3)...`, 'yellow');
+      socket.emit('move', {
+        position: { x: data.character.position.x, y: data.character.position.y, z: newZ },
+        heading: 0,
+        speed: 'walk',
+      });
+      data.character.position.z = newZ;
+    },
+    // Emote
+    () => {
+      log(`\n>>> Emoting...`, 'yellow');
+      socket.emit('chat', {
+        channel: 'emote',
+        message: 'looks around cautiously',
+      });
+    },
+    // Call for help
+    () => {
+      log(`\n>>> Calling for help...`, 'yellow');
+      socket.emit('chat', {
+        channel: 'cfh',
+        message: 'Testing emergency broadcast system!',
+      });
+    },
+  ];
 
-    // Move 10 units north (towards the NPC at 100,0,50)
-    const newZ = data.character.position.z - 10;
+  const actionInterval = setInterval(() => {
+    if (actionCount < actions.length) {
+      actions[actionCount]();
+      actionCount++;
+    } else {
+      clearInterval(actionInterval);
 
-    log(`\n>>> Moving north (move ${moveCount}/3)...`, 'yellow');
-    socket.emit('move', {
-      position: {
-        x: data.character.position.x,
-        y: data.character.position.y,
-        z: newZ,
-      },
-      heading: 0, // North
-      speed: 'walk',
-    });
-
-    // Update our local position for next move
-    data.character.position.z = newZ;
-
-    // Stop after 3 moves
-    if (moveCount >= 3) {
-      clearInterval(moveInterval);
-
-      // Disconnect after final move
+      // Disconnect after final action
       setTimeout(() => {
         log('\n>>> Disconnecting...', 'yellow');
         socket.disconnect();
@@ -148,6 +199,13 @@ socket.on('world_entry', (data) => {
 socket.on('proximity_roster', (data) => {
   logEvent('proximity_roster', data);
   displayProximityRoster(data);
+});
+
+// Handle chat messages
+socket.on('chat', (data) => {
+  log('\n' + '='.repeat(60), 'yellow');
+  log(`[${data.channel.toUpperCase()}] ${data.sender}: ${data.message}`, 'bright');
+  log('='.repeat(60), 'yellow');
 });
 
 // Handle pong response
