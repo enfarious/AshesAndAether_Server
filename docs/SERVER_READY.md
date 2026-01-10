@@ -7,11 +7,13 @@ Your World of Darkness MMO server is ready to accept its first connection!
 ## What's Been Done
 
 ### 1. Environment Setup ✅
+
 - All dependencies installed
 - Environment configuration (.env) created
 - TypeScript compiled successfully
 
 ### 2. Protocol Implementation ✅
+
 - Complete handshake flow implemented
 - Type-safe message definitions
 - Guest authentication working
@@ -19,6 +21,7 @@ Your World of Darkness MMO server is ready to accept its first connection!
 - World entry with sample zone
 
 ### 3. Test Tools ✅
+
 - Test client script (`test-client.js`)
 - Protocol documentation (`PROTOCOL.md`)
 - Quick start guide (`QUICKSTART.md`)
@@ -30,6 +33,7 @@ npm run dev
 ```
 
 Expected output:
+
 ```
 Starting World of Darkness MMO Server...
 Environment: development
@@ -43,11 +47,13 @@ Game server fully initialized
 ## Test It
 
 In another terminal:
+
 ```bash
 node test-client.js
 ```
 
 You should see:
+
 - ✓ Connection established
 - ✓ Handshake successful
 - ✓ Guest authentication
@@ -59,6 +65,7 @@ You should see:
 ## What Your Client Developer Needs
 
 ### Documentation
+
 1. **`PROTOCOL.md`** - Full protocol specification
    - All message types
    - Message formats (JSON)
@@ -76,6 +83,7 @@ You should see:
    - Text-based world display
 
 ### Connection Details
+
 - **Server URL**: `http://localhost:3000`
 - **Protocol Version**: `1.0.0`
 - **Transport**: WebSocket (Socket.io)
@@ -181,6 +189,7 @@ Your client should:
 6. **Display** events as they arrive (chat, combat, etc.)
 
 The server sends everything needed for text rendering:
+
 - `description` - Narrative text
 - `narrative` - Event descriptions
 - `exits` - Direction-based navigation
@@ -196,6 +205,7 @@ The server sends everything needed for text rendering:
 ## Logs
 
 Server logs everything:
+
 - Connections/disconnections
 - Handshakes
 - Authentication attempts
@@ -204,11 +214,12 @@ Server logs everything:
 
 Set `LOG_LEVEL=debug` in `.env` for verbose logging.
 
-## Ready to Go!
+## Ready to Go
 
 Everything is in place for your client developer to start connecting. The handshake works, authentication works, and they'll get proper world data back.
 
 You can now:
+
 1. Start the server (`npm run dev`)
 2. Run the test client (`node test-client.js`)
 3. Share the protocol docs with your client dev

@@ -139,6 +139,128 @@ Every character has:
 
 ---
 
+### 4. Proximity Roster (NEW - REQUIRED FOR COMMUNICATION)
+
+**Social awareness system:** Know who's around before you speak.
+
+#### Core Concept
+
+Server tells you who can hear/see you in each range. This prevents:
+- Talking to empty rooms
+- Using names in crowds (creepy)
+- Calling for help when not in danger
+
+#### Message You'll Receive
+
+```json
+{
+  "type": "proximity_roster",
+  "timestamp": 1704859200000,
+  "payload": {
+    "channels": {
+      "touch": { "count": 1, "sample": ["Shadowblade"] },
+      "say": { "count": 3, "sample": ["Shadowblade", "Elara", "Wanderer"], "lastSpeaker": "Elara" },
+      "shout": { "count": 9 },
+      "emote": { "count": 4 },
+      "see": { "count": 2, "sample": ["Elara", "Wanderer"] },
+      "hear": { "count": 7 },
+      "cfh": { "count": 0 }
+    },
+    "dangerState": false
+  }
+}
+```
+
+#### Channel Ranges
+
+| Channel | Range | Purpose |
+|---------|-------|---------|
+| touch | 5 feet | Physical interaction, trading |
+| say | 20 feet | Normal conversation |
+| shout | 150 feet | Loud communication |
+| emote | 150 feet | Actions, gestures |
+| see | 150 feet | Who can see you |
+| hear | 150 feet | Who can hear you |
+| cfh | 250 feet | Call for Help (danger-gated) |
+
+#### The Rules (CRITICAL)
+
+**Rule 1: Names vs Crowds**
+- If `sample` exists (1-3 people): Use names freely
+- If `count >= 4` (no sample): Use "folks", "travelers", "everyone" - NO NAMES
+
+**Rule 2: Don't talk to empty rooms**
+- If `say.count === 0`: Don't send say messages (use emotes or internal thoughts)
+
+**Rule 3: CFH requires danger**
+- If `dangerState === false`: Cannot use CFH channel
+
+**Rule 4: Respond to lastSpeaker**
+- If `lastSpeaker` exists: They just spoke, respond to them first
+
+#### Why This Matters
+
+This encodes real human social bandwidth:
+- **1-on-1**: Personal, use names, full attention
+- **2-3 people**: Small group, use names, rotate attention
+- **4+ people**: Crowd mode, no names, general address
+
+Your LLM/client should enforce these rules. Server provides the data, you enforce behavior.
+
+#### Example: Text Client
+
+```javascript
+socket.on('proximity_roster', (data) => {
+  const roster = data.payload;
+
+  // Can we speak?
+  if (roster.channels.say.count === 0) {
+    console.log("Nobody is nearby to hear you.");
+    return;
+  }
+
+  // What mode are we in?
+  if (roster.channels.say.sample) {
+    // Personal or small group - use names
+    console.log(`Nearby: ${roster.channels.say.sample.join(', ')}`);
+    if (roster.channels.say.lastSpeaker) {
+      console.log(`${roster.channels.say.lastSpeaker} just spoke.`);
+    }
+  } else {
+    // Crowd mode
+    console.log(`${roster.channels.say.count} people nearby (crowd mode - no names)`);
+  }
+
+  // Can we call for help?
+  if (roster.dangerState) {
+    console.log("You can call for help! (CFH available)");
+  }
+});
+```
+
+#### Player Inspection: /look Command
+
+Get detailed info about specific players:
+
+```javascript
+// Send request
+socket.emit('player_peek', { targetName: 'Shadowblade' });
+
+// Receive response
+socket.on('player_peek_response', (data) => {
+  const info = data.payload;
+  console.log(`${info.name} - Level ${info.level}`);
+  console.log(`${info.appearance}`);
+  console.log(`Pronouns: ${info.pronouns || 'not specified'}`);
+  console.log(`Content: ${info.contentAccessLevel}`);
+  console.log(`Age group: ${info.ageGroup}`);
+});
+```
+
+**Privacy**: Only shows coarse age group (minor/adult), never exact age or personal data.
+
+---
+
 ## Translation Guide
 
 ### 3D → 2D

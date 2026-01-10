@@ -280,14 +280,27 @@ export interface MoveMessage {
   };
 }
 
-export type ChatChannel = 'say' | 'yell' | 'whisper' | 'party' | 'world';
+export type CommunicationChannel = 'say' | 'shout' | 'emote' | 'cfh' | 'whisper' | 'party' | 'world';
 
 export interface ChatMessage {
   type: 'chat';
   payload: {
-    channel: ChatChannel;
+    channel: CommunicationChannel;
     message: string;
     target?: string; // For whispers
+    timestamp: number;
+  };
+}
+
+export interface CommunicationReceived {
+  type: 'communication';
+  payload: {
+    channel: 'say' | 'shout' | 'emote' | 'cfh';
+    senderId: string;
+    senderName: string;
+    senderType: 'player' | 'npc' | 'companion';
+    content: string;
+    distance: number;  // Actual distance from receiver in feet
     timestamp: number;
   };
 }
@@ -434,6 +447,85 @@ export interface TextMovementInfo {
   currentSpeed: MovementSpeed;              // Current movement speed
 }
 
+// ========== Proximity & Perception ==========
+
+// Communication ranges in feet
+export const COMMUNICATION_RANGES = {
+  touch: 5,
+  say: 20,
+  shout: 150,
+  emote: 150,
+  see: 150,
+  hear: 150,
+  cfh: 250,  // Call for Help
+} as const;
+
+export interface ProximityChannel {
+  count: number;              // Total entities in range
+  sample?: string[];          // Present ONLY if count <= 3 (array of entity names)
+  lastSpeaker?: string;       // Present ONLY if count <= 3 and someone spoke recently
+}
+
+export interface ProximityRosterMessage {
+  type: 'proximity_roster';
+  payload: {
+    channels: {
+      touch: ProximityChannel;   // ~5 feet
+      say: ProximityChannel;     // 20 feet
+      shout: ProximityChannel;   // 150 feet
+      emote: ProximityChannel;   // 150 feet
+      see: ProximityChannel;     // 150 feet
+      hear: ProximityChannel;    // 150 feet
+      cfh: ProximityChannel;     // 250 feet (Call for Help)
+    };
+    dangerState: boolean;  // true if in combat/danger (gates CFH usage)
+  };
+  timestamp: number;
+}
+
+export type AgeGroup = 'minor' | 'adult';
+
+export interface PlayerPeekRequest {
+  type: 'player_peek';
+  payload: {
+    targetName: string;  // or targetId
+  };
+}
+
+export interface PlayerPeekResponse {
+  type: 'player_peek_response';
+  payload: {
+    id: string;
+    name: string;
+    type: 'player' | 'npc' | 'companion';
+
+    // Visual
+    appearance: string;         // Description
+    equipment?: string[];       // Visible equipment
+
+    // Basic info
+    level?: number;
+    title?: string;
+    guildName?: string;
+
+    // Social context
+    ageGroup?: AgeGroup;                    // Coarse, never exact
+    pronouns?: string;                       // Player-provided (optional)
+    contentAccessLevel?: ContentRating;     // For age-appropriate interaction
+
+    // State
+    currentAction?: string;     // "standing", "sitting", "fighting"
+    inCombat: boolean;
+    afk: boolean;
+
+    // Interaction flags
+    interactive: boolean;
+    acceptsWhispers: boolean;
+    acceptsGroupInvites: boolean;
+  };
+  timestamp: number;
+}
+
 // ========== Union Type for All Messages ==========
 
 export type ClientMessage =
@@ -446,7 +538,8 @@ export type ClientMessage =
   | InteractMessage
   | CombatActionMessage
   | PingMessage
-  | DisconnectMessage;
+  | DisconnectMessage
+  | PlayerPeekRequest;
 
 export type ServerMessage =
   | HandshakeAckMessage
@@ -456,4 +549,7 @@ export type ServerMessage =
   | StateUpdateMessage
   | EventMessage
   | PongMessage
-  | ErrorMessage;
+  | ErrorMessage
+  | ProximityRosterMessage
+  | CommunicationReceived
+  | PlayerPeekResponse;
