@@ -2,7 +2,6 @@
 
 This document defines the Active Time Battle (ATB) combat loop for the World of Darkness server.
 It focuses on server-authoritative rules, event flow, and the minimal data model needed to implement.
-Characters do auto-attack on a timer, this timer can be affected by slowing or hasting effects. Auto-attacks operate outside of global CD and do not rely on ATB. They just happen and build ATB. For some this is faster than ATB over time, for others (mages and the like) ATB fills fast enough to warrant staying out of the melee.
 
 ## Goals
 
@@ -26,14 +25,23 @@ Characters do auto-attack on a timer, this timer can be affected by slowing or h
 - Each entity has an ATB gauge from 0 to 100.
 - Gauge fills continuously: `fillRate = derivedStats.attackSpeedBonus + baseRate`.
 - When gauge reaches 100, the entity can execute an action.
-- Using an action consumes 0..100, depending on ability used. This does not allow more than a single action at a time, but, it does allow for more actions over time if that's your jam.
-- Some actions can actually build you to > 100 ATB charge, which can allow for more than a single action. These are called 'builders' and typically have long cooldowns. 
-- Some actions are 'free' and have only a CD, the CD doesn't start until the effect of the ability has worn off. For instance /rage for wolves has no ATB cost but has a 120 second CD that doesn't start to tick until Rage wears off (30s base). These "free" abilities can be used in addition to actual consumers. 
-- Ults consume 100 ATB AND have monster CDs 900+ seconds. They can change the tides of battle though.
+- Using an action consumes 0..100, depending on ability used.
+
+### Auto-Attack
+
+- Auto-attacks tick on a timer (affected by slow/haste).
+- Auto-attacks are outside the global cooldown and do not require ATB.
+- Auto-attacks build ATB; some builds can rely on them for sustained actions.
+
+### Builders, Free Abilities, Ults
+
+- Builders can push ATB above 100 (allowing back-to-back actions). They have long cooldowns.
+- Free abilities cost no ATB and only use cooldowns; cooldown starts when the effect ends.
+- Ults consume 100 ATB and have very long cooldowns (900s+).
 
 ### Action Queue
 
-- Client sends /spell|ability when ready and the server enqueues it.
+- Client sends /spell or /ability when ready and the server enqueues it.
 - Server validates action: cooldowns, range, resources, target visibility.
 - On validation success, resolve immediately (no delay) or after cast time.
 
@@ -160,9 +168,18 @@ These commands route through the command system and publish combat actions into 
 ## Open Questions
 
 - How do we group encounters: per-zone or per-target cluster?
+  - Prefer per-target cluster (local engagement group).
+
 - How do we handle line-of-sight for ranged attacks?
+  - Check at time of ability use; if blocked, the ability hits the blocker.
+
 - How do we resolve interrupts and counter-attacks?
+  - Status effects (stun/sleep/paralysis) pause ATB until they expire.
+
 - How do we cap multi-target damage in large fights?
+  - Scale total damage with targets hit (+10% per target), then divide among all targets.
+  - Example: 1 target = 100%; 2 targets = 120%/2 = 60% each; 5 targets = 150%/5 = 30% each.
+  - Single-target remains efficient; AoE grows total output without dominating.
 
 ## Next Implementation Steps
 

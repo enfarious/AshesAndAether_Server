@@ -15,6 +15,7 @@ Write-Host "Stopping existing servers..." -ForegroundColor Yellow
 # Window titles for server consoles
 $gatewayWindowTitle = "World of Darkness - Gateway"
 $zoneWindowTitle = "World of Darkness - Zone"
+$repoRoot = (Resolve-Path $PSScriptRoot).Path
 
 # Get all PowerShell windows running tsx watch commands
 $serverWindows = Get-Process -Name "powershell" -ErrorAction SilentlyContinue | Where-Object {
@@ -30,23 +31,27 @@ if ($serverWindows) {
         Write-Host "  Closing window (PID: $($_.Id))..." -ForegroundColor Gray
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "✓ Closed $($serverWindows.Count) server window(s)" -ForegroundColor Green
+    Write-Host "û Closed $($serverWindows.Count) server window(s)" -ForegroundColor Green
 } else {
-    Write-Host "✓ No running server windows found" -ForegroundColor Green
+    Write-Host "û No running server windows found" -ForegroundColor Green
 }
 
 # Also kill any orphaned node processes
-$orphanedNodes = Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -like "*tsx*gateway-main*" -or
-    $_.CommandLine -like "*tsx*zoneserver-main*"
+$orphanedNodes = Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -like "*$repoRoot*" -and (
+        $_.CommandLine -like "*tsx*gateway-main*" -or
+        $_.CommandLine -like "*tsx*zoneserver-main*" -or
+        $_.CommandLine -like "*src\\gateway-main.ts*" -or
+        $_.CommandLine -like "*src\\zoneserver-main.ts*"
+    )
 }
 
 if ($orphanedNodes) {
     $orphanedNodes | ForEach-Object {
-        Write-Host "  Killing orphaned node process $($_.Id)..." -ForegroundColor Gray
-        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        Write-Host "  Killing orphaned node process $($_.ProcessId)..." -ForegroundColor Gray
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "✓ Killed $($orphanedNodes.Count) orphaned process(es)" -ForegroundColor Green
+    Write-Host "û Killed $($orphanedNodes.Count) orphaned process(es)" -ForegroundColor Green
 }
 
 # Wait for processes to fully terminate
@@ -57,5 +62,5 @@ Start-Sleep -Seconds 3
 Write-Host "`nStarting fresh servers..." -ForegroundColor Green
 & "$PSScriptRoot\start-distributed.ps1" -RedisUrl $RedisUrl -GatewayWindowTitle $gatewayWindowTitle -ZoneWindowTitle $zoneWindowTitle
 
-Write-Host "`n✓ Restart complete!" -ForegroundColor Green
+Write-Host "`nû Restart complete!" -ForegroundColor Green
 Write-Host "========================================`n" -ForegroundColor Cyan
