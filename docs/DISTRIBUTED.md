@@ -2,43 +2,43 @@
 
 ## Overview
 
-The World of Darkness server supports distributed deployment across multiple machines for horizontal scaling. The architecture uses Redis as a message bus to coordinate between Gateway servers (handling client connections) and Zone servers (processing game logic).
+The Ashes & Aether server supports distributed deployment across multiple machines for horizontal scaling. The architecture uses Redis as a message bus to coordinate between Gateway servers (handling client connections) and Zone servers (processing game logic).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    CLIENTS                              │
-│              (WebSocket connections)                    │
-└────────────────────┬────────────────────────────────────┘
-                     │
-         ┌───────────▼───────────┐
-         │   GATEWAY SERVER      │  ← Handles ALL client connections
-         │   - Authentication     │     Doesn't run game logic
-         │   - Message routing    │     Just routes messages
-         │   - Connection mgmt    │
-         └───────────┬───────────┘
-                     │
-              ┌──────▼──────┐
-              │    REDIS    │  ← Message bus + shared state
-              │  Pub/Sub    │     - Online players
-              └──────┬──────┘     - Zone assignments
-                     │            - Character positions
-         ┌───────────┼───────────┐
-         │           │           │
-    ┌────▼────┐ ┌───▼────┐ ┌───▼────┐
-    │  ZONE   │ │  ZONE  │ │  ZONE  │  ← Run game logic
-    │ SERVER  │ │ SERVER │ │ SERVER │     Calculate proximity
-    │    1    │ │    2   │ │    3   │     Run AI/combat
-    └────┬────┘ └───┬────┘ └───┬────┘     Publish updates
-         │          │          │
-         └──────────┼──────────┘
-                    │
-            ┌───────▼────────┐
-            │   POSTGRESQL   │  ← Persistent storage
-            │   - Characters  │     - Zone definitions
-            │   - Accounts    │     - Game state
-            └────────────────┘
+ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+Γöé                    CLIENTS                              Γöé
+Γöé              (WebSocket connections)                    Γöé
+ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+                     Γöé
+         ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓû╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+         Γöé   GATEWAY SERVER      Γöé  ΓåÉ Handles ALL client connections
+         Γöé   - Authentication     Γöé     Doesn't run game logic
+         Γöé   - Message routing    Γöé     Just routes messages
+         Γöé   - Connection mgmt    Γöé
+         ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+                     Γöé
+              ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓû╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+              Γöé    REDIS    Γöé  ΓåÉ Message bus + shared state
+              Γöé  Pub/Sub    Γöé     - Online players
+              ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ     - Zone assignments
+                     Γöé            - Character positions
+         ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+         Γöé           Γöé           Γöé
+    ΓöîΓöÇΓöÇΓöÇΓöÇΓû╝ΓöÇΓöÇΓöÇΓöÇΓöÉ ΓöîΓöÇΓöÇΓöÇΓû╝ΓöÇΓöÇΓöÇΓöÇΓöÉ ΓöîΓöÇΓöÇΓöÇΓû╝ΓöÇΓöÇΓöÇΓöÇΓöÉ
+    Γöé  ZONE   Γöé Γöé  ZONE  Γöé Γöé  ZONE  Γöé  ΓåÉ Run game logic
+    Γöé SERVER  Γöé Γöé SERVER Γöé Γöé SERVER Γöé     Calculate proximity
+    Γöé    1    Γöé Γöé    2   Γöé Γöé    3   Γöé     Run AI/combat
+    ΓööΓöÇΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÿ ΓööΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÿ ΓööΓöÇΓöÇΓöÇΓö¼ΓöÇΓöÇΓöÇΓöÇΓöÿ     Publish updates
+         Γöé          Γöé          Γöé
+         ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓö╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
+                    Γöé
+            ΓöîΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓû╝ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÉ
+            Γöé   POSTGRESQL   Γöé  ΓåÉ Persistent storage
+            Γöé   - Characters  Γöé     - Zone definitions
+            Γöé   - Accounts    Γöé     - Game state
+            ΓööΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÿ
 ```
 
 ## Deployment Modes
@@ -121,7 +121,7 @@ ASSIGNED_ZONES=""
 
 **Specific zones:**
 ```env
-ASSIGNED_ZONES="zone-crossroads,zone-forest,zone-city"
+ASSIGNED_ZONES="USA_NY_Stephentown,zone-forest,zone-city"
 ```
 
 **Geographic distribution:**
@@ -140,7 +140,7 @@ ASSIGNED_ZONES="zone-london,zone-paris,zone-berlin,zone-rome"
 
 ### Player Movement Example
 
-1. Client sends `move` message → Gateway
+1. Client sends `move` message ΓåÆ Gateway
 2. Gateway looks up "which zone server has this player?" (Redis registry)
 3. Gateway publishes to `zone:crossroads:input` Redis channel
 4. Zone Server 1 (hosting Crossroads) receives message
@@ -274,7 +274,7 @@ npm run dev:gateway
 Terminal 2 (Zone Server 1):
 ```powershell
 $env:SERVER_ID="zone-1"
-$env:ASSIGNED_ZONES="zone-crossroads"
+$env:ASSIGNED_ZONES="USA_NY_Stephentown"
 npm run dev:zone
 ```
 

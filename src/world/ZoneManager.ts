@@ -25,6 +25,7 @@ interface Entity {
   socketId?: string; // For players only
   inCombat?: boolean;
   isMachine: boolean;
+  isAlive: boolean;
 }
 
 /**
@@ -60,6 +61,7 @@ export class ZoneManager {
         },
         inCombat: false,
         isMachine: true,
+        isAlive: companion.isAlive ?? true,
       });
     }
 
@@ -85,6 +87,7 @@ export class ZoneManager {
       socketId,
       inCombat: false,
       isMachine,
+      isAlive: character.isAlive ?? true,
     };
 
     this.entities.set(character.id, entity);
@@ -126,6 +129,13 @@ export class ZoneManager {
     const entity = this.entities.get(entityId);
     if (entity) {
       entity.inCombat = inCombat;
+    }
+  }
+
+  setEntityAlive(entityId: string, isAlive: boolean): void {
+    const entity = this.entities.get(entityId);
+    if (entity) {
+      entity.isAlive = isAlive;
     }
   }
 
@@ -219,6 +229,7 @@ export class ZoneManager {
 
     for (const entity of this.entities.values()) {
       if (entity.id === excludeId) continue;
+      if (!entity.isAlive && entity.id !== excludeId) continue;
 
       const distance = this.calculateDistance(origin, entity.position);
       if (distance <= range) {
@@ -257,6 +268,7 @@ export class ZoneManager {
         name: entity.name,
         type: entity.type,
         isMachine: entity.isMachine,
+        isAlive: entity.isAlive,
         bearing,
         elevation,
         range: Math.round(range * 100) / 100, // Round to 2 decimal places

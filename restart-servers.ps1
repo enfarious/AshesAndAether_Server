@@ -4,13 +4,13 @@
 param(
     [string]$RedisUrl = "redis://localhost:6379",
     [switch]$NoStart,
-    [string]$GatewayWindowTitle = "World of Darkness - Gateway",
-    [string]$ZoneWindowTitle = "World of Darkness - Zone"
+    [string]$GatewayWindowTitle = "Ashes & Aether - Gateway",
+    [string]$ZoneWindowTitle = "Ashes & Aether - Zone"
 )
 
 $repoRoot = (Resolve-Path $PSScriptRoot).Path
 
-Write-Host "World of Darkness - Restart Servers" -ForegroundColor Cyan
+Write-Host "Ashes & Aether - Restart Servers" -ForegroundColor Cyan
 Write-Host "===================================" -ForegroundColor Cyan
 Write-Host ""
 

@@ -1,7 +1,7 @@
-# Development Notes - World of Darkness Server
+# Development Notes - Ashes & Aether Server
 
 ## Project Context
-Building an MMO server for a World of Darkness inspired game with:
+Building an MMO server for a Ashes & Aether inspired game with:
 - Active Time Battle (ATB) combat system (cooldown-based, real-time)
 - LLM-powered AI companions with memory and personality
 - Wildlife ecosystem simulation (hunger, thirst, aging, reproduction)

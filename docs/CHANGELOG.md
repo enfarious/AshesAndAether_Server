@@ -1,4 +1,4 @@
-# Changelog - World of Darkness Server
+# Changelog - Ashes & Aether Server
 
 All notable changes and progress will be documented in this file.
 

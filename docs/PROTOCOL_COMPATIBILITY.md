@@ -226,7 +226,7 @@ redis-server
 npm run dev:gateway
 
 # Terminal 3: MUD Client
-cd .claude/clients/mud-client/WorldOfDarkness_MUD_Client/clients/mud
+cd .claude/clients/mud-client/AshesAndAether_MUD_Client/clients/mud
 dotnet run
 ```
 
@@ -252,7 +252,7 @@ npm run dev:gateway
 npm run dev:zone
 
 # Terminal 4: MUD Client
-cd .claude/clients/mud-client/WorldOfDarkness_MUD_Client/clients/mud
+cd .claude/clients/mud-client/AshesAndAether_MUD_Client/clients/mud
 dotnet run
 ```
 

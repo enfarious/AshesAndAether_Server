@@ -1,6 +1,6 @@
 # Combat System (ATB)
 
-This document defines the Active Time Battle (ATB) combat loop for the World of Darkness server.
+This document defines the Active Time Battle (ATB) combat loop for the Ashes & Aether server.
 It focuses on server-authoritative rules, event flow, and the minimal data model needed to implement.
 
 ## Goals

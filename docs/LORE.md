@@ -1,4 +1,22 @@
-# World of Darkness - Lore Primer
+# Ashes & Aether - Lore Primer
+
+The Shatterline opened in upstate New York. People went in. None returned. Something else did.
+
+## Aether and the Shatterline
+
+Aether gives life and power, but humans are greedy. Once we found it, we refused to stop taking.
+The planet screamed. The war ended. The devastation was undeniable. Now we live in the ruins of our own creating.
+
+The Shatterline has been a stable source of the power we use for everything now. Sadly, even if it weren't for
+the mutations from long-term exposure, the creatures that occasionally appear and wreak havoc, or the very real
+risk of injury, Aether was never meant for humans to so directly manipulate. It corrupts.
+
+The tech folk learned to curb and channel the corruption. The nanotech that altered humanity also allows a few
+to safely touch Aether (our mages). Others end up changed — werewolves, vampires, elves, trolls, and stranger things.
+Most of us start out human still, then choices. Often the kind that don't feel like choices at all:
+move closer to the rift where rent is lower, or work more when you're already drowning. You move closer. You change.
+
+So it is with new players: human on day one, but not for long.
 
 ## The 37-Hour War
 
@@ -305,7 +323,7 @@ The Event lasted exactly 37 hours. Then stopped.
 
 **"Magic and technology became one. Humanity became many."**
 
-**"In this World of Darkness, some still find the light."**
+**"In this Ashes & Aether, some still find the light."**
 
 **"Your neighborhood survived. But nothing will ever be the same."**
 
@@ -334,7 +352,7 @@ You're in Stephentown, NY. A small town that survived.
 
 You've heard stories about The Event, the 37 hours that changed everything. You've seen the Changed, the corruption zones, the frozen missiles in the distance.
 
-Now it's your turn to step into this World of Darkness.
+Now it's your turn to step into this Ashes & Aether.
 
 The Narrator whispers: *"Your journey begins at the covered bridge. What you find there will change everything."*
 

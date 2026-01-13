@@ -8,7 +8,7 @@ param(
 )
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "World of Darkness - Gateway Server" -ForegroundColor Cyan
+Write-Host "Ashes & Aether - Gateway Server" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Server ID: $ServerId" -ForegroundColor Gray
 Write-Host "Port: $Port" -ForegroundColor Gray
@@ -16,7 +16,7 @@ Write-Host "Redis: $RedisUrl" -ForegroundColor Gray
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Name the console window for easier restart/cleanup.
-$Host.UI.RawUI.WindowTitle = "World of Darkness - Gateway"
+$Host.UI.RawUI.WindowTitle = "Ashes & Aether - Gateway"
 
 # Set environment variables
 $env:SERVER_ID = $ServerId

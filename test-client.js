@@ -1,5 +1,5 @@
 /**
- * Simple test client for World of Darkness MMO Server
+ * Simple test client for Ashes & Aether MMO Server
  *
  * This demonstrates the complete handshake and connection flow.
  * Run with: node test-client.js
@@ -33,7 +33,7 @@ function logEvent(event, data) {
 }
 
 // Connect to server
-log('\nConnecting to World of Darkness MMO Server...', 'green');
+log('\nConnecting to Ashes & Aether MMO Server...', 'green');
 const socket = io(SERVER_URL, {
   transports: ['websocket'],
 });

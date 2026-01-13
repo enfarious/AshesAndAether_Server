@@ -1,10 +1,11 @@
-# World of Darkness - Vision Document
+# Ashes & Aether - Vision Document
 
 ## The Big Idea
 
 **One persistent world. Six ways to experience it. Real geography. Distributed architecture.**
 
 A post-apocalyptic MMO set in upstate New York, 100 years after The 37-Hour War transformed humanity forever through AI-deployed nanotech.
+The Shatterline cuts across the region, bleeding anomalies into the world and redrawing every border.
 
 ## What Makes This Different
 
@@ -325,6 +326,6 @@ This is a **hobby project**. We iterate. We experiment. We build what's fun.
 
 ---
 
-*"In this World of Darkness, some still find the light."*
+*"In this Ashes & Aether, some still find the light."*
 
 **Welcome to the project. Let's build something amazing.**

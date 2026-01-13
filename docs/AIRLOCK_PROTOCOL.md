@@ -64,7 +64,7 @@ Granted:
     "inhabitId": "inhabit-uuid",
     "npcId": "npc-uuid",
     "displayName": "Old Merchant",
-    "zoneId": "zone-crossroads",
+    "zoneId": "USA_NY_Stephentown",
     "expiresAt": 1769999999999
   }
 }

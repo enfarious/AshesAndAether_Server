@@ -1,8 +1,8 @@
-# Server Ready for First Connection
+# Server - Ashes & Aether
 
 ## Status: READY ✅
 
-Your World of Darkness MMO server is ready to accept its first connection!
+Your Ashes & Aether MMO server is ready to accept its first connection!
 
 ## What's Been Done
 
@@ -35,7 +35,7 @@ npm run dev
 Expected output:
 
 ```
-Starting World of Darkness MMO Server...
+Starting Ashes & Aether MMO Server...
 Environment: development
 HTTP server listening on port 3000
 WebSocket server initialized

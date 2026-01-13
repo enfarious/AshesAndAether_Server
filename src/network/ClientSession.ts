@@ -222,7 +222,7 @@ export class ClientSession {
     }
 
     // Create character in starter zone (The Crossroads)
-    const starterZoneId = 'zone-crossroads';
+    const starterZoneId = 'USA_NY_Stephentown';
     const character = await CharacterService.createCharacter({
       accountId: this.accountId,
       name: data.name,
@@ -273,12 +273,15 @@ export class ClientSession {
     const companions = await ZoneService.getCompanionsInZone(zone.id);
 
     // Build entity list
-    const entities = companions.map(companion => ({
+    const entities = companions
+      .filter(companion => companion.isAlive ?? true)
+      .map(companion => ({
       id: companion.id,
       type: 'npc' as const,
       name: companion.name,
       position: { x: companion.positionX, y: companion.positionY, z: companion.positionZ },
       description: companion.description || '',
+      isAlive: companion.isAlive ?? true,
       interactive: true,
     }));
 
@@ -291,6 +294,7 @@ export class ClientSession {
         level: character.level,
         experience: character.experience,
         abilityPoints: character.abilityPoints,
+        isAlive: character.isAlive ?? true,
 
         // Position
         position: { x: character.positionX, y: character.positionY, z: character.positionZ },

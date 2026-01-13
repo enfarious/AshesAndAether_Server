@@ -9,7 +9,7 @@ param(
 )
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "World of Darkness - Zone Server" -ForegroundColor Cyan
+Write-Host "Ashes & Aether - Zone Server" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Server ID: $ServerId" -ForegroundColor Gray
 Write-Host "Tick Rate: $TickRate TPS" -ForegroundColor Gray
@@ -24,7 +24,7 @@ if ($AssignedZones -eq "") {
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Name the console window for easier restart/cleanup.
-$Host.UI.RawUI.WindowTitle = "World of Darkness - Zone"
+$Host.UI.RawUI.WindowTitle = "Ashes & Aether - Zone"
 
 # Set environment variables
 $env:SERVER_ID = $ServerId

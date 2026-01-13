@@ -2,7 +2,7 @@
 
 **Status**: DRAFT - Needs approval before implementation
 
-This document proposes the initial set of slash commands aligned with the World of Darkness MMO vision.
+This document proposes the initial set of slash commands aligned with the Ashes & Aether MMO vision.
 
 ---
 

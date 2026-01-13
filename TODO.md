@@ -1,4 +1,4 @@
-# TODO - World of Darkness Server
+# TODO - Ashes & Aether Server
 
 Last updated: 2026-01-10
 

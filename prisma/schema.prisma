@@ -1,4 +1,4 @@
-// Prisma schema for World of Darkness MMO
+// Prisma schema for Ashes & Aether MMO
 
 generator client {
   provider = "prisma-client-js"
@@ -63,6 +63,7 @@ model Character {
   currentHp       Int             @default(200)
   currentStamina  Int             @default(100)
   currentMana     Int             @default(100)
+  isAlive         Boolean         @default(true)
 
   // Position in world
   zoneId          String
@@ -207,6 +208,7 @@ model Companion {
   stats           Json
   currentHealth   Int
   maxHealth       Int
+  isAlive         Boolean         @default(true)
 
   // Position
   zoneId          String

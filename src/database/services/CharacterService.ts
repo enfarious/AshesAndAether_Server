@@ -88,6 +88,7 @@ export class CharacterService {
         currentHp: derivedStats.maxHp,
         currentStamina: derivedStats.maxStamina,
         currentMana: derivedStats.maxMana,
+        isAlive: true,
 
         // Position
         zoneId: data.zoneId,
@@ -134,6 +135,7 @@ export class CharacterService {
       currentHp?: number;
       currentStamina?: number;
       currentMana?: number;
+      isAlive?: boolean;
     }
   ): Promise<void> {
     await prisma.character.update({

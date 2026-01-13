@@ -3,13 +3,13 @@
 
 param(
     [string]$RedisUrl = "redis://localhost:6379",
-    [string]$GatewayWindowTitle = "World of Darkness - Gateway",
-    [string]$ZoneWindowTitle = "World of Darkness - Zone",
+    [string]$GatewayWindowTitle = "Ashes & Aether - Gateway",
+    [string]$ZoneWindowTitle = "Ashes & Aether - Zone",
     [switch]$SkipRedisCheck
 )
 
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "World of Darkness - Distributed Setup" -ForegroundColor Cyan
+Write-Host "Ashes & Aether - Distributed Setup" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Check if Redis is running

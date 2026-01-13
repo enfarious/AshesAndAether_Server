@@ -1,5 +1,8 @@
 import express, { Express } from 'express';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
 import { createServer, Server as HTTPServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { logger } from '@/utils/logger';
@@ -37,6 +40,50 @@ export class GameServer {
     this.app.use(cors());
     this.app.use(express.json());
 
+    const assetsDir = path.join(process.cwd(), 'data', 'world', 'assets');
+    const terrainDir = path.join(process.cwd(), 'data', 'terrain');
+    const manifestForZone = (zoneId: string) =>
+      path.join(assetsDir, zoneId, 'manifest.json');
+
+    this.app.use('/world/assets', express.static(assetsDir));
+    this.app.use('/world/terrain', express.static(terrainDir));
+
+    this.app.get('/world/assets', (_req, res) => {
+      const zones = fs.existsSync(assetsDir)
+        ? fs
+            .readdirSync(assetsDir, { withFileTypes: true })
+            .filter(entry => entry.isDirectory())
+            .map(entry => entry.name)
+        : [];
+
+      res.json({
+        version: '0.1.0',
+        zones,
+      });
+    });
+
+    this.app.get('/world/assets/:zoneId', (req, res) => {
+      const { zoneId } = req.params;
+      const manifestPath = manifestForZone(zoneId);
+
+      if (!fs.existsSync(manifestPath)) {
+        res.status(404).json({ error: 'manifest_not_found', zoneId });
+        return;
+      }
+
+      const raw = fs.readFileSync(manifestPath, 'utf-8');
+      const etag = crypto.createHash('sha256').update(raw).digest('hex');
+      const ifNoneMatch = req.header('if-none-match');
+
+      res.setHeader('ETag', etag);
+      if (ifNoneMatch && ifNoneMatch === etag) {
+        res.status(304).end();
+        return;
+      }
+
+      res.json(JSON.parse(raw));
+    });
+
     // Health check endpoint
     this.app.get('/health', (_req, res) => {
       res.json({
@@ -49,7 +96,7 @@ export class GameServer {
     // API routes placeholder
     this.app.get('/api/info', (_req, res) => {
       res.json({
-        name: 'World of Darkness MMO',
+        name: 'Ashes & Aether MMO',
         version: '0.1.0',
         players: this.connectionManager?.getPlayerCount() || 0,
       });

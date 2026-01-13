@@ -1,4 +1,4 @@
-# Quick Start Guide - World of Darkness MMO Server
+# Quick Start Guide - Ashes & Aether MMO Server
 
 ## Getting Your Server Running
 
@@ -22,7 +22,7 @@ The server will start on:
 
 You should see:
 ```
-Starting World of Darkness MMO Server...
+Starting Ashes & Aether MMO Server...
 HTTP server listening on port 3000
 WebSocket server initialized
 World initialized with 1 zones

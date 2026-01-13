@@ -1,7 +1,7 @@
 {
-  "name": "world-of-darkness-server",
+  "name": "ashes-and-aether-server",
   "version": "0.1.0",
-  "description": "MMO server for World of Darkness - tactical supernatural combat and wildlife simulation",
+  "description": "MMO server for Ashes & Aether - tactical supernatural combat and wildlife simulation",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

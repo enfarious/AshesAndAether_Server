@@ -4,7 +4,7 @@
 
 ## Overview
 
-NPCs (Companions) in the World of Darkness server are driven by LLM-powered personalities with proximity-aware social behavior. Each NPC has:
+NPCs (Companions) in the Ashes & Aether server are driven by LLM-powered personalities with proximity-aware social behavior. Each NPC has:
 
 - **Personality**: Configured via `personalityType` and `systemPrompt` in database
 - **Memory**: Conversation history and relationship data
@@ -104,6 +104,12 @@ model Companion {
   // ...
 }
 ```
+
+## Alive State and Mob Respawn
+
+- All entities (players, NPCs, mobs) carry an `isAlive` flag.
+- Proximity rosters exclude entities with `isAlive=false`.
+- Mobs are identified by tag prefix `mob.` and respawn 120 seconds after death.
 
 ## Example Flow
 
@@ -252,4 +258,4 @@ node test-client.js
 
 ---
 
-*"In this World of Darkness, even the NPCs have stories to tell."*
+*"In this Ashes & Aether, even the NPCs have stories to tell."*

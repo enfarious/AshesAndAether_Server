@@ -497,7 +497,7 @@ export class GatewayClientSession {
       return;
     }
 
-    const starterZoneId = 'zone-crossroads';
+    const starterZoneId = 'USA_NY_Stephentown';
     const character = await CharacterService.createCharacter({
       accountId: this.accountId,
       name: data.name,
@@ -543,12 +543,15 @@ export class GatewayClientSession {
 
     const companions = await ZoneService.getCompanionsInZone(zone.id);
 
-    const entities = companions.map(companion => ({
+    const entities = companions
+      .filter(companion => companion.isAlive ?? true)
+      .map(companion => ({
       id: companion.id,
       type: 'npc' as const,
       name: companion.name,
       position: { x: companion.positionX, y: companion.positionY, z: companion.positionZ },
       description: companion.description || '',
+      isAlive: companion.isAlive ?? true,
       interactive: true,
     }));
 
@@ -561,6 +564,7 @@ export class GatewayClientSession {
         level: character.level,
         experience: character.experience,
         abilityPoints: character.abilityPoints,
+        isAlive: character.isAlive ?? true,
         position: { x: character.positionX, y: character.positionY, z: character.positionZ },
         heading: character.heading,
         rotation: { x: 0, y: character.heading, z: 0 },
@@ -684,29 +688,33 @@ export class GatewayClientSession {
       return;
     }
 
-    const defaultTtlMs = Number.parseInt(
-      process.env.AIRLOCK_INHABIT_TTL_MS || '300000',
+    const sessionTtlMs = Number.parseInt(
+      process.env.AIRLOCK_SESSION_TTL_MS || `${12 * 60 * 60 * 1000}`,
       10
     );
+    const defaultTtlEnv = process.env.AIRLOCK_INHABIT_TTL_MS;
+    const defaultTtlMs = defaultTtlEnv === undefined
+      ? sessionTtlMs
+      : Number.parseInt(defaultTtlEnv || '0', 10);
     const maxTtlMs = Number.parseInt(
       process.env.AIRLOCK_INHABIT_MAX_TTL_MS || `${30 * 60 * 1000}`,
       10
     );
-    const ttlMs = Math.min(data.ttlMs || defaultTtlMs, maxTtlMs);
+    const requestedTtlMs = data.ttlMs ?? defaultTtlMs;
+    const ttlMs = requestedTtlMs <= 0 ? 0 : Math.min(requestedTtlMs, maxTtlMs);
 
     const inhabitId = randomUUID();
     const npcKey = `airlock:npc:${companion.id}`;
-    const setResult = await redis.set(npcKey, inhabitId, {
-      PX: ttlMs,
-      NX: true,
-    });
+    const setResult = ttlMs > 0
+      ? await redis.set(npcKey, inhabitId, { PX: ttlMs, NX: true })
+      : await redis.set(npcKey, inhabitId, { NX: true });
 
     if (!setResult) {
       this.socket.emit('inhabit_denied', { reason: 'npc_unavailable' });
       return;
     }
 
-    const expiresAt = Date.now() + ttlMs;
+    const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : 0;
     const inhabitKey = `airlock:inhabit:${inhabitId}`;
     await redis.hSet(inhabitKey, {
       airlockSessionId: this.airlockSessionId,
@@ -716,9 +724,11 @@ export class GatewayClientSession {
       expiresAt: `${expiresAt}`,
       ttlMs: `${ttlMs}`,
     });
-    await redis.pExpire(inhabitKey, ttlMs);
+    if (ttlMs > 0) {
+      await redis.pExpire(inhabitKey, ttlMs);
+    }
     await redis.sAdd(sessionSetKey, inhabitId);
-    await redis.pExpire(sessionSetKey, Number.parseInt(process.env.AIRLOCK_SESSION_TTL_MS || `${12 * 60 * 60 * 1000}`, 10));
+    await redis.pExpire(sessionSetKey, sessionTtlMs);
 
     const channel = `zone:${companion.zoneId}:input`;
     await this.messageBus.publish(channel, {
@@ -759,15 +769,7 @@ export class GatewayClientSession {
       return;
     }
 
-    const ttlMs = Number.parseInt(result.ttlMs || '0', 10);
-    if (!ttlMs) return;
-
-    const expiresAt = Date.now() + ttlMs;
-    await redis.hSet(inhabitKey, { expiresAt: `${expiresAt}` });
-    await redis.pExpire(inhabitKey, ttlMs);
-    if (result.npcId) {
-      await redis.pExpire(`airlock:npc:${result.npcId}`, ttlMs);
-    }
+    await this.refreshInhabitTtl(redis, inhabitKey, result);
   }
 
   private async handleInhabitChat(data: { inhabitId?: string; channel?: string; message?: string }): Promise<void> {
@@ -803,6 +805,7 @@ export class GatewayClientSession {
       timestamp: Date.now(),
     });
 
+    await this.refreshInhabitTtl(redis, inhabitKey, result);
     this.sendDevAck('inhabit_chat', true);
   }
 
@@ -892,6 +895,24 @@ export class GatewayClientSession {
 
     await redis.del(sessionSetKey);
     await redis.del(`airlock:session:${this.airlockSessionId}`);
+  }
+
+  private async refreshInhabitTtl(
+    redis: ReturnType<MessageBus['getRedisClient']>,
+    inhabitKey: string,
+    result: Record<string, string>
+  ): Promise<void> {
+    const ttlMs = Number.parseInt(result.ttlMs || '0', 10);
+    if (ttlMs <= 0) {
+      return;
+    }
+
+    const expiresAt = Date.now() + ttlMs;
+    await redis.hSet(inhabitKey, { expiresAt: `${expiresAt}` });
+    await redis.pExpire(inhabitKey, ttlMs);
+    if (result.npcId) {
+      await redis.pExpire(`airlock:npc:${result.npcId}`, ttlMs);
+    }
   }
 
   updatePing(): void {

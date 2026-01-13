@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ashes &amp; Aether Brand Preview</title>
+    <style>
+      :root {
+        --ink: #1d1412;
+        --ash: #eee6da;
+        --ember: #d97a45;
+        --coal: #3a2a24;
+      }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Franklin Gothic", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at 20% 20%, #f6efe4, #e7dfd3 45%, #d5cbc0 100%);
+      }
+      header {
+        padding: 28px 32px 10px;
+        border-bottom: 1px solid #c8b9a6;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 20px;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+      }
+      header p {
+        margin: 6px 0 0;
+        color: #5b4a40;
+      }
+      main {
+        display: grid;
+        gap: 24px;
+        padding: 28px 32px 40px;
+      }
+      .panel {
+        background: rgba(255, 255, 255, 0.65);
+        border: 1px solid #d2c4b2;
+        border-radius: 18px;
+        padding: 22px;
+        box-shadow: 0 10px 30px rgba(46, 34, 30, 0.08);
+      }
+      .panel h2 {
+        margin: 0 0 14px;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        color: #7c6656;
+      }
+      .logo-preview {
+        width: 100%;
+        max-width: 980px;
+      }
+      .mark-row {
+        display: flex;
+        gap: 24px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .mark-row .mark {
+        flex: 0 0 auto;
+        width: 240px;
+        height: 240px;
+        padding: 12px;
+        border-radius: 16px;
+        background: linear-gradient(140deg, #f3ecdf, #e2d6c6);
+        border: 1px solid #ccbca8;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .mark img {
+        width: 100%;
+        height: auto;
+      }
+      .swatches {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 12px;
+      }
+      .swatch {
+        border-radius: 12px;
+        padding: 12px;
+        color: #2c1e19;
+        border: 1px solid rgba(46, 34, 30, 0.15);
+      }
+      .swatch span {
+        display: block;
+        font-size: 12px;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Ashes &amp; Aether Brand Preview</h1>
+      <p>Quick look at current logo + mark drafts.</p>
+    </header>
+    <main>
+      <section class="panel">
+        <h2>Hero Mark</h2>
+        <img class="logo-preview" src="Totem in Rift.png" alt="Totem in Rift reference" />
+      </section>
+      <section class="panel">
+        <h2>Palette</h2>
+        <div class="swatches">
+          <div class="swatch" style="background: #eee6da">
+            <strong>Ash</strong>
+            <span>#EEE6DA</span>
+          </div>
+          <div class="swatch" style="background: #d97a45">
+            <strong>Ember</strong>
+            <span>#D97A45</span>
+          </div>
+          <div class="swatch" style="background: #3a2a24; color: #f6efe4">
+            <strong>Coal</strong>
+            <span>#3A2A24</span>
+          </div>
+          <div class="swatch" style="background: #1d1412; color: #f6efe4">
+            <strong>Ink</strong>
+            <span>#1D1412</span>
+          </div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Moodboard</h2>
+        <div class="mark-row">
+          <div class="mark" style="width: 280px; height: 280px;">
+            <img src="Totem in Rift.png" alt="Totem in Rift reference" />
+          </div>
+          <div class="mark" style="width: 280px; height: 280px;">
+            <img src="Totems Hold the Line.png" alt="Totems Hold the Line reference" />
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

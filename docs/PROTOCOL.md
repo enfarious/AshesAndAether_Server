@@ -1,4 +1,4 @@
-# Client-Server Protocol - World of Darkness MMO
+# Client-Server Protocol - Ashes & Aether MMO
 
 ## Overview
 
@@ -28,7 +28,7 @@ ws://server:port/socket.io/
 
 ### 2. Handshake Sequence
 
-#### Step 1: Client → Server: Version Check & Capabilities
+#### Step 1: Client ΓåÆ Server: Version Check & Capabilities
 
 ```json
 {
@@ -53,7 +53,7 @@ ws://server:port/socket.io/
 - `3d`: 3D client (full 3D coordinates, models, animations)
 - `vr`: VR client (same as 3D but with additional VR-specific data)
 
-#### Step 2: Server → Client: Handshake Acknowledgment
+#### Step 2: Server ΓåÆ Client: Handshake Acknowledgment
 
 ```json
 {
@@ -197,7 +197,7 @@ Client selects or creates a character:
 
 ### 6. Enter World
 
-#### Server → Client: World Entry
+#### Server ΓåÆ Client: World Entry
 
 Once character is selected/created, server sends the initial world state:
 
@@ -226,7 +226,7 @@ Once character is selected/created, server sends the initial world state:
 
     // Current location
     "zone": {
-      "id": "zone-crossroads",
+      "id": "USA_NY_Stephentown",
       "name": "The Crossroads",
       "description": "A weathered crossroads where five ancient paths converge. Moss-covered stones mark each direction, their inscriptions long faded. A sense of anticipation hangs in the air.",
       "weather": "clear",
@@ -268,7 +268,7 @@ Once character is selected/created, server sends the initial world state:
 
 ## Ongoing Communication
 
-### Server → Client: State Updates
+### Server ΓåÆ Client: State Updates
 
 The server sends periodic updates about world changes:
 
@@ -324,11 +324,11 @@ The server sends periodic updates about world changes:
 
 ---
 
-### Client → Server: Player Actions
+### Client ΓåÆ Server: Player Actions
 
 #### Movement:
 
-The server uses a unified 3D movement system with heading (0-360°). See [MOVEMENT_SYSTEM.md](docs/MOVEMENT_SYSTEM.md) for complete details.
+The server uses a unified 3D movement system with heading (0-360┬░). See [MOVEMENT_SYSTEM.md](docs/MOVEMENT_SYSTEM.md) for complete details.
 
 **Method 1: Heading (Universal)**
 ```json
@@ -415,7 +415,7 @@ The server uses a unified 3D movement system with heading (0-360°). See [MOVEME
 
 ---
 
-### Server → Client: Events
+### Server ΓåÆ Client: Events
 
 Events are one-time occurrences that clients should present to the user:
 
@@ -584,7 +584,7 @@ All messages follow this base structure:
 {
   type: string,        // Message type (e.g., "move", "chat", "event")
   payload: object,     // Type-specific data
-  timestamp?: number,  // Optional client timestamp (for client → server)
+  timestamp?: number,  // Optional client timestamp (for client ΓåÆ server)
   sequence?: number    // Optional sequence number (for ordering)
 }
 ```

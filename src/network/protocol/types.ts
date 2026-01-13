@@ -174,6 +174,7 @@ export interface CharacterState {
   level: number;
   experience: number;
   abilityPoints: number;
+  isAlive: boolean;
 
   // Position
   position: Vector3;
@@ -216,6 +217,7 @@ export interface Entity {
   name: string;
   position: Vector3;
   description: string;
+  isAlive?: boolean;
   interactive?: boolean;
   hostile?: boolean;
   animation?: string;
@@ -554,6 +556,7 @@ export interface ProximityEntity {
   name: string;
   type: 'player' | 'npc' | 'companion';
   isMachine: boolean;  // true = AI/NPC, false = human player
+  isAlive: boolean;
   bearing: number;     // 0-360 degrees (0=North, 90=East, 180=South, 270=West)
   elevation: number;   // -90 to 90 degrees (negative=down, positive=up)
   range: number;       // Distance in feet

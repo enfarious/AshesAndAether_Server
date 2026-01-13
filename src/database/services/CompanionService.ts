@@ -21,4 +21,14 @@ export class CompanionService {
       data: { currentHealth },
     });
   }
+
+  static async updateStatus(
+    companionId: string,
+    data: { currentHealth?: number; isAlive?: boolean }
+  ): Promise<void> {
+    await prisma.companion.update({
+      where: { id: companionId },
+      data,
+    });
+  }
 }

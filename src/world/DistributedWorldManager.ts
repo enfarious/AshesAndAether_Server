@@ -33,6 +33,7 @@ export class DistributedWorldManager {
   private combatManager: CombatManager;
   private abilitySystem: AbilitySystem;
   private damageCalculator: DamageCalculator;
+  private respawnTimers: Map<string, NodeJS.Timeout> = new Map();
 
   // Command system
   private commandRegistry: CommandRegistry;
@@ -370,10 +371,10 @@ export class DistributedWorldManager {
     if (!zoneManager) return;
 
     const attackerEntity = zoneManager.getEntity(characterId);
-    if (!attackerEntity) return;
+    if (!attackerEntity || !attackerEntity.isAlive) return;
 
     const targetEntity = zoneManager.getEntity(targetId);
-    if (!targetEntity) {
+    if (!targetEntity || !targetEntity.isAlive) {
       await this.broadcastCombatEvent(zoneId, attackerEntity.position, {
         eventType: 'combat_error',
         timestamp: Date.now(),
@@ -541,7 +542,7 @@ export class DistributedWorldManager {
           }
 
           const attackerEntity = zoneManager.getEntity(context.characterId);
-          if (!attackerEntity) {
+          if (!attackerEntity || !attackerEntity.isAlive) {
             return {
               success: false,
               error: 'You are not present in the zone.',
@@ -807,8 +808,9 @@ export class DistributedWorldManager {
   private resolveCombatTarget(zoneManager: ZoneManager, target: string) {
     if (!target) return null;
     const direct = zoneManager.getEntity(target);
-    if (direct) return direct;
-    return zoneManager.findEntityByName(target);
+    if (direct && direct.isAlive) return direct;
+    const byName = zoneManager.findEntityByName(target);
+    return byName && byName.isAlive ? byName : null;
   }
 
   private calculateHeadingFromVector(dx: number, dy: number): number {
@@ -956,11 +958,19 @@ export class DistributedWorldManager {
       });
 
       if (newHp <= 0) {
+        zoneManager.setEntityAlive(targetId, false);
+        zoneManager.setEntityCombatState(targetId, false);
+        await this.broadcastNearbyUpdate(zoneManager.getZone().id);
+
         await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
           eventType: 'combat_death',
           timestamp: now,
           eventTypeData: { targetId },
         });
+
+        if (!targetSnapshot.isPlayer) {
+          await this.scheduleMobRespawn(targetId, zoneManager.getZone().id, targetSnapshot.maxHealth);
+        }
       }
     }
   }
@@ -1158,12 +1168,16 @@ export class DistributedWorldManager {
         currentHp: newHealth,
         currentStamina: Math.max(0, snapshot.currentStamina - staminaCost),
         currentMana: Math.max(0, snapshot.currentMana - manaCost),
+        isAlive: newHealth > 0,
       });
       return;
     }
 
     if (healthCost > 0) {
-      await CompanionService.updateHealth(snapshot.entityId, newHealth);
+      await CompanionService.updateStatus(snapshot.entityId, {
+        currentHealth: newHealth,
+        isAlive: newHealth > 0,
+      });
     }
   }
 
@@ -1172,10 +1186,36 @@ export class DistributedWorldManager {
     newHealth: number
   ): Promise<void> {
     if (snapshot.isPlayer) {
-      await CharacterService.updateResources(snapshot.entityId, { currentHp: newHealth });
+      await CharacterService.updateResources(snapshot.entityId, { currentHp: newHealth, isAlive: newHealth > 0 });
     } else {
-      await CompanionService.updateHealth(snapshot.entityId, newHealth);
+      await CompanionService.updateStatus(snapshot.entityId, {
+        currentHealth: newHealth,
+        isAlive: newHealth > 0,
+      });
     }
+  }
+
+  private async scheduleMobRespawn(companionId: string, zoneId: string, maxHealth: number): Promise<void> {
+    if (this.respawnTimers.has(companionId)) return;
+
+    const companion = await CompanionService.findById(companionId);
+    if (!companion || !companion.tag?.startsWith('mob.')) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        await CompanionService.updateStatus(companionId, { currentHealth: maxHealth, isAlive: true });
+        const zoneManager = this.zones.get(zoneId);
+        if (zoneManager) {
+          zoneManager.setEntityAlive(companionId, true);
+          zoneManager.setEntityCombatState(companionId, false);
+          await this.broadcastNearbyUpdate(zoneId);
+        }
+      } finally {
+        this.respawnTimers.delete(companionId);
+      }
+    }, 120000);
+
+    this.respawnTimers.set(companionId, timer);
   }
 
   private async handleNpcInhabit(message: MessageEnvelope): Promise<void> {
@@ -1681,6 +1721,11 @@ export class DistributedWorldManager {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down distributed world manager');
+
+    for (const timer of this.respawnTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.respawnTimers.clear();
 
     // Unassign all zones
     for (const zoneId of this.zones.keys()) {

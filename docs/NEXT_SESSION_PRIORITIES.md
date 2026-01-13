@@ -4,6 +4,16 @@
 
 ---
 
+## Owner Notes (Next Session)
+
+- NPC personality matrix for LLM context
+- Simple grouping with NPCs or other players
+- Stephentown area pass (persistent structure vs ephemeral)
+- Cyberspace layer for deck/jack-in/technomance play
+- Push client work toward the 3D client
+
+---
+
 ## Priority 1: Combat System Implementation
 
 With spatial navigation now complete (bearing/elevation/range), we can implement the core combat mechanics.
@@ -363,7 +373,7 @@ With combat working, players need items, equipment, and loot.
 
 You already have two functional clients in progress:
 
-### WorldOfDarkness_MUD_Client
+### AshesAndAether_MUD_Client
 **Tech**: .NET 8, Terminal.Gui, SocketIOClient
 
 **Features (v0.1)**:
@@ -381,7 +391,7 @@ You already have two functional clients in progress:
 **Protocol Support**:
 - Both `event` mode (one event per message type) and `envelope` mode (single event with `{ type, payload }`)
 
-**Location**: `../WorldOfDarkness_MUD_Client`
+**Location**: `../AshesAndAether_MUD_Client`
 
 **Docs**:
 - `docs/mud-client/README.md`
@@ -391,7 +401,7 @@ You already have two functional clients in progress:
 - `docs/mud-client/controls.md`
 - `docs/mud-client/themes.md`
 
-### WorldOfDarkness_LLM_Airlock
+### AshesAndAether_LLM_Airlock
 **Tech**: Node.js + TypeScript
 
 **Features**:
@@ -411,7 +421,7 @@ You already have two functional clients in progress:
 - Ollama (local)
 - Any OpenAI-compatible endpoint
 
-**Location**: `../WorldOfDarkness_LLM_Airlock`
+**Location**: `../AshesAndAether_LLM_Airlock`
 
 **Docs**:
 - `README.md`

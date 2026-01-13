@@ -50,8 +50,8 @@
    - Loot system
 
 **Context Documented**:
-- **WorldOfDarkness_MUD_Client**: Feature-rich .NET text client with position ring widget, entity roster with Approach/Evade buttons
-- **WorldOfDarkness_LLM_Airlock**: Safety layer for LLM interactions with pre-validation and social mode adjustments
+- **AshesAndAether_MUD_Client**: Feature-rich .NET text client with position ring widget, entity roster with Approach/Evade buttons
+- **AshesAndAether_LLM_Airlock**: Safety layer for LLM interactions with pre-validation and social mode adjustments
 
 ## Technical Details
 

@@ -6,7 +6,7 @@ import { GameServer } from '@/network/GameServer';
 dotenv.config();
 
 async function main() {
-  logger.info('Starting World of Darkness MMO Server...');
+  logger.info('Starting Ashes & Aether MMO Server...');
   logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
 
   // Create and initialize the game server

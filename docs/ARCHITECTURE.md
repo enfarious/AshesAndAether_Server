@@ -1,4 +1,4 @@
-# World of Darkness MMO - Server Architecture
+# Ashes & Aether MMO - Server Architecture
 
 ## Overview
 A modular monolithic server architecture built with Node.js/TypeScript, designed to support multiple client types (text, 2D, 3D, VR) with tactical combat, AI companions, and wildlife simulation.

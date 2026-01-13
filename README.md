@@ -1,6 +1,9 @@
-# World of Darkness MMO
+# Ashes & Aether: Life on the Shatterline
 
 An MMORPG of supernatural persuasions, featuring tactical combat, AI companions, and living wildlife ecosystems.
+
+The Shatterline is a rift in upstate New York. No one returned from the first expeditions, but things return from it.
+City-states cling to the old world with hard tech and harder borders while the wild grows clever and hungry.
 
 ## Overview
 

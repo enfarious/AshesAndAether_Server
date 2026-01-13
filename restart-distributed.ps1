@@ -6,15 +6,15 @@ param(
 )
 
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "World of Darkness - Restart Servers" -ForegroundColor Cyan
+Write-Host "Ashes & Aether - Restart Servers" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
 # Find and close PowerShell windows running the servers
 Write-Host "Stopping existing servers..." -ForegroundColor Yellow
 
 # Window titles for server consoles
-$gatewayWindowTitle = "World of Darkness - Gateway"
-$zoneWindowTitle = "World of Darkness - Zone"
+$gatewayWindowTitle = "Ashes & Aether - Gateway"
+$zoneWindowTitle = "Ashes & Aether - Zone"
 $repoRoot = (Resolve-Path $PSScriptRoot).Path
 
 # Get all PowerShell windows running tsx watch commands

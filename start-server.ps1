@@ -1,4 +1,4 @@
-# World of Darkness Server Launcher
+# Ashes & Aether Server Launcher
 # Auto-restart script with logging
 
 param(
@@ -19,7 +19,7 @@ $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $LogFile = Join-Path $LogDir "server_$Timestamp.log"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "World of Darkness Server Launcher" -ForegroundColor Cyan
+Write-Host "Ashes & Aether Server Launcher" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Log file: $LogFile" -ForegroundColor Gray
 Write-Host "Auto-restart: $(-not $NoRestart)" -ForegroundColor Gray

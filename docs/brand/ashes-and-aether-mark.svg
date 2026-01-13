@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="420" viewBox="0 0 420 420" role="img" aria-label="Ashes &amp; Aether mark">
+  <defs>
+    <linearGradient id="totemWood" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4C3A30"/>
+      <stop offset="50%" stop-color="#3A2A24"/>
+      <stop offset="100%" stop-color="#241A17"/>
+    </linearGradient>
+    <linearGradient id="aetherGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#E8D8B8"/>
+      <stop offset="50%" stop-color="#C08457"/>
+      <stop offset="100%" stop-color="#6A3A2A"/>
+    </linearGradient>
+    <linearGradient id="techStrand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#687A78"/>
+      <stop offset="100%" stop-color="#2A3735"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Totem body -->
+  <path d="M210 54
+           C188 72,168 112,168 148
+           C168 178,184 196,184 228
+           C184 262,166 288,166 320
+           C166 342,182 358,210 366
+           C238 358,254 342,254 320
+           C254 288,236 262,236 228
+           C236 196,252 178,252 148
+           C252 112,232 72,210 54Z"
+        fill="url(#totemWood)" stroke="#1E1512" stroke-width="4"/>
+
+  <!-- Spirit animal: owl mask -->
+  <path d="M150 110 L210 82 L270 110 L252 150 L210 170 L168 150 Z"
+        fill="#2B201C" stroke="#1C1412" stroke-width="3"/>
+  <circle cx="192" cy="128" r="10" fill="#D8C5A6"/>
+  <circle cx="228" cy="128" r="10" fill="#D8C5A6"/>
+  <circle cx="192" cy="128" r="4" fill="#1A1210"/>
+  <circle cx="228" cy="128" r="4" fill="#1A1210"/>
+
+  <!-- Spirit animal: wolf jaw -->
+  <path d="M160 218 L210 248 L260 218 L248 260 L210 286 L172 260 Z"
+        fill="#2B201C" stroke="#1C1412" stroke-width="3"/>
+  <path d="M190 246 L210 258 L230 246" fill="none" stroke="#D8C5A6" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Corrupted aether veins -->
+  <path d="M210 76 C198 108,224 132,206 166 C188 202,224 226,204 262 C186 300,214 334,210 354"
+        fill="none" stroke="url(#aetherGlow)" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="204" cy="166" r="6" fill="#E9A15D"/>
+  <circle cx="214" cy="262" r="5" fill="#E9A15D"/>
+
+  <!-- Tech containment strands -->
+  <g fill="none" stroke="url(#techStrand)" stroke-width="4" stroke-linecap="round">
+    <path d="M96 120 C120 150,134 182,146 218"/>
+    <path d="M324 120 C300 150,286 182,274 218"/>
+    <path d="M118 280 C146 300,170 318,196 334"/>
+    <path d="M302 280 C274 300,250 318,224 334"/>
+  </g>
+  <g fill="#6B7C78">
+    <circle cx="146" cy="218" r="5"/>
+    <circle cx="274" cy="218" r="5"/>
+    <circle cx="196" cy="334" r="4"/>
+    <circle cx="224" cy="334" r="4"/>
+  </g>
+</svg>

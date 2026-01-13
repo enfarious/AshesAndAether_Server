@@ -1,4 +1,4 @@
-# Stat System - World of Darkness MMO
+# Stat System - Ashes & Aether MMO
 
 ## Philosophy
 
