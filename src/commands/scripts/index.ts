@@ -11,6 +11,7 @@ import { emoteCommand } from './social/emote';
 import { shoutCommand } from './social/shout';
 import { attackCommand } from './combat/attack';
 import { castCommand } from './combat/cast';
+import { useCommand } from './inventory/use';
 
 import { lookCommand } from './perception/look';
 import { listenCommand } from './perception/listen';
@@ -22,6 +23,7 @@ import { inventoryCommand } from './system/inventory';
 
 import { moveCommand } from './movement/move';
 import { stopCommand } from './movement/stop';
+import { companionCommand } from './world/companion';
 
 /**
  * Register all Phase 1 commands
@@ -42,10 +44,14 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(helpCommand);
   registry.register(statsCommand);
   registry.register(inventoryCommand);
+  registry.register(useCommand);
 
   // Movement commands
   registry.register(moveCommand);
   registry.register(stopCommand);
+
+  // World commands
+  registry.register(companionCommand);
 
   // Combat commands
   registry.register(attackCommand);
@@ -62,9 +68,11 @@ export function getAllCommandNames(): string[] {
     // Perception
     'look', 'listen', 'sense',
     // System
-    'help', 'stats', 'inventory',
+    'help', 'stats', 'inventory', 'use',
     // Movement
     'move', 'stop',
+    // World
+    'companion',
     // Combat
     'attack', 'cast',
   ];

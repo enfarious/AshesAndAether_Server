@@ -6,7 +6,7 @@ import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } 
 
 export const castCommand: CommandDefinition = {
   name: 'cast',
-  aliases: ['ability'],
+  aliases: ['ability', 'magic'],
   description: 'Cast a named ability on a target',
   category: 'combat',
   usage: '/cast "<ability>" <target>',

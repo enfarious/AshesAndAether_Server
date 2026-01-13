@@ -676,6 +676,14 @@ export class DistributedWorldManager {
           });
           break;
         }
+        case 'item_use': {
+          // Item system not wired yet; accept command for now.
+          break;
+        }
+        case 'companion_command': {
+          // Companion cycling is handled client-side or by airlock control.
+          break;
+        }
         default:
           return {
             success: false,

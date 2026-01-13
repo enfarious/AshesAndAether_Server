@@ -104,8 +104,7 @@
 
 ```bash
 /attack <target>               # Basic attack
-/cast <ability> [target:<entity>] [power:<number>]
-/use <ability>                 # Use ability from loadout
+/cast <ability> [target:<entity>] [power:<number>]  # Aliases: /ability, /magic
 /target <entity>               # Set current target
 /assist <player>               # Target their target
 /focus <entity>                # Set focus (off-target)
@@ -130,7 +129,7 @@
 /inventory                     # Show inventory
 /equip <item>                  # Equip item
 /unequip <slot>                # Unequip slot
-/use <item>                    # Use consumable
+/use <item>                    # Use consumable (alias: /item)
 /drop <item> [count:<n>]       # Drop item
 /give <player> <item> [count:<n>]
 /trade <player>                # Open trade window
@@ -157,6 +156,7 @@
 /map                           # Show local map
 /who                           # List nearby players
 /time                          # Show in-game time
+/companion <next|prev>         # Cycle companion control (alias: /comp)
 ```
 
 ### System Commands
@@ -567,8 +567,8 @@ interface CommandResponseMessage {
 
 1. `/attack`
 2. `/cast`
-3. `/use`
-4. `/target`
+3. `/target`
+4. `/focus`
 
 ### Phase 4: Advanced Features
 

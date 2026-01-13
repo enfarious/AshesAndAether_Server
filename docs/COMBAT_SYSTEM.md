@@ -125,8 +125,7 @@ It focuses on server-authoritative rules, event flow, and the minimal data model
 Slash commands are first class scripts and should generate combat events:
 
 - `/attack <target>` -> basic melee
-- `/<ability> <target>` -> ability cast
-- `/<spell> <target>` -> ability cast
+- `/cast <ability> <target>` -> ability cast (aliases: /ability, /magic)
 - `/flee` -> escape attempt
 - `/guard <target>` -> damage reduction on ally
 

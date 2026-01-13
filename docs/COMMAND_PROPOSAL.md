@@ -106,7 +106,7 @@ shouting should be able to cause aggro, mobs will hear speech and shouting or ca
 
 ```bash
 /attack <target>               # Basic attack
-/<ability> [target]            # Use ability from loadout - All abilities are first class slash commands too
+/cast <ability> [target]       # Aliases: /ability, /magic
 /shift                         # Shift to Changed form (werewolf, etc.) costly, time, vuln while shifting
 /unshift                       # Return to human form
 /flee                          # Attempt to escape combat
@@ -222,7 +222,6 @@ Many of these verbs are just needed. Most MOOs and MUDs have WAY more. IRL has W
 ### ❌ Generic Fantasy Commands
 
 ```bash
-/cast                          # Too D&D, every spell/ability is a first class script
 /meditate                      # Not atmospheric for horror survival
 /rest                          # Maybe /sleep in safe zones instead?
 ```
