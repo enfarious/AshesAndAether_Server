@@ -1,9 +1,24 @@
 import { StatCalculator } from '@/game/stats/StatCalculator';
+import type { DamageType } from '@/game/abilities/AbilityTypes';
 import { CombatAbilityDefinition, CombatStats, DamageResult } from './types';
 
 const BASE_CRIT_CHANCE = 5;
 const BASE_PENETRATING_CHANCE = 5;
 const BASE_DEFLECTED_CHANCE = 5;
+
+// Maps all damage types to their mitigation category
+// Physical: uses defense rating and damage absorption
+// Magic: uses magic defense and magic absorption
+const MITIGATION_CATEGORY: Record<DamageType, 'physical' | 'magic'> = {
+  physical: 'physical',
+  magic: 'magic',
+  fire: 'magic',
+  ice: 'magic',
+  lightning: 'magic',
+  poison: 'magic',
+  holy: 'magic',
+  dark: 'magic',
+};
 
 export class DamageCalculator {
   calculate(
@@ -13,9 +28,10 @@ export class DamageCalculator {
     scalingValue: number
   ): DamageResult {
     const damageType = ability.damage?.type || 'physical';
+    const mitigationCategory = MITIGATION_CATEGORY[damageType];
     const baseDamage = this.calculateBaseDamage(ability, attacker, scalingValue);
 
-    const hitChance = damageType === 'magic'
+    const hitChance = mitigationCategory === 'magic'
       ? StatCalculator.calculateHitChance(attacker.magicAccuracy, defender.magicEvasion)
       : StatCalculator.calculateHitChance(attacker.physicalAccuracy, defender.evasion);
 
@@ -36,21 +52,21 @@ export class DamageCalculator {
 
     if (outcome === 'crit') {
       damage = StatCalculator.calculateCriticalDamage(baseDamage, 1.5);
-      mitigatedDamage = this.applyMitigation(damage, defender, damageType, false);
+      mitigatedDamage = this.applyMitigation(damage, defender, mitigationCategory, false);
     } else if (outcome === 'glance') {
-      mitigatedDamage = this.applyMitigation(baseDamage, defender, damageType, true);
+      mitigatedDamage = this.applyMitigation(baseDamage, defender, mitigationCategory, true);
       damage = mitigatedDamage;
     } else if (outcome === 'penetrating') {
-      mitigatedDamage = this.applyPenetrating(baseDamage, defender, damageType);
+      mitigatedDamage = this.applyPenetrating(baseDamage, defender, mitigationCategory);
       damage = mitigatedDamage;
     } else if (outcome === 'deflected') {
       mitigatedDamage = Math.max(
         1,
-        Math.floor(this.applyMitigation(baseDamage, defender, damageType, false) * 0.5)
+        Math.floor(this.applyMitigation(baseDamage, defender, mitigationCategory, false) * 0.5)
       );
       damage = mitigatedDamage;
     } else {
-      mitigatedDamage = this.applyMitigation(baseDamage, defender, damageType, false);
+      mitigatedDamage = this.applyMitigation(baseDamage, defender, mitigationCategory, false);
       damage = mitigatedDamage;
     }
 
@@ -121,7 +137,6 @@ export class DamageCalculator {
     const penetrating = this.clampChance(attacker.penetratingBlowChance, BASE_PENETRATING_CHANCE);
     const deflected = this.clampChance(attacker.deflectedBlowChance, BASE_DEFLECTED_CHANCE);
 
-    const total = crit + glance + penetrating + deflected;
     const roll = Math.random() * 100;
 
     if (roll < crit) return 'crit';

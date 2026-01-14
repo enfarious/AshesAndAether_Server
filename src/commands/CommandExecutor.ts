@@ -9,8 +9,6 @@ import { CommandParser } from './CommandParser';
 import type {
   CommandContext,
   CommandResult,
-  CommandError,
-  CommandErrorCode,
   ParsedCommand,
 } from './types';
 
@@ -153,8 +151,8 @@ export class CommandExecutor {
    * Check if character has required permissions
    */
   private async checkPermissions(
-    context: CommandContext,
-    requiredPermissions: string[]
+    _context: CommandContext,
+    _requiredPermissions: string[]
   ): Promise<boolean> {
     // TODO: Implement permission system
     // For now, all commands are allowed

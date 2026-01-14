@@ -14,7 +14,7 @@ export const listenCommand: CommandDefinition = {
 
   cooldown: 5000,  // 5 second cooldown (prevent spam)
 
-  handler: async (context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
+  handler: async (context: CommandContext, _args: ParsedCommand): Promise<CommandResult> => {
     // Create perception event for narrator with dice roll
     return {
       success: true,

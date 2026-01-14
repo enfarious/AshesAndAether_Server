@@ -14,7 +14,7 @@ export const senseCommand: CommandDefinition = {
 
   cooldown: 10000,  // 10 second cooldown (powerful ability)
 
-  handler: async (context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
+  handler: async (context: CommandContext, _args: ParsedCommand): Promise<CommandResult> => {
     // Create perception event for narrator with Changed type context
     return {
       success: true,

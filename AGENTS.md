@@ -7,6 +7,7 @@ Always read this file in full and those files in /.agents
 **The user can spin up services quickly and enjoys doing so.**
 
 When you need a database, Redis, message queue, or any other service:
+
 - **ASK** instead of assuming or suggesting workarounds
 - The user likely has it available or can set it up in minutes
 - Examples: PostgreSQL, Redis, RabbitMQ, Elasticsearch, etc.

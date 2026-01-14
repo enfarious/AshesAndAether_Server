@@ -12,7 +12,7 @@ export const inventoryCommand: CommandDefinition = {
   usage: '/inventory',
   examples: ['/inventory', '/inv'],
 
-  handler: async (context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
+  handler: async (context: CommandContext, _args: ParsedCommand): Promise<CommandResult> => {
     // Request inventory from database
     return {
       success: true,

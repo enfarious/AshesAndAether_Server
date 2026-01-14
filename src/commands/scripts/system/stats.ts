@@ -12,7 +12,7 @@ export const statsCommand: CommandDefinition = {
   usage: '/stats',
   examples: ['/stats'],
 
-  handler: async (context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
+  handler: async (context: CommandContext, _args: ParsedCommand): Promise<CommandResult> => {
     // Request character stats from database
     return {
       success: true,

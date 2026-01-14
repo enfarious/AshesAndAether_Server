@@ -1,6 +1,7 @@
 import { logger } from '@/utils/logger';
 import { CharacterService, CompanionService, ZoneService } from '@/database';
 import { ZoneManager } from './ZoneManager';
+import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
 import { NPCAIController, LLMService } from '@/ai';
 import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands } from '@/commands';
@@ -11,6 +12,7 @@ import { CombatManager } from '@/combat/CombatManager';
 import { AbilitySystem } from '@/combat/AbilitySystem';
 import { DamageCalculator } from '@/combat/DamageCalculator';
 import type { CombatAbilityDefinition, CombatStats } from '@/combat/types';
+import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
 
 const FEET_TO_METERS = 0.3048;
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
@@ -34,6 +36,7 @@ export class DistributedWorldManager {
   private abilitySystem: AbilitySystem;
   private damageCalculator: DamageCalculator;
   private respawnTimers: Map<string, NodeJS.Timeout> = new Map();
+  private movementSystem: MovementSystem;
 
   // Command system
   private commandRegistry: CommandRegistry;
@@ -50,6 +53,12 @@ export class DistributedWorldManager {
     this.combatManager = new CombatManager();
     this.abilitySystem = new AbilitySystem();
     this.damageCalculator = new DamageCalculator();
+    this.movementSystem = new MovementSystem();
+
+    // Set up movement completion callback
+    this.movementSystem.setMovementCompleteCallback(
+      (characterId, reason, finalPosition) => this.onMovementComplete(characterId, reason, finalPosition)
+    );
 
     // Initialize command system
     this.commandRegistry = new CommandRegistry();
@@ -83,6 +92,9 @@ export class DistributedWorldManager {
       const zoneManager = new ZoneManager(zone);
       await zoneManager.initialize();
       this.zones.set(zone.id, zoneManager);
+
+      // Register with movement system for entity lookups
+      this.movementSystem.registerZoneManager(zone.id, zoneManager);
 
       // Initialize NPC AI controllers for this zone
       await this.initializeNPCsForZone(zoneId);
@@ -216,6 +228,11 @@ export class DistributedWorldManager {
     const zoneManager = this.zones.get(zoneId);
 
     if (!zoneManager) return;
+
+    // Stop any active movement
+    if (this.movementSystem.isMoving(characterId)) {
+      this.movementSystem.stopMovement({ characterId, zoneId });
+    }
 
     zoneManager.removePlayer(characterId);
     this.characterToZone.delete(characterId);
@@ -575,104 +592,49 @@ export class DistributedWorldManager {
           );
           break;
         }
-        case 'movement': {
-          const { heading, target, targetRange } = event.data as {
+        case 'movement_start': {
+          const { heading, speed, distance, target, targetRange, startPosition } = event.data as {
             heading?: number;
+            speed: MovementSpeed;
+            distance?: number;
             target?: string;
-            targetRange?: number;
+            targetRange: number;
+            startPosition: Vector3;
           };
 
-          const character = await CharacterService.findById(context.characterId);
-          if (!character) {
+          const movementEvent: MovementStartEvent = {
+            characterId: context.characterId,
+            zoneId: context.zoneId,
+            startPosition,
+            heading,
+            speed,
+            distance,
+            target,
+            targetRange,
+          };
+
+          const started = await this.movementSystem.startMovement(movementEvent);
+          if (!started) {
             return {
               success: false,
-              error: 'Character not found.',
+              error: 'Failed to start movement. Target may not exist.',
             };
           }
 
-          let nextPosition = { ...context.position };
-          let nextHeading = heading ?? context.heading;
-
-          if (target) {
-            const targetEntity = this.resolveCombatTarget(zoneManager, target);
-            if (!targetEntity) {
-              return {
-                success: false,
-                error: `Target '${target}' not found.`,
-              };
-            }
-
-            const desiredRangeMeters = (targetRange ?? 5) * FEET_TO_METERS;
-            const dx = targetEntity.position.x - context.position.x;
-            const dy = targetEntity.position.y - context.position.y;
-            const dz = targetEntity.position.z - context.position.z;
-            const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-            if (distance > 0.001) {
-              const unitX = dx / distance;
-              const unitY = dy / distance;
-              const unitZ = dz / distance;
-
-              const clampedRange = Math.max(0, desiredRangeMeters);
-              const travel = Math.max(0, distance - clampedRange);
-
-              nextPosition = {
-                x: context.position.x + unitX * travel,
-                y: context.position.y + unitY * travel,
-                z: context.position.z + unitZ * travel,
-              };
-              nextHeading = this.calculateHeadingFromVector(dx, dz);
-            }
-          } else if (nextHeading !== undefined) {
-            const derived = StatCalculator.calculateDerivedStats(
-              {
-                strength: character.strength,
-                vitality: character.vitality,
-                dexterity: character.dexterity,
-                agility: character.agility,
-                intelligence: character.intelligence,
-                wisdom: character.wisdom,
-              },
-              character.level
-            );
-
-            const distance = Math.max(0.5, derived.movementSpeed);
-            const radians = (nextHeading * Math.PI) / 180;
-
-            nextPosition = {
-              x: context.position.x + Math.sin(radians) * distance,
-              y: context.position.y,
-              z: context.position.z + Math.cos(radians) * distance,
-            };
-          } else {
-            return {
-              success: false,
-              error: 'Movement requires a heading or target.',
-            };
+          // Update character heading in database if we have one
+          if (heading !== undefined) {
+            await CharacterService.updatePosition(context.characterId, {
+              ...startPosition,
+              heading,
+            });
           }
-
-          const actor = zoneManager.getEntity(context.characterId);
-          if (!actor) {
-            return {
-              success: false,
-              error: 'You are not present in the zone.',
-            };
-          }
-
-          zoneManager.updatePlayerPosition(context.characterId, nextPosition);
-          await CharacterService.updatePosition(context.characterId, {
-            ...nextPosition,
-            heading: nextHeading,
-          });
-
-          await this.sendProximityRosterToEntity(context.characterId);
-          await this.broadcastNearbyUpdate(context.zoneId);
           break;
         }
         case 'movement_stop': {
-          await CharacterService.updatePosition(context.characterId, {
-            ...context.position,
-            heading: context.heading,
+          // Stop any active movement
+          this.movementSystem.stopMovement({
+            characterId: context.characterId,
+            zoneId: context.zoneId,
           });
           break;
         }
@@ -819,15 +781,6 @@ export class DistributedWorldManager {
     if (direct && direct.isAlive) return direct;
     const byName = zoneManager.findEntityByName(target);
     return byName && byName.isAlive ? byName : null;
-  }
-
-  private calculateHeadingFromVector(dx: number, dz: number): number {
-    if (dx === 0 && dz === 0) return 0;
-    let bearing = Math.atan2(dx, dz) * (180 / Math.PI);
-    if (bearing < 0) {
-      bearing += 360;
-    }
-    return Math.round(bearing);
   }
 
   private async executeCombatAction(
@@ -1681,11 +1634,111 @@ export class DistributedWorldManager {
   /**
    * Update tick - called by game loop
    */
-  update(_deltaTime: number): void {
-    const expired = this.combatManager.update(_deltaTime, () => 0);
+  update(deltaTime: number): void {
+    // Update combat system (ATB, cooldowns, combat timeouts)
+    const expired = this.combatManager.update(deltaTime, () => 0);
     if (expired.length > 0) {
       void this.handleCombatTimeouts(expired);
     }
+
+    // Update movement system
+    const positionUpdates = this.movementSystem.update(deltaTime);
+    if (positionUpdates.size > 0) {
+      void this.handleMovementUpdates(positionUpdates);
+    }
+  }
+
+  /**
+   * Handle position updates from movement system
+   */
+  private async handleMovementUpdates(updates: Map<string, Vector3>): Promise<void> {
+    const zoneUpdates = new Set<string>();
+
+    for (const [characterId, position] of updates) {
+      const zoneId = this.characterToZone.get(characterId);
+      if (!zoneId) continue;
+
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) continue;
+
+      // Update position in zone manager
+      zoneManager.updatePlayerPosition(characterId, position);
+      zoneUpdates.add(zoneId);
+
+      // Send proximity roster to moving player
+      await this.sendProximityRosterToEntity(characterId);
+    }
+
+    // Broadcast updates to all affected zones
+    for (const zoneId of zoneUpdates) {
+      await this.broadcastNearbyUpdate(zoneId);
+    }
+  }
+
+  /**
+   * Called when movement completes (reached destination, stopped, etc.)
+   */
+  private async onMovementComplete(
+    characterId: string,
+    reason: 'command' | 'distance_reached' | 'target_reached' | 'target_lost' | 'boundary',
+    finalPosition: Vector3
+  ): Promise<void> {
+    const zoneId = this.characterToZone.get(characterId);
+    if (!zoneId) return;
+
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    // Update position one final time
+    zoneManager.updatePlayerPosition(characterId, finalPosition);
+
+    // Get socket ID to notify player
+    const socketId = zoneManager.getSocketIdForCharacter(characterId);
+    if (socketId) {
+      // Build narrative message based on reason
+      let narrative: string;
+      switch (reason) {
+        case 'distance_reached':
+          narrative = 'You arrive at your destination.';
+          break;
+        case 'target_reached':
+          narrative = 'You reach your target.';
+          break;
+        case 'target_lost':
+          narrative = 'You stop moving. Target lost.';
+          break;
+        case 'boundary':
+          narrative = 'You stop at the zone boundary.';
+          break;
+        default:
+          narrative = 'You stop moving.';
+      }
+
+      // Send movement complete event to player
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: {
+          socketId,
+          event: 'event',
+          data: {
+            eventType: 'movement_complete',
+            reason,
+            narrative,
+            position: finalPosition,
+            timestamp: Date.now(),
+          },
+        },
+        timestamp: Date.now(),
+      });
+    }
+
+    // Final proximity update
+    await this.sendProximityRosterToEntity(characterId);
+    await this.broadcastNearbyUpdate(zoneId);
+
+    logger.debug({ characterId, reason, position: finalPosition }, 'Movement completed');
   }
 
   private async handleCombatTimeouts(expired: string[]): Promise<void> {
@@ -1730,13 +1783,17 @@ export class DistributedWorldManager {
   async shutdown(): Promise<void> {
     logger.info('Shutting down distributed world manager');
 
+    // Clear all active movements (persists final positions)
+    this.movementSystem.clearAll();
+
     for (const timer of this.respawnTimers.values()) {
       clearTimeout(timer);
     }
     this.respawnTimers.clear();
 
-    // Unassign all zones
+    // Unregister zone managers from movement system
     for (const zoneId of this.zones.keys()) {
+      this.movementSystem.unregisterZoneManager(zoneId);
       await this.zoneRegistry.unassignZone(zoneId);
     }
 

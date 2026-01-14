@@ -27,8 +27,8 @@ export class AbilitySystem {
   async getAbility(abilityId: string): Promise<CombatAbilityDefinition | null> {
     try {
       const record = await AbilityService.findById(abilityId);
-      if (record?.data && typeof record.data === 'object') {
-        const data = record.data as CombatAbilityDefinition;
+      if (record?.data && typeof record.data === 'object' && !Array.isArray(record.data)) {
+        const data = record.data as unknown as CombatAbilityDefinition;
         return {
           ...data,
           id: record.id,
@@ -49,8 +49,8 @@ export class AbilitySystem {
 
     try {
       const record = await AbilityService.findByName(trimmed);
-      if (record?.data && typeof record.data === 'object') {
-        const data = record.data as CombatAbilityDefinition;
+      if (record?.data && typeof record.data === 'object' && !Array.isArray(record.data)) {
+        const data = record.data as unknown as CombatAbilityDefinition;
         return {
           ...data,
           id: record.id,
