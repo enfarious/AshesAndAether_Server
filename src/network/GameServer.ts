@@ -12,14 +12,12 @@ import { WorldManager } from '@/world/WorldManager';
 
 interface GameServerConfig {
   port: number;
-  wsPort: number;
   tickRate: number;
 }
 
 export class GameServer {
   private app: Express;
   private httpServer: HTTPServer | null = null;
-  private wsServer: HTTPServer | null = null;
   private io: SocketIOServer | null = null;
   private connectionManager: ConnectionManager | null = null;
   private worldManager: WorldManager | null = null;
@@ -108,19 +106,14 @@ export class GameServer {
     logger.info('Connecting to database...');
     await db.connect();
 
-    // Start HTTP server
+    // Start HTTP server (shared with WebSocket)
     this.httpServer = createServer(this.app);
     this.httpServer.listen(this.config.port, () => {
-      logger.info(`HTTP server listening on port ${this.config.port}`);
+      logger.info(`HTTP/WebSocket server listening on port ${this.config.port}`);
     });
 
-    // Start WebSocket server on its own port
-    this.wsServer = createServer();
-    this.wsServer.listen(this.config.wsPort, () => {
-      logger.info(`WebSocket server listening on port ${this.config.wsPort}`);
-    });
-
-    this.io = new SocketIOServer(this.wsServer, {
+    // Attach Socket.IO to the same HTTP server
+    this.io = new SocketIOServer(this.httpServer, {
       cors: {
         origin: '*', // Configure properly in production
         methods: ['GET', 'POST'],
@@ -128,7 +121,7 @@ export class GameServer {
       path: '/socket.io/',
     });
 
-    logger.info(`WebSocket server initialized`);
+    logger.info(`Socket.IO initialized on port ${this.config.port}`);
 
     // Initialize managers
     this.worldManager = new WorldManager();
@@ -185,20 +178,11 @@ export class GameServer {
       await this.connectionManager.disconnectAll();
     }
 
-    // Close WebSocket server
+    // Close Socket.IO
     if (this.io) {
       await new Promise<void>((resolve) => {
         this.io?.close(() => {
-          logger.info('WebSocket server closed');
-          resolve();
-        });
-      });
-    }
-
-    if (this.wsServer) {
-      await new Promise<void>((resolve) => {
-        this.wsServer?.close(() => {
-          logger.info('WebSocket HTTP server closed');
+          logger.info('Socket.IO closed');
           resolve();
         });
       });

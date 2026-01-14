@@ -12,7 +12,6 @@ async function main() {
   // Create and initialize the game server
   const server = new GameServer({
     port: parseInt(process.env.PORT || '3000'),
-    wsPort: parseInt(process.env.WS_PORT || '3001'),
     tickRate: parseInt(process.env.TICK_RATE || '10'),
   });
 
