@@ -1,5 +1,3 @@
-// Prisma schema for Ashes & Aether MMO
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -9,367 +7,229 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ============================================================================
-// Authentication & Accounts
-// ============================================================================
-
 model Account {
-  id            String      @id @default(uuid())
-  email         String?     @unique
-  passwordHash  String?
-  username      String      @unique
-  createdAt     DateTime    @default(now())
-  lastLoginAt   DateTime?
-
-  // Replit Auth fields
-  replitId      String?     @unique
-  profileImageUrl String?
-  firstName     String?
-  lastName      String?
-
-  characters    Character[]
-  sessions      Session[]
+  id           String      @id @default(uuid())
+  email        String      @unique
+  passwordHash String
+  username     String      @unique
+  createdAt    DateTime    @default(now())
+  lastLoginAt  DateTime?
+  characters   Character[]
 
   @@map("accounts")
 }
 
-model Session {
-  sid       String    @id @db.VarChar(255)
-  sess      Json
-  expire    DateTime
-  accountId String?
-
-  account   Account?  @relation(fields: [accountId], references: [id], onDelete: Cascade)
-
-  @@index([expire])
-  @@map("sessions")
-}
-
-// ============================================================================
-// Characters
-// ============================================================================
-
 model Character {
-  id              String          @id @default(uuid())
-  accountId       String
-  name            String
-  level           Int             @default(1)
-  experience      Int             @default(0)
-  abilityPoints   Int             @default(0)
-
-  // Supernatural type and powers
-  supernaturalType String?        // null for mortals, "vampire", "werewolf", etc
-  supernaturalData Json?          // Type-specific data (clan, tribe, etc)
-
-  // Core Stats (6 primary attributes)
-  strength        Int             @default(10)
-  vitality        Int             @default(10)
-  dexterity       Int             @default(10)
-  agility         Int             @default(10)
-  intelligence    Int             @default(10)
-  wisdom          Int             @default(10)
-
-  // Derived stats (cached for performance)
-  maxHp           Int             @default(200)
-  maxStamina      Int             @default(100)
-  maxMana         Int             @default(100)
-  attackRating    Float           @default(30)
-  defenseRating   Float           @default(5)
-  magicAttack     Float           @default(30)
-  magicDefense    Float           @default(5)
-
-  // Current state
-  currentHp       Int             @default(200)
-  currentStamina  Int             @default(100)
-  currentMana     Int             @default(100)
-  isAlive         Boolean         @default(true)
-
-  // Position in world
-  zoneId          String
-  positionX       Float
-  positionY       Float
-  positionZ       Float
-  heading         Float           @default(0)  // 0-360 degrees
-  rotation        Float           @default(0)  // Deprecated, use heading
-
-  // Progression
-  unlockedFeats     Json          @default("[]")  // Array of feat IDs
-  unlockedAbilities Json          @default("[]")  // Array of ability IDs
-
-  // Loadouts (8 active, 8 passive, 4 special)
-  activeLoadout   Json            @default("[]")  // 8 ability IDs
-  passiveLoadout  Json            @default("[]")  // 8 ability IDs
-  specialLoadout  Json            @default("[]")  // 4 ability IDs (from equipment)
-
-  // Inventory
-  inventory       InventoryItem[]
-
-  // Relationships
-  account         Account         @relation(fields: [accountId], references: [id])
-  zone            Zone            @relation(fields: [zoneId], references: [id])
-
-  // Timestamps
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
-  lastSeenAt      DateTime        @default(now())
+  id                String          @id @default(uuid())
+  accountId         String
+  name              String
+  level             Int             @default(1)
+  experience        Int             @default(0)
+  abilityPoints     Int             @default(0)
+  supernaturalType  String?
+  supernaturalData  Json?
+  strength          Int             @default(10)
+  vitality          Int             @default(10)
+  dexterity         Int             @default(10)
+  agility           Int             @default(10)
+  intelligence      Int             @default(10)
+  wisdom            Int             @default(10)
+  maxHp             Int             @default(200)
+  maxStamina        Int             @default(100)
+  maxMana           Int             @default(100)
+  attackRating      Float           @default(30)
+  defenseRating     Float           @default(5)
+  magicAttack       Float           @default(30)
+  magicDefense      Float           @default(5)
+  currentHp         Int             @default(200)
+  currentStamina    Int             @default(100)
+  currentMana       Int             @default(100)
+  isAlive           Boolean         @default(true)
+  zoneId            String
+  positionX         Float
+  positionY         Float
+  positionZ         Float
+  heading           Float           @default(0)
+  rotation          Float           @default(0)
+  unlockedFeats     Json            @default("[]")
+  unlockedAbilities Json            @default("[]")
+  activeLoadout     Json            @default("[]")
+  passiveLoadout    Json            @default("[]")
+  specialLoadout    Json            @default("[]")
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  lastSeenAt        DateTime        @default(now())
+  account           Account         @relation(fields: [accountId], references: [id])
+  zone              Zone            @relation(fields: [zoneId], references: [id])
+  inventory         InventoryItem[]
 
   @@index([accountId])
   @@index([zoneId])
   @@map("characters")
 }
 
-// ============================================================================
-// World & Zones
-// ============================================================================
-
 model Zone {
-  id              String          @id @default(uuid())
-  name            String
-  description     String?
-
-  // World coordinates (for zone connections)
-  worldX          Int
-  worldY          Int
-
-  // Zone size
-  sizeX           Float
-  sizeY           Float
-  sizeZ           Float
-
-  // Environment
-  terrainType     String          // "forest", "urban", "desert", etc
-  weatherEnabled  Boolean         @default(true)
-  timeOfDayEnabled Boolean        @default(true)
-
-  // Content rating
-  contentRating   String          @default("T")  // "T" (Teen), "M" (Mature), "AO" (Adults Only)
-
-  // Navmesh data (stored as JSON for now, could be file reference)
-  navmeshData     Json?
-
-  // Characters currently in zone
-  characters      Character[]
-
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id               String      @id @default(uuid())
+  name             String
+  description      String?
+  worldX           Int
+  worldY           Int
+  sizeX            Float
+  sizeY            Float
+  sizeZ            Float
+  terrainType      String
+  weatherEnabled   Boolean     @default(true)
+  timeOfDayEnabled Boolean     @default(true)
+  contentRating    String      @default("T")
+  navmeshData      Json?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  characters       Character[]
 
   @@unique([worldX, worldY])
   @@map("zones")
 }
 
-// ============================================================================
-// Items & Inventory
-// ============================================================================
-
 model ItemTemplate {
-  id              String          @id @default(uuid())
-  name            String
-  description     String?
-  itemType        String          // "weapon", "armor", "consumable", etc
-
-  // Stats and properties
-  properties      Json            // Item-specific properties
-
-  // Visual
-  iconUrl         String?
-  modelUrl        String?
-
-  // Economy
-  value           Int             @default(0)
-  stackable       Boolean         @default(false)
-  maxStackSize    Int             @default(1)
-
-  instances       InventoryItem[]
-
-  createdAt       DateTime        @default(now())
+  id           String          @id @default(uuid())
+  name         String
+  description  String?
+  itemType     String
+  properties   Json
+  iconUrl      String?
+  modelUrl     String?
+  value        Int             @default(0)
+  stackable    Boolean         @default(false)
+  maxStackSize Int             @default(1)
+  createdAt    DateTime        @default(now())
+  instances    InventoryItem[]
 
   @@map("item_templates")
 }
 
 model InventoryItem {
-  id              String          @id @default(uuid())
-  characterId     String
-  itemTemplateId  String
-
-  // Instance data
-  quantity        Int             @default(1)
-  durability      Float?          // For degradable items
-  customData      Json?           // Item-specific instance data
-
-  // Slot info
-  equipped        Boolean         @default(false)
-  equipSlot       String?         // "mainHand", "offHand", "head", etc
-
-  // Relationships
-  character       Character       @relation(fields: [characterId], references: [id], onDelete: Cascade)
-  template        ItemTemplate    @relation(fields: [itemTemplateId], references: [id])
+  id             String       @id @default(uuid())
+  characterId    String
+  itemTemplateId String
+  quantity       Int          @default(1)
+  durability     Float?
+  customData     Json?
+  equipped       Boolean      @default(false)
+  equipSlot      String?
+  character      Character    @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  template       ItemTemplate @relation(fields: [itemTemplateId], references: [id])
 
   @@index([characterId])
   @@map("inventory_items")
 }
 
-// ============================================================================
-// AI Companions & NPCs
-// ============================================================================
-
 model Companion {
-  id              String          @id @default(uuid())
-  name            String
-  tag             String?
-  description     String?
-
-  // AI configuration
-  personalityType String          // Personality preset or custom
-  memoryData      Json            // Long-term memory, relationships, etc
-
-  // Stats (similar to characters)
-  level           Int             @default(1)
-  stats           Json
-  currentHealth   Int
-  maxHealth       Int
-  isAlive         Boolean         @default(true)
-
-  // Position
-  zoneId          String
-  positionX       Float
-  positionY       Float
-  positionZ       Float
-
-  // LLM configuration
-  llmProvider     String          @default("anthropic")
-  llmModel        String          @default("claude-3-5-sonnet-20241022")
-  systemPrompt    String?
-
-  // Airlock possession (persistent LLM pairing)
-  possessedAirlockId String?
-
-  // Conversation history (recent only, older in separate storage)
-  conversationHistory Json        @default("[]")
-
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id                  String   @id @default(uuid())
+  name                String
+  tag                 String?
+  description         String?
+  personalityType     String
+  memoryData          Json
+  level               Int      @default(1)
+  stats               Json
+  currentHealth       Int
+  maxHealth           Int
+  isAlive             Boolean  @default(true)
+  zoneId              String
+  positionX           Float
+  positionY           Float
+  positionZ           Float
+  llmProvider         String   @default("anthropic")
+  llmModel            String   @default("claude-3-5-sonnet-20241022")
+  systemPrompt        String?
+  possessedAirlockId  String?
+  conversationHistory Json     @default("[]")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   @@index([tag])
   @@index([possessedAirlockId])
   @@map("companions")
 }
 
-// ============================================================================
-// Abilities (Hybrid: DB metadata + code execution)
-// ============================================================================
-
 model Ability {
   id          String   @id
   name        String
   description String?
   data        Json
-
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@map("abilities")
 }
 
-// ============================================================================
-// Factions & Reputation
-// ============================================================================
-
 model Faction {
   id              String              @id @default(uuid())
   name            String              @unique
   description     String?
-  factionType     String              // "vampire_clan", "werewolf_tribe", "city_faction", etc
-
-  // Parent faction (for hierarchies)
+  factionType     String
   parentFactionId String?
+  controlledZones String[]
+  createdAt       DateTime            @default(now())
+  reputations     FactionReputation[]
   parentFaction   Faction?            @relation("FactionHierarchy", fields: [parentFactionId], references: [id])
   childFactions   Faction[]           @relation("FactionHierarchy")
-
-  // Territory
-  controlledZones String[]            // Array of zone IDs
-
-  reputations     FactionReputation[]
-
-  createdAt       DateTime            @default(now())
 
   @@map("factions")
 }
 
 model FactionReputation {
-  id              String          @id @default(uuid())
-  characterId     String
-  factionId       String
-
-  reputation      Int             @default(0) // -100 to 100
-  standing        String          // "hostile", "unfriendly", "neutral", "friendly", "allied"
-
-  faction         Faction         @relation(fields: [factionId], references: [id])
+  id          String  @id @default(uuid())
+  characterId String
+  factionId   String
+  reputation  Int     @default(0)
+  standing    String
+  faction     Faction @relation(fields: [factionId], references: [id])
 
   @@unique([characterId, factionId])
   @@index([characterId])
   @@map("faction_reputations")
 }
 
-// ============================================================================
-// Quests & Objectives
-// ============================================================================
-
 model Quest {
-  id              String          @id @default(uuid())
-  title           String
-  description     String
-  questType       String          // "main", "side", "daily", "faction"
-
-  // Requirements
-  requiredLevel   Int             @default(1)
-  requiredFaction String?
-
-  // Objectives (stored as JSON for flexibility)
-  objectives      Json            // Array of objective definitions
-
-  // Rewards
-  rewards         Json            // { experience, items, reputation, etc }
-
-  // Quest chain
-  prerequisiteQuestIds String[]    // Must complete these first
-  followupQuestIds     String[]    // Unlocked after completion
-
-  createdAt       DateTime        @default(now())
+  id                   String   @id @default(uuid())
+  title                String
+  description          String
+  questType            String
+  requiredLevel        Int      @default(1)
+  requiredFaction      String?
+  objectives           Json
+  rewards              Json
+  prerequisiteQuestIds String[]
+  followupQuestIds     String[]
+  createdAt            DateTime @default(now())
 
   @@map("quests")
 }
 
 model QuestProgress {
-  id              String          @id @default(uuid())
-  characterId     String
-  questId         String
-
-  status          String          @default("active") // "active", "completed", "failed"
-  objectiveProgress Json          // Track progress on each objective
-
-  startedAt       DateTime        @default(now())
-  completedAt     DateTime?
+  id                String    @id @default(uuid())
+  characterId       String
+  questId           String
+  status            String    @default("active")
+  objectiveProgress Json
+  startedAt         DateTime  @default(now())
+  completedAt       DateTime?
 
   @@unique([characterId, questId])
   @@index([characterId])
   @@map("quest_progress")
 }
 
-// ============================================================================
-// Combat & Encounters
-// ============================================================================
-
 model CombatLog {
-  id              String          @id @default(uuid())
-  combatId        String          // Generated ID for this combat encounter
-
-  participants    Json            // Array of participant IDs and types
-  actions         Json            // Serialized combat actions
-  outcome         String          // "victory", "defeat", "fled"
-
-  startedAt       DateTime        @default(now())
-  endedAt         DateTime
-  duration        Int             // Seconds
+  id           String   @id @default(uuid())
+  combatId     String
+  participants Json
+  actions      Json
+  outcome      String
+  startedAt    DateTime @default(now())
+  endedAt      DateTime
+  duration     Int
 
   @@index([combatId])
   @@map("combat_logs")
