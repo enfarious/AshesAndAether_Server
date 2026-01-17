@@ -1,12 +1,12 @@
 import * as client from "openid-client";
 import { Strategy, type VerifyFunction } from "openid-client/passport";
+
 import passport from "passport";
 import session from "express-session";
 import type { Express, RequestHandler } from "express";
 import memoize from "memoizee";
 import connectPg from "connect-pg-simple";
-import { prisma } from '@/database/DatabaseService';
-import { logger } from '@/utils/logger';
+import { authStorage } from "./storage";
 
 const getOidcConfig = memoize(
   async () => {
@@ -18,12 +18,12 @@ const getOidcConfig = memoize(
   { maxAge: 3600 * 1000 }
 );
 
-function getSession() {
+export function getSession() {
   const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
   const pgStore = connectPg(session);
   const sessionStore = new pgStore({
     conString: process.env.DATABASE_URL,
-    createTableIfMissing: true,
+    createTableIfMissing: false,
     ttl: sessionTtl,
     tableName: "sessions",
   });
@@ -41,63 +41,26 @@ function getSession() {
 }
 
 function updateUserSession(
-  user: Express.User,
+  user: any,
   tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers
 ) {
-  const claims = tokens.claims();
-  (user as any).claims = claims;
-  (user as any).access_token = tokens.access_token;
-  (user as any).refresh_token = tokens.refresh_token;
-  (user as any).expires_at = claims?.exp;
+  user.claims = tokens.claims();
+  user.access_token = tokens.access_token;
+  user.refresh_token = tokens.refresh_token;
+  user.expires_at = user.claims?.exp;
 }
 
-async function upsertAccount(claims: any) {
-  const existingAccount = await prisma.account.findUnique({
-    where: { replitId: claims.sub },
-  });
-
-  if (existingAccount) {
-    return prisma.account.update({
-      where: { id: existingAccount.id },
-      data: {
-        email: claims.email ?? existingAccount.email,
-        firstName: claims.first_name ?? existingAccount.firstName,
-        lastName: claims.last_name ?? existingAccount.lastName,
-        profileImageUrl: claims.profile_image_url ?? existingAccount.profileImageUrl,
-        lastLoginAt: new Date(),
-      },
-    });
-  }
-
-  const baseUsername = claims.email?.split('@')[0] ?? `user_${claims.sub.slice(0, 8)}`;
-  const uniqueUsername = await generateUniqueUsername(baseUsername);
-
-  return prisma.account.create({
-    data: {
-      replitId: claims.sub,
-      email: claims.email ?? null,
-      username: uniqueUsername,
-      firstName: claims.first_name ?? null,
-      lastName: claims.last_name ?? null,
-      profileImageUrl: claims.profile_image_url ?? null,
-      lastLoginAt: new Date(),
-    },
+async function upsertUser(claims: any) {
+  await authStorage.upsertUser({
+    id: claims["sub"],
+    email: claims["email"],
+    firstName: claims["first_name"],
+    lastName: claims["last_name"],
+    profileImageUrl: claims["profile_image_url"],
   });
 }
 
-async function generateUniqueUsername(baseUsername: string): Promise<string> {
-  let username = baseUsername;
-  let counter = 1;
-  
-  while (await prisma.account.findUnique({ where: { username } })) {
-    username = `${baseUsername}${counter}`;
-    counter++;
-  }
-  
-  return username;
-}
-
-export async function setupAuth(app: Express): Promise<void> {
+export async function setupAuth(app: Express) {
   app.set("trust proxy", 1);
   app.use(getSession());
   app.use(passport.initialize());
@@ -109,21 +72,16 @@ export async function setupAuth(app: Express): Promise<void> {
     tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers,
     verified: passport.AuthenticateCallback
   ) => {
-    try {
-      const user: Express.User = {} as any;
-      updateUserSession(user, tokens);
-      const claims = tokens.claims();
-      const account = await upsertAccount(claims);
-      (user as any).accountId = account.id;
-      verified(null, user);
-    } catch (error) {
-      logger.error({ error }, 'Error in OIDC verify');
-      verified(error as Error);
-    }
+    const user = {};
+    updateUserSession(user, tokens);
+    await upsertUser(tokens.claims());
+    verified(null, user);
   };
 
+  // Keep track of registered strategies
   const registeredStrategies = new Set<string>();
 
+  // Helper function to ensure strategy exists for a domain
   const ensureStrategy = (domain: string) => {
     const strategyName = `replitauth:${domain}`;
     if (!registeredStrategies.has(strategyName)) {
@@ -170,24 +128,12 @@ export async function setupAuth(app: Express): Promise<void> {
       );
     });
   });
-
-  logger.info('Replit Auth configured successfully');
-}
-
-export function registerAuthRoutes(app: Express): void {
-  app.get('/api/auth/user', (req, res) => {
-    if (req.isAuthenticated() && req.user) {
-      res.json(req.user);
-    } else {
-      res.status(401).json({ message: 'Not authenticated' });
-    }
-  });
 }
 
 export const isAuthenticated: RequestHandler = async (req, res, next) => {
   const user = req.user as any;
 
-  if (!req.isAuthenticated() || !user?.expires_at) {
+  if (!req.isAuthenticated() || !user.expires_at) {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
