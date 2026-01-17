@@ -15,15 +15,34 @@ datasource db {
 
 model Account {
   id            String      @id @default(uuid())
-  email         String      @unique
-  passwordHash  String
+  email         String?     @unique
+  passwordHash  String?
   username      String      @unique
   createdAt     DateTime    @default(now())
   lastLoginAt   DateTime?
 
+  // Replit Auth fields
+  replitId      String?     @unique
+  profileImageUrl String?
+  firstName     String?
+  lastName      String?
+
   characters    Character[]
+  sessions      Session[]
 
   @@map("accounts")
+}
+
+model Session {
+  sid       String    @id @db.VarChar(255)
+  sess      Json
+  expire    DateTime
+  accountId String?
+
+  account   Account?  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([expire])
+  @@map("sessions")
 }
 
 // ============================================================================

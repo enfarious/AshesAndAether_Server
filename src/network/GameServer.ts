@@ -108,7 +108,7 @@ export class GameServer {
 
     // Start HTTP server (shared with WebSocket)
     this.httpServer = createServer(this.app);
-    this.httpServer.listen(this.config.port, () => {
+    this.httpServer.listen(this.config.port, '0.0.0.0', () => {
       logger.info(`HTTP/WebSocket server listening on port ${this.config.port}`);
     });
 

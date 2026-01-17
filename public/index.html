@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ashes & Aether: Life at the Shatterline</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: linear-gradient(
+          135deg,
+          #1a1a2e 0%,
+          #16213e 50%,
+          #0f3460 100%
+        );
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #e8e8e8;
+      }
+      .container {
+        text-align: center;
+        padding: 2rem;
+        max-width: 600px;
+      }
+      h1 {
+        font-size: 2.5rem;
+        margin-bottom: 0.5rem;
+        background: linear-gradient(90deg, #e94560, #f39c12);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .subtitle {
+        font-size: 1.2rem;
+        color: #a8a8a8;
+        margin-bottom: 2rem;
+      }
+      .status {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        padding: 1.5rem;
+        margin-bottom: 2rem;
+      }
+      .status h2 {
+        font-size: 1rem;
+        color: #6dd5ed;
+        margin-bottom: 0.5rem;
+      }
+      .status p {
+        color: #ccc;
+      }
+      .btn {
+        display: inline-block;
+        padding: 0.75rem 2rem;
+        background: linear-gradient(90deg, #e94560, #f39c12);
+        color: white;
+        text-decoration: none;
+        border-radius: 4px;
+        font-weight: 600;
+        transition:
+          transform 0.2s,
+          box-shadow 0.2s;
+      }
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 20px rgba(233, 69, 96, 0.4);
+      }
+      .user-info {
+        margin-top: 2rem;
+        padding: 1rem;
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 8px;
+      }
+      .user-info img {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        margin-bottom: 0.5rem;
+      }
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Ashes & Aether</h1>
+      <p class="subtitle">Life at the Shatterline</p>
+
+      <div class="status">
+        <h2>Gateway Status</h2>
+        <p id="status">Checking connection...</p>
+      </div>
+
+      <div id="auth-section">
+        <div id="logged-out">
+          <a href="/api/login" class="btn">Sign In to Play</a>
+        </div>
+        <div id="logged-in" class="hidden user-info">
+          <img id="user-avatar" src="" alt="Avatar" />
+          <p id="user-name"></p>
+          <p style="margin-top: 1rem">
+            <a href="/api/logout" class="btn" style="background: #555"
+              >Sign Out</a
+            >
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      async function checkStatus() {
+        try {
+          const res = await fetch("/health");
+          const data = await res.json();
+          document.getElementById("status").textContent =
+            `Server: ${data.status} | Redis: ${data.connected ? "Connected" : "Disconnected"}`;
+        } catch (e) {
+          document.getElementById("status").textContent =
+            "Unable to reach server";
+        }
+      }
+
+      async function checkAuth() {
+        try {
+          const res = await fetch("/api/auth/user");
+          if (res.ok) {
+            const user = await res.json();
+            document.getElementById("logged-out").classList.add("hidden");
+            document.getElementById("logged-in").classList.remove("hidden");
+
+            const name =
+              user.claims?.first_name || user.claims?.email || "Player";
+            document.getElementById("user-name").textContent =
+              `Welcome, ${name}!`;
+
+            if (user.claims?.profile_image_url) {
+              document.getElementById("user-avatar").src =
+                user.claims.profile_image_url;
+            }
+          }
+        } catch (e) {
+          // Not logged in
+        }
+      }
+
+      checkStatus();
+      checkAuth();
+    </script>
+  </body>
+</html>

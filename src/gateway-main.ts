@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const config = {
-  port: parseInt(process.env.GATEWAY_PORT || '3100'),
+  port: parseInt(process.env.PORT || process.env.GATEWAY_PORT || '5000'),
   serverId: process.env.SERVER_ID || 'gateway-1',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
 };

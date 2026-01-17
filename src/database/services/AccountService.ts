@@ -21,6 +21,15 @@ export class AccountService {
   }
 
   /**
+   * Find account by Replit ID
+   */
+  static async findByReplitId(replitId: string): Promise<Account | null> {
+    return prisma.account.findUnique({
+      where: { replitId },
+    });
+  }
+
+  /**
    * Find account by ID with characters
    */
   static async findByIdWithCharacters(accountId: string): Promise<(Account & { characters: Character[] }) | null> {
@@ -35,14 +44,13 @@ export class AccountService {
    */
   static async createGuestAccount(guestName: string): Promise<Account> {
     const timestamp = Date.now();
-    // Ensure username is unique by appending timestamp
     const uniqueUsername = guestName ? `${guestName}-${timestamp}` : `Guest${timestamp}`;
 
     return prisma.account.create({
       data: {
         email: `guest-${timestamp}@temp.worldofdarkness.com`,
         username: uniqueUsername,
-        passwordHash: '', // No password for guests
+        passwordHash: null,
       },
     });
   }
