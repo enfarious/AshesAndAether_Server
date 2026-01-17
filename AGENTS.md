@@ -1,6 +1,29 @@
-# Agents.md for keeping your agentic maker in the loop
+# Agents.md for keeping our agentic makers in the loop
 
-Always read this file in full and those files in /.agents
+Always read this file in full and those files in .agents/ and docs/ as needed, skimming at least.
+
+## Things to keep in mind as we always work future forward
+
+With what we have already built, we're in good shape:
+
+Already scale-ready:
+
+Gateway pattern - Client entry point is separated from game logic. Gateways can be load-balanced behind a reverse proxy later.
+Zone servers - Separate processes that communicate via Redis pub/sub. Add more zones = add more servers.
+Redis messaging - Pub/sub for inter-server communication works the same whether it's 1 machine or 50.
+Prisma ORM - Connection pooling built-in, easy to point at a different DB when you migrate.
+Stateless auth flow - Replit Auth uses standard OIDC, swappable for any auth provider.
+
+## Things to keep an eye on as we build
+
+No hardcoded localhost/ports - Use environment variables for all service endpoints
+Zone servers should be location-agnostic - They don't care where other zones live, just talk through Redis
+Database queries should be zone-scoped - Makes sharding by region trivial later
+Session/player state in Redis, not in-memory - So any gateway can handle any player
+
+The architecture doc shows we've already thought this through. The distributed design is there - it's just running on one machine right now. When we scale, we deploy the same code to more machines and update the connection strings.
+
+Keep this in mind as we work. No shortcuts that would bite us later.
 
 ## Ask About Services/Servers
 
