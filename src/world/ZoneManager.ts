@@ -20,12 +20,26 @@ interface Vector3 {
 interface Entity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion';
+  type: 'player' | 'npc' | 'companion' | 'wildlife';
   position: Vector3;
   socketId?: string; // For players only
   inCombat?: boolean;
   isMachine: boolean;
   isAlive: boolean;
+  // Wildlife-specific fields
+  speciesId?: string;
+  sprite?: string;
+  heading?: number;
+  behavior?: string;
+}
+
+export interface WildlifeEntityData {
+  id: string;
+  name: string;
+  speciesId: string;
+  position: Vector3;
+  sprite: string;
+  heading?: number;
 }
 
 /**
@@ -632,5 +646,65 @@ export class ZoneManager {
       if (entity.type === 'player') count++;
     }
     return count;
+  }
+
+  // ========== Wildlife Management ==========
+
+  /**
+   * Add a wildlife entity to the zone
+   */
+  addWildlife(data: WildlifeEntityData): void {
+    const entity: Entity = {
+      id: data.id,
+      name: data.name,
+      type: 'wildlife',
+      position: data.position,
+      isMachine: true,
+      isAlive: true,
+      speciesId: data.speciesId,
+      sprite: data.sprite,
+      heading: data.heading ?? 0,
+    };
+
+    this.entities.set(data.id, entity);
+    logger.debug({ entityId: data.id, species: data.speciesId, zoneId: this.zone.id }, 'Wildlife spawned');
+  }
+
+  /**
+   * Remove a wildlife entity from the zone
+   */
+  removeWildlife(entityId: string): void {
+    const entity = this.entities.get(entityId);
+    if (entity && entity.type === 'wildlife') {
+      this.entities.delete(entityId);
+      logger.debug({ entityId, zoneId: this.zone.id }, 'Wildlife removed');
+    }
+  }
+
+  /**
+   * Update wildlife position and behavior
+   */
+  updateWildlife(entityId: string, position: Vector3, heading: number, behavior?: string): void {
+    const entity = this.entities.get(entityId);
+    if (entity && entity.type === 'wildlife') {
+      entity.position = position;
+      entity.heading = heading;
+      if (behavior !== undefined) {
+        entity.behavior = behavior;
+      }
+    }
+  }
+
+  /**
+   * Get all player positions in the zone (for wildlife sim)
+   */
+  getPlayerPositions(): Array<{ id: string; position: Vector3 }> {
+    const positions: Array<{ id: string; position: Vector3 }> = [];
+    for (const entity of this.entities.values()) {
+      if (entity.type === 'player' && entity.isAlive) {
+        positions.push({ id: entity.id, position: entity.position });
+      }
+    }
+    return positions;
   }
 }

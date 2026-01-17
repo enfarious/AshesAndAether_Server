@@ -1,8 +1,10 @@
 import { logger } from '@/utils/logger';
 import { ZoneService } from '@/database';
 import { ZoneManager } from './ZoneManager';
+import { MovementSystem } from './MovementSystem';
 import type { Server as SocketIOServer } from 'socket.io';
 import type { Character } from '@prisma/client';
+import type { Vector3, MovementSpeed } from '@/network/protocol/types';
 
 /**
  * Manages the entire game world - all zones and their entities
@@ -11,6 +13,7 @@ export class WorldManager {
   private zones: Map<string, ZoneManager> = new Map();
   private io: SocketIOServer | null = null;
   private characterToZone: Map<string, string> = new Map(); // characterId -> zoneId for quick lookups
+  private movementSystem: MovementSystem = new MovementSystem();
 
   /**
    * Set Socket.IO server for broadcasting
@@ -32,7 +35,15 @@ export class WorldManager {
       const zoneManager = new ZoneManager(zone);
       await zoneManager.initialize();
       this.zones.set(zone.id, zoneManager);
+      this.movementSystem.registerZoneManager(zone.id, zoneManager);
     }
+
+    // Set up movement completion callback
+    this.movementSystem.setMovementCompleteCallback((characterId, reason, finalPosition) => {
+      logger.debug({ characterId, reason, position: finalPosition }, 'Movement completed');
+      // Position is already updated in ZoneManager by update() - just send final roster
+      this.sendProximityRosterToPlayer(characterId);
+    });
 
     logger.info(`World manager initialized with ${this.zones.size} zones`);
   }
@@ -97,7 +108,8 @@ export class WorldManager {
   }
 
   /**
-   * Update player position and broadcast updates
+   * Update player position (teleport) and broadcast updates
+   * This is for direct position updates (teleport), not tick-based movement
    */
   async updatePlayerPosition(
     characterId: string,
@@ -109,11 +121,57 @@ export class WorldManager {
 
     zoneManager.updatePlayerPosition(characterId, position);
 
+    // Broadcast state_update to nearby players
+    this.broadcastPositionUpdate(characterId, zoneId, position);
+
     // Send updated proximity roster to the player
     this.sendProximityRosterToPlayer(characterId);
 
     // Broadcast to nearby players about position change
     this.broadcastNearbyUpdate(zoneId);
+  }
+
+  /**
+   * Start tick-based movement toward a position or heading
+   */
+  async startMovement(
+    characterId: string,
+    zoneId: string,
+    startPosition: Vector3,
+    options: {
+      heading?: number;
+      speed: MovementSpeed;
+      distance?: number;
+      target?: string;
+      targetPosition?: { x: number; y?: number; z: number };
+      targetRange?: number;
+    }
+  ): Promise<boolean> {
+    return this.movementSystem.startMovement({
+      characterId,
+      zoneId,
+      startPosition,
+      heading: options.heading,
+      speed: options.speed,
+      distance: options.distance,
+      target: options.target,
+      targetPosition: options.targetPosition,
+      targetRange: options.targetRange ?? 5,
+    });
+  }
+
+  /**
+   * Stop movement for a character
+   */
+  stopMovement(characterId: string, zoneId: string): void {
+    this.movementSystem.stopMovement({ characterId, zoneId });
+  }
+
+  /**
+   * Check if a character is currently moving
+   */
+  isMoving(characterId: string): boolean {
+    return this.movementSystem.isMoving(characterId);
   }
 
   /**
@@ -157,6 +215,44 @@ export class WorldManager {
   }
 
   /**
+   * Broadcast position update to all players in the zone (including the moving player)
+   */
+  private broadcastPositionUpdate(
+    characterId: string,
+    zoneId: string,
+    position: Vector3
+  ): void {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager || !this.io) return;
+
+    const entity = zoneManager.getEntity(characterId);
+    if (!entity) return;
+
+    // Build state_update message
+    const stateUpdate = {
+      timestamp: Date.now(),
+      entities: {
+        updated: [{
+          id: characterId,
+          name: entity.name,
+          type: entity.type,
+          position,
+        }],
+      },
+    };
+
+    // Send to all players in the zone
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId === zoneId) {
+        const socketId = zoneManager.getSocketIdForCharacter(charId);
+        if (socketId) {
+          this.io.to(socketId).emit('state_update', stateUpdate);
+        }
+      }
+    }
+  }
+
+  /**
    * Record last speaker for proximity tracking
    */
   recordLastSpeaker(zoneId: string, listenerId: string, speakerName: string): void {
@@ -184,7 +280,25 @@ export class WorldManager {
   /**
    * Update tick - called by game loop
    */
-  update(_deltaTime: number): void {
+  update(deltaTime: number): void {
+    // Update movement system and get position changes
+    const positionUpdates = this.movementSystem.update(deltaTime);
+
+    // Broadcast position updates to clients
+    for (const [characterId, position] of positionUpdates) {
+      const zoneId = this.characterToZone.get(characterId);
+      if (!zoneId) continue;
+
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) continue;
+
+      // Update in-memory position in ZoneManager
+      zoneManager.updatePlayerPosition(characterId, position);
+
+      // Broadcast state_update to all players in the zone
+      this.broadcastPositionUpdate(characterId, zoneId, position);
+    }
+
     // TODO: Update world simulation
     // - Weather changes
     // - Time of day

@@ -16,6 +16,7 @@ import {
   ChatMessage,
   InteractMessage,
   CombatActionMessage,
+  MovementSpeed,
 } from './protocol/types';
 
 interface ClientInfo {
@@ -61,10 +62,16 @@ export class ClientSession {
       this.handleCharacterCreate(data);
     });
 
-    // Movement
+    // Movement (tick-based, server-authoritative)
     this.socket.on('move', async (data: MoveMessage['payload']) => {
       if (!this.characterId || !this.currentZoneId) return;
       await this.handleMovement(data);
+    });
+
+    // Teleport (direct position update, admin/debug)
+    this.socket.on('teleport', async (data: { position: { x: number; y: number; z: number }; heading?: number }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      await this.handleTeleport(data);
     });
 
     // Chat
@@ -346,12 +353,88 @@ export class ClientSession {
   private async handleMovement(data: MoveMessage['payload']): Promise<void> {
     if (!this.characterId || !this.currentZoneId) return;
 
+    const { method, position, heading, speed } = data;
+
+    // Get current character position from database for movement start
+    const character = await CharacterService.findById(this.characterId);
+    if (!character) {
+      logger.warn({ characterId: this.characterId }, 'Character not found for movement');
+      return;
+    }
+
+    const startPosition = {
+      x: character.positionX,
+      y: character.positionY,
+      z: character.positionZ,
+    };
+
+    // Determine movement speed (default to walk)
+    const movementSpeed: MovementSpeed = speed || 'walk';
+
+    // Handle stop
+    if (movementSpeed === 'stop') {
+      this.worldManager.stopMovement(this.characterId, this.currentZoneId);
+      this.socket.emit('dev_ack', { status: 'ok', message: 'Movement stopped' });
+      logger.debug({ characterId: this.characterId }, 'Player stopped');
+      return;
+    }
+
+    // Route based on method
+    if (method === 'position' && position) {
+      // Position-based movement: route to MovementSystem for tick-based pathing
+      const started = await this.worldManager.startMovement(
+        this.characterId,
+        this.currentZoneId,
+        startPosition,
+        {
+          speed: movementSpeed,
+          targetPosition: { x: position.x, y: position.y, z: position.z },
+          targetRange: 0.5, // Stop within 0.5m of target
+        }
+      );
+
+      if (started) {
+        this.socket.emit('dev_ack', { status: 'ok', message: 'Moving to position' });
+        logger.debug({ characterId: this.characterId, targetPosition: position, speed: movementSpeed }, 'Player movement started (position)');
+      } else {
+        this.socket.emit('dev_ack', { status: 'error', message: 'Failed to start movement' });
+      }
+    } else if (method === 'heading' && heading !== undefined) {
+      // Heading-based movement: route to MovementSystem
+      const started = await this.worldManager.startMovement(
+        this.characterId,
+        this.currentZoneId,
+        startPosition,
+        {
+          heading,
+          speed: movementSpeed,
+        }
+      );
+
+      if (started) {
+        this.socket.emit('dev_ack', { status: 'ok', message: 'Moving by heading' });
+        logger.debug({ characterId: this.characterId, heading, speed: movementSpeed }, 'Player movement started (heading)');
+      } else {
+        this.socket.emit('dev_ack', { status: 'error', message: 'Failed to start movement' });
+      }
+    } else {
+      logger.warn({ characterId: this.characterId, method }, 'Invalid movement request');
+      this.socket.emit('dev_ack', { status: 'error', message: 'Invalid movement request' });
+    }
+  }
+
+  private async handleTeleport(data: { position: { x: number; y: number; z: number }; heading?: number }): Promise<void> {
+    if (!this.characterId || !this.currentZoneId) return;
+
     const { position, heading } = data;
 
     if (!position) {
-      logger.warn({ characterId: this.characterId }, 'Movement request missing position');
+      logger.warn({ characterId: this.characterId }, 'Teleport request missing position');
       return;
     }
+
+    // Stop any active movement first
+    this.worldManager.stopMovement(this.characterId, this.currentZoneId);
 
     // Update position in database
     await CharacterService.updatePosition(this.characterId, {
@@ -361,18 +444,19 @@ export class ClientSession {
       heading: heading !== undefined ? heading : undefined,
     });
 
-    // Update position in WorldManager (triggers proximity roster updates)
+    // Update position in WorldManager (triggers state_update broadcast)
     await this.worldManager.updatePlayerPosition(
       this.characterId,
       this.currentZoneId,
       position
     );
 
+    this.socket.emit('dev_ack', { status: 'ok', message: 'Teleported' });
     logger.debug({
       characterId: this.characterId,
       position,
       heading,
-    }, 'Player moved');
+    }, 'Player teleported');
   }
 
   isAuthenticated(): boolean {

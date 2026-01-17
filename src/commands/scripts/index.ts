@@ -11,6 +11,7 @@ import { emoteCommand } from './social/emote';
 import { shoutCommand } from './social/shout';
 import { attackCommand } from './combat/attack';
 import { castCommand } from './combat/cast';
+import { disengageCommand } from './combat/disengage';
 import { useCommand } from './inventory/use';
 
 import { lookCommand } from './perception/look';
@@ -56,6 +57,7 @@ export function registerAllCommands(registry: CommandRegistry): void {
   // Combat commands
   registry.register(attackCommand);
   registry.register(castCommand);
+  registry.register(disengageCommand);
 }
 
 /**
@@ -74,6 +76,6 @@ export function getAllCommandNames(): string[] {
     // World
     'companion',
     // Combat
-    'attack', 'cast',
+    'attack', 'cast', 'disengage',
   ];
 }

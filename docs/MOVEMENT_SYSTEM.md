@@ -7,6 +7,7 @@ The server uses a **unified 3D movement system** that works seamlessly across al
 ## Core Concept
 
 **Single Source of Truth:**
+
 - Every entity has a **position** (Vector3: x, y, z)
 - Every entity has a **heading** (0-360 degrees, where 0 = north)
 - Movement is calculated in 3D space
@@ -39,6 +40,7 @@ The server uses a **unified 3D movement system** that works seamlessly across al
 ### Position (Vector3)
 
 Right-handed coordinate system:
+
 - **X axis**: East (+) / West (-)
 - **Y axis**: Up (+) / Down (-)
 - **Z axis**: North (+) / South (-)
@@ -54,6 +56,7 @@ position: {
 ### Heading (0-360 degrees)
 
 Clockwise from north:
+
 - **0° / 360°** = North
 - **90°** = East
 - **180°** = South
@@ -103,12 +106,14 @@ Send speed and heading in degrees:
 ```
 
 **Speed options:**
+
 - `walk` - Base speed (1.0x multiplier)
 - `jog` - Medium speed (2.0x multiplier)
 - `run` - Fast speed (3.5x multiplier)
 - `stop` - Stop movement (0x multiplier)
 
 **Heading:**
+
 - 0-360 degrees
 - Optional: if omitted, uses current heading
 - Allows precise control
@@ -130,6 +135,7 @@ Send speed and compass direction:
 ```
 
 **Compass directions:**
+
 - `N` = 0°
 - `NE` = 45°
 - `E` = 90°
@@ -140,11 +146,12 @@ Send speed and compass direction:
 - `NW` = 315°
 
 **Server automatically converts to heading:**
+
 ```typescript
 compass: "NE" → heading: 45
 ```
 
-### Method 3: Position (3D/VR Only)
+### Method 3: Position (2D/3D/VR Only) for click to move
 
 Direct position update for clients with free movement:
 
@@ -179,6 +186,7 @@ Stop       # Stop moving
 ```
 
 **Using exact degrees:**
+
 ```
 Walk.037   # Walk at 37°
 Jog.149    # Jog at 149°
@@ -186,6 +194,7 @@ Run.256    # Run at 256°
 ```
 
 **Using current heading (omit direction):**
+
 ```
 Walk       # Walk forward (current heading)
 Jog        # Jog forward
@@ -197,6 +206,7 @@ Stop       # Stop
 
 **Player command:** `Walk.N`
 **Sent to server:**
+
 ```json
 {
   "type": "move",
@@ -211,6 +221,7 @@ Stop       # Stop
 
 **Player command:** `Run.045`
 **Sent to server:**
+
 ```json
 {
   "type": "move",
@@ -236,6 +247,7 @@ Text clients get `availableDirections` based on navmesh:
 ```
 
 This tells the client (or LLM):
+
 - Can move: North, Northeast, East, West, Northwest
 - Cannot move: Southeast, South, Southwest (blocked by terrain/obstacles)
 - Currently facing: 45° (Northeast)
@@ -284,6 +296,7 @@ LLM outputs: `"I'll head east. Run.E"`
 Parser extracts: `Run.E`
 
 Converts to:
+
 ```json
 {
   "method": "compass",
@@ -293,6 +306,7 @@ Converts to:
 ```
 
 Server converts to:
+
 ```json
 {
   "method": "heading",
@@ -302,6 +316,7 @@ Server converts to:
 ```
 
 Updates entity:
+
 ```typescript
 entity.heading = 90;
 entity.currentSpeed = "run";
@@ -315,6 +330,7 @@ entity.velocity = calculateVelocity(90, SPEED_MULTIPLIERS.run);
 ### 3D/VR Client
 
 **Receives:**
+
 ```json
 {
   "character": {
@@ -327,10 +343,12 @@ entity.velocity = calculateVelocity(90, SPEED_MULTIPLIERS.run);
 ```
 
 **Sends:**
+
 - Method: `position` (direct position updates from physics)
 - Method: `heading` (speed + heading from input)
 
 **Rendering:**
+
 - Use full 3D position for camera and character placement
 - Use rotation for character model orientation
 - Interpolate between updates for smooth movement
@@ -339,6 +357,7 @@ entity.velocity = calculateVelocity(90, SPEED_MULTIPLIERS.run);
 ### 2D Client
 
 **Receives:**
+
 ```json
 {
   "character": {
@@ -350,9 +369,11 @@ entity.velocity = calculateVelocity(90, SPEED_MULTIPLIERS.run);
 ```
 
 **Sends:**
+
 - Method: `heading` (speed + heading from input)
 
 **Rendering:**
+
 - Drop Y axis: project to 2D plane (x, z)
 - Use heading to select sprite direction (8-way sprites)
 - Orthographic camera view from above
@@ -366,6 +387,7 @@ entity.velocity = calculateVelocity(90, SPEED_MULTIPLIERS.run);
 ### Text Client
 
 **Receives:**
+
 ```json
 {
   "character": {
@@ -382,10 +404,12 @@ entity.velocity = calculateVelocity(90, SPEED_MULTIPLIERS.run);
 ```
 
 **Sends:**
+
 - Method: `compass` (speed + compass direction)
 - Method: `heading` (speed + exact degrees)
 
 **Display:**
+
 ```
 Location: The Crossroads
 You are facing northeast, walking.
@@ -587,6 +611,7 @@ function formatUpdateForClient(entity: Entity, clientType: ClientType) {
 ## Implementation Checklist
 
 **Phase 1: Core System**
+
 - [x] Add `heading` to CharacterState
 - [x] Add `currentSpeed` to CharacterState
 - [x] Update MoveMessage with three methods
@@ -595,17 +620,20 @@ function formatUpdateForClient(entity: Entity, clientType: ClientType) {
 - [ ] Add navmesh query for available directions
 
 **Phase 2: Client Support**
+
 - [ ] Text client: send compass commands
 - [ ] Text client: display available directions
 - [ ] 2D client: project 3D to 2D
 - [ ] 3D/VR client: full 3D movement
 
 **Phase 3: LLM Integration**
+
 - [ ] System prompt templates for movement
 - [ ] Command parser for LLM outputs
 - [ ] Test with Claude/GPT controlling character
 
 **Phase 4: Optimization**
+
 - [ ] Movement prediction/interpolation
 - [ ] Update rate tuning per client type
 - [ ] Navmesh caching for common queries
@@ -617,6 +645,7 @@ function formatUpdateForClient(entity: Entity, clientType: ClientType) {
 1. **User types:** "go north quickly"
 
 2. **LLM receives context:**
+
    ```
    Available directions: [N, NE, E, W]
    Current heading: 45° (NE)
@@ -627,6 +656,7 @@ function formatUpdateForClient(entity: Entity, clientType: ClientType) {
 4. **Client parses:** `Run.N`
 
 5. **Client sends:**
+
    ```json
    {
      "type": "move",
@@ -642,6 +672,7 @@ function formatUpdateForClient(entity: Entity, clientType: ClientType) {
 6. **Server converts:** `compass: "N"` → `heading: 0`
 
 7. **Server updates entity:**
+
    ```typescript
    entity.heading = 0;
    entity.currentSpeed = "run";
@@ -651,6 +682,7 @@ function formatUpdateForClient(entity: Entity, clientType: ClientType) {
 8. **Server broadcasts:** All nearby clients receive position update
 
 9. **Text client receives:**
+
    ```
    You sprint north along the forest path...
    Available directions: [N, NE, E, SE, W, NW]

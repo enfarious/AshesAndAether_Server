@@ -230,20 +230,14 @@ export class GatewayClientSession {
         messageType = MessageType.PLAYER_MOVE;
         const moveData = data as MoveMessage['payload'];
 
-        if (!moveData.position) {
-          logger.warn({ characterId: this.characterId }, 'Movement request missing position');
-          this.sendDevAck('move', false, 'missing_position');
+        // Validate: need either position (for position-based move) or heading (for direction-based move)
+        if (!moveData.position && moveData.heading === undefined && moveData.speed !== 'stop') {
+          logger.warn({ characterId: this.characterId }, 'Movement request missing position or heading');
+          this.sendDevAck('move', false, 'missing_position_or_heading');
           return false;
         }
 
-        // Update position in database
-        await CharacterService.updatePosition(this.characterId, {
-          x: moveData.position.x,
-          y: moveData.position.y,
-          z: moveData.position.z,
-          heading: moveData.heading !== undefined ? moveData.heading : undefined,
-        });
-
+        // Pass through full movement data to zone server for MovementSystem handling
         await this.messageBus.publish(channel, {
           type: messageType,
           zoneId: this.currentZoneId,
@@ -252,7 +246,10 @@ export class GatewayClientSession {
           payload: {
             characterId: this.characterId,
             zoneId: this.currentZoneId,
+            method: moveData.method,
             position: moveData.position,
+            heading: moveData.heading,
+            speed: moveData.speed || 'walk',
           },
           timestamp: Date.now(),
         });

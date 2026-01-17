@@ -1,5 +1,5 @@
 /**
- * /stop command - Stop moving
+ * /stop command - Stop moving (does not affect combat/auto-attack)
  */
 
 import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } from '@/commands/types';

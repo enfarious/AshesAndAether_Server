@@ -263,8 +263,22 @@ export interface StateUpdateMessage {
     character?: {
       health?: { current: number; max: number };
       stamina?: { current: number; max: number };
+      mana?: { current: number; max: number };
       effects?: StatusEffect[];
     };
+    // Combat gauges (self only - private to the player)
+    combat?: {
+      atb?: { current: number; max: number };           // ATB gauge (0-200, or higher with gear)
+      autoAttack?: { current: number; max: number };    // Weapon swing timer (0-weaponSpeed)
+      inCombat?: boolean;
+      autoAttackTarget?: string;                        // Entity ID of current target
+      specialCharges?: Record<string, number>;          // Builder/consumer charges (e.g., {"combo_point": 3})
+    };
+    // Allied combat gauges (party/alliance members - ATB only, no auto-attack)
+    allies?: Array<{
+      entityId: string;
+      atb: { current: number; max: number };
+    }>;
     zone?: Partial<ZoneInfo>;
   };
 }
@@ -554,12 +568,15 @@ export const COMMUNICATION_RANGES = {
 export interface ProximityEntity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion';
+  type: 'player' | 'npc' | 'companion' | 'wildlife';
   isMachine: boolean;  // true = AI/NPC, false = human player
   isAlive: boolean;
   bearing: number;     // 0-360 degrees (0=North, 90=East, 180=South, 270=West)
   elevation: number;   // -90 to 90 degrees (negative=down, positive=up)
   range: number;       // Distance in feet
+  // Wildlife-specific (optional)
+  speciesId?: string;
+  sprite?: string;
 }
 
 export interface ProximityChannel {

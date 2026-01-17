@@ -254,24 +254,88 @@ export class DistributedWorldManager {
    * Handle player movement
    */
   private async handlePlayerMove(message: MessageEnvelope): Promise<void> {
-    const { characterId, zoneId, position } = message.payload as {
+    const { characterId, zoneId, method, position, heading, speed } = message.payload as {
       characterId: string;
       zoneId: string;
-      position: { x: number; y: number; z: number };
+      method?: 'position' | 'heading' | 'compass';
+      position?: { x: number; y: number; z: number };
+      heading?: number;
+      speed?: MovementSpeed;
     };
 
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
 
-    zoneManager.updatePlayerPosition(characterId, position);
+    // Handle stop
+    if (speed === 'stop') {
+      this.movementSystem.stopMovement({ characterId, zoneId });
+      logger.debug({ characterId }, 'Player stopped');
+      return;
+    }
 
-    // Send updated proximity roster to the player
-    await this.sendProximityRosterToEntity(characterId);
+    // Get current position from zone manager or database
+    const entity = zoneManager.getEntity(characterId);
+    if (!entity) {
+      logger.warn({ characterId, zoneId }, 'Entity not found for movement');
+      return;
+    }
 
-    // Broadcast to nearby players
-    await this.broadcastNearbyUpdate(zoneId);
+    const startPosition = entity.position;
+    const movementSpeed: MovementSpeed = speed || 'walk';
 
-    logger.debug({ characterId, position }, 'Player moved');
+    // Route based on method
+    if (method === 'position' && position) {
+      // Position-based movement: move toward target coordinates
+      const started = await this.movementSystem.startMovement({
+        characterId,
+        zoneId,
+        startPosition,
+        speed: movementSpeed,
+        targetPosition: { x: position.x, y: position.y, z: position.z },
+        targetRange: 0.5, // Stop within 0.5m of target
+      });
+
+      if (started) {
+        logger.debug({ characterId, targetPosition: position, speed: movementSpeed }, 'Player movement started (position)');
+      }
+    } else if (method === 'heading' && heading !== undefined) {
+      // Heading-based movement: move in a direction
+      const started = await this.movementSystem.startMovement({
+        characterId,
+        zoneId,
+        startPosition,
+        heading,
+        speed: movementSpeed,
+        targetRange: 5,
+      });
+
+      if (started) {
+        logger.debug({ characterId, heading, speed: movementSpeed }, 'Player movement started (heading)');
+      }
+    } else if (position) {
+      // Legacy: direct position update (teleport) - for backwards compatibility
+      zoneManager.updatePlayerPosition(characterId, position);
+
+      // Update database
+      await CharacterService.updatePosition(characterId, {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+      });
+
+      // Broadcast state_update
+      await this.broadcastPositionUpdate(characterId, zoneId, position);
+
+      // Send updated proximity roster to the player
+      await this.sendProximityRosterToEntity(characterId);
+
+      // Broadcast to nearby players
+      await this.broadcastNearbyUpdate(zoneId);
+
+      logger.debug({ characterId, position }, 'Player teleported (legacy)');
+    } else {
+      logger.warn({ characterId, method, position, heading }, 'Invalid movement request');
+    }
   }
 
   /**
@@ -537,10 +601,11 @@ export class DistributedWorldManager {
           break;
         }
         case 'combat_action': {
-          const { abilityId, abilityName, target } = event.data as {
+          const { abilityId, abilityName, target, setAutoAttack } = event.data as {
             abilityId?: string;
             abilityName?: string;
             target?: string;
+            setAutoAttack?: boolean;
           };
 
           if (!target) {
@@ -582,6 +647,12 @@ export class DistributedWorldManager {
               success: false,
               error: 'Combat action missing ability.',
             };
+          }
+
+          // Set auto-attack target if this is basic_attack (unless explicitly disabled)
+          // Auto-attack continues until target dies, player stops, or combat ends
+          if (ability.id === 'basic_attack' && setAutoAttack !== false) {
+            this.combatManager.setAutoAttackTarget(context.characterId, targetEntity.id);
           }
 
           await this.executeCombatAction(
@@ -636,6 +707,11 @@ export class DistributedWorldManager {
             characterId: context.characterId,
             zoneId: context.zoneId,
           });
+          break;
+        }
+        case 'auto_attack_stop': {
+          // Stop auto-attacking
+          this.combatManager.clearAutoAttackTarget(context.characterId);
           break;
         }
         case 'item_use': {
@@ -787,8 +863,10 @@ export class DistributedWorldManager {
     zoneManager: ZoneManager,
     attackerEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
     targetEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
-    ability: CombatAbilityDefinition
+    ability: CombatAbilityDefinition,
+    options?: { isAutoAttack?: boolean }
   ): Promise<void> {
+    const isAutoAttack = options?.isAutoAttack ?? false;
     const characterId = attackerEntity.id;
     const targetId = targetEntity.id;
     const now = Date.now();
@@ -818,13 +896,42 @@ export class DistributedWorldManager {
       return;
     }
 
-    if (!ability.isFree && ability.atbCost > 0) {
+    // Auto-attacks don't use ATB - they run on weapon speed timer
+    if (!isAutoAttack && !ability.isFree && ability.atbCost > 0) {
       if (!this.combatManager.canSpendAtb(characterId, ability.atbCost)) {
         await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
           eventType: 'combat_error',
           timestamp: now,
           narrative: `Not enough ATB.`,
           eventTypeData: { reason: 'atb_low', attackerId: characterId },
+        });
+        return;
+      }
+    }
+
+    // Consumer abilities require special charges
+    if (ability.consumesCharge) {
+      const hasCharges = this.combatManager.canSpendSpecialCharge(
+        characterId,
+        ability.consumesCharge.chargeType,
+        ability.consumesCharge.amount
+      );
+      if (!hasCharges) {
+        const currentCharges = this.combatManager.getSpecialCharges(
+          characterId,
+          ability.consumesCharge.chargeType
+        );
+        await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+          eventType: 'combat_error',
+          timestamp: now,
+          narrative: `Not enough ${ability.consumesCharge.chargeType} (need ${ability.consumesCharge.amount}, have ${currentCharges}).`,
+          eventTypeData: {
+            reason: 'charges_low',
+            attackerId: characterId,
+            chargeType: ability.consumesCharge.chargeType,
+            required: ability.consumesCharge.amount,
+            current: currentCharges,
+          },
         });
         return;
       }
@@ -841,12 +948,27 @@ export class DistributedWorldManager {
     }
 
     await this.applyCosts(attackerSnapshot, ability);
-    if (!ability.isFree) {
+    // Auto-attacks don't spend ATB
+    if (!isAutoAttack && !ability.isFree) {
       this.combatManager.spendAtb(characterId, ability.atbCost);
     }
 
-    if (ability.isBuilder) {
-      this.combatManager.addAtb(characterId, ability.atbCost);
+    // Builder abilities generate special charges
+    if (ability.buildsCharge) {
+      this.combatManager.addSpecialCharge(
+        characterId,
+        ability.buildsCharge.chargeType,
+        ability.buildsCharge.amount
+      );
+    }
+
+    // Consumer abilities spend special charges
+    if (ability.consumesCharge) {
+      this.combatManager.spendSpecialCharge(
+        characterId,
+        ability.consumesCharge.chargeType,
+        ability.consumesCharge.amount
+      );
     }
 
     this.combatManager.setCooldown(characterId, ability.id, ability.cooldown * 1000, now);
@@ -921,6 +1043,11 @@ export class DistributedWorldManager {
       if (newHp <= 0) {
         zoneManager.setEntityAlive(targetId, false);
         zoneManager.setEntityCombatState(targetId, false);
+
+        // Clear auto-attack for the dying target and all entities targeting it
+        this.combatManager.clearAutoAttackTarget(targetId);
+        this.combatManager.clearAutoAttacksOnTarget(targetId);
+
         await this.broadcastNearbyUpdate(zoneManager.getZone().id);
 
         await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
@@ -1556,6 +1683,54 @@ export class DistributedWorldManager {
   }
 
   /**
+   * Broadcast position update (state_update) to all players in the zone
+   */
+  private async broadcastPositionUpdate(
+    characterId: string,
+    zoneId: string,
+    position: Vector3
+  ): Promise<void> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const entity = zoneManager.getEntity(characterId);
+    if (!entity) return;
+
+    // Build state_update message
+    const stateUpdate = {
+      timestamp: Date.now(),
+      entities: {
+        updated: [{
+          id: characterId,
+          name: entity.name,
+          type: entity.type,
+          position,
+        }],
+      },
+    };
+
+    // Send to all players in the zone via gateway
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId === zoneId) {
+        const socketId = zoneManager.getSocketIdForCharacter(charId);
+        if (socketId) {
+          await this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: charId,
+            socketId,
+            payload: {
+              socketId,
+              event: 'state_update',
+              data: stateUpdate,
+            },
+            timestamp: Date.now(),
+          });
+        }
+      }
+    }
+  }
+
+  /**
    * Add a player to a zone (called from Gateway via message bus)
    */
   async addPlayerToZone(character: Character, socketId: string, isMachine: boolean = false): Promise<void> {
@@ -1641,10 +1816,149 @@ export class DistributedWorldManager {
       void this.handleCombatTimeouts(expired);
     }
 
+    // Process auto-attacks for entities whose weapon timer is ready
+    void this.processAutoAttacks();
+
+    // Broadcast combat gauges to players in combat
+    void this.broadcastCombatGauges();
+
     // Update movement system
     const positionUpdates = this.movementSystem.update(deltaTime);
     if (positionUpdates.size > 0) {
       void this.handleMovementUpdates(positionUpdates);
+    }
+  }
+
+  /**
+   * Broadcast combat gauges (ATB, auto-attack timer) to players
+   * - Self: Gets full combat state (ATB + auto-attack timer)
+   * - Party/Alliance: Gets ATB only (no auto-attack info)
+   * - Enemies: Get nothing
+   */
+  private async broadcastCombatGauges(): Promise<void> {
+    const entitiesInCombat = this.combatManager.getEntitiesInCombat();
+
+    for (const entityId of entitiesInCombat) {
+      // Only broadcast to players (not NPCs/companions for now)
+      const zoneId = this.characterToZone.get(entityId);
+      if (!zoneId) continue;
+
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) continue;
+
+      const socketId = zoneManager.getSocketIdForCharacter(entityId);
+      if (!socketId) continue;
+
+      // Get combat state for self
+      const combatState = this.combatManager.getCombatState(entityId);
+      if (!combatState) continue;
+
+      // Build state_update with combat gauges
+      // Only include specialCharges if there are any (avoid empty object)
+      const hasCharges = Object.keys(combatState.specialCharges).length > 0;
+      const stateUpdate = {
+        timestamp: Date.now(),
+        combat: {
+          atb: combatState.atb,
+          autoAttack: combatState.autoAttack,
+          inCombat: combatState.inCombat,
+          autoAttackTarget: combatState.autoAttackTarget,
+          ...(hasCharges && { specialCharges: combatState.specialCharges }),
+        },
+        // TODO: Add party/alliance ATB when party system is implemented
+        // allies: this.getPartyMemberAtb(entityId),
+      };
+
+      // Send to self
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: entityId,
+        socketId,
+        payload: {
+          socketId,
+          event: 'state_update',
+          data: stateUpdate,
+        },
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Process auto-attacks for all entities whose weapon timer is ready
+   * Auto-attack runs on weapon speed, separate from ATB (which is for abilities)
+   */
+  private async processAutoAttacks(): Promise<void> {
+    const basicAttack = this.abilitySystem.getDefaultAbility();
+    const readyAttackers = this.combatManager.getAutoAttackersReady();
+
+    for (const { attackerId, targetId } of readyAttackers) {
+      // Find which zone the attacker is in
+      const zoneId = this.characterToZone.get(attackerId) || this.companionToZone.get(attackerId);
+      if (!zoneId) {
+        this.combatManager.clearAutoAttackTarget(attackerId);
+        continue;
+      }
+
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) {
+        this.combatManager.clearAutoAttackTarget(attackerId);
+        continue;
+      }
+
+      const attackerEntity = zoneManager.getEntity(attackerId);
+      const targetEntity = zoneManager.getEntity(targetId);
+
+      // Clear auto-attack if attacker or target no longer exists/is dead
+      if (!attackerEntity || !attackerEntity.isAlive) {
+        this.combatManager.clearAutoAttackTarget(attackerId);
+        continue;
+      }
+
+      if (!targetEntity || !targetEntity.isAlive) {
+        this.combatManager.clearAutoAttackTarget(attackerId);
+        // Notify attacker that target is gone
+        const socketId = zoneManager.getSocketIdForEntity(attackerId);
+        if (socketId) {
+          await this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: attackerId,
+            socketId,
+            payload: {
+              socketId,
+              event: 'event',
+              data: {
+                eventType: 'auto_attack_stopped',
+                reason: 'target_dead',
+                narrative: 'Your target is no longer alive.',
+                timestamp: Date.now(),
+              },
+            },
+            timestamp: Date.now(),
+          });
+        }
+        continue;
+      }
+
+      // Reset the weapon timer before executing (so next attack waits full duration)
+      this.combatManager.resetAutoAttackTimer(attackerId);
+
+      // Execute the auto-attack (does NOT consume ATB - auto-attacks are free)
+      await this.executeCombatAction(
+        zoneManager,
+        {
+          id: attackerEntity.id,
+          position: attackerEntity.position,
+          type: attackerEntity.type,
+        },
+        {
+          id: targetEntity.id,
+          position: targetEntity.position,
+          type: targetEntity.type,
+        },
+        basicAttack,
+        { isAutoAttack: true }
+      );
     }
   }
 
@@ -1665,11 +1979,14 @@ export class DistributedWorldManager {
       zoneManager.updatePlayerPosition(characterId, position);
       zoneUpdates.add(zoneId);
 
+      // Broadcast state_update to all players in the zone
+      await this.broadcastPositionUpdate(characterId, zoneId, position);
+
       // Send proximity roster to moving player
       await this.sendProximityRosterToEntity(characterId);
     }
 
-    // Broadcast updates to all affected zones
+    // Broadcast proximity roster updates to all affected zones
     for (const zoneId of zoneUpdates) {
       await this.broadcastNearbyUpdate(zoneId);
     }
@@ -1749,6 +2066,9 @@ export class DistributedWorldManager {
       if (!zoneManager) continue;
       const entity = zoneManager.getEntity(entityId);
       if (!entity) continue;
+
+      // Clear auto-attack when combat times out
+      this.combatManager.clearAutoAttackTarget(entityId);
 
       zoneManager.setEntityCombatState(entityId, false);
       await this.broadcastNearbyUpdate(zoneId);

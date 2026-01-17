@@ -242,12 +242,16 @@ export class MovementSystem {
     // Calculate distance to move this tick
     const distanceThisTick = actualSpeed * deltaTime;
 
+    // Stopping tolerance: at least the distance we'd travel this tick, with a minimum of 0.5m
+    // This prevents rubberbanding where we overshoot and constantly reverse direction
+    const stoppingTolerance = Math.max(0.5, distanceThisTick * 1.1);
+
     // If targeting a fixed position, check arrival and update heading
     if (state.targetPosition) {
       const distanceToTarget = this.calculateDistance(state.currentPosition, state.targetPosition);
 
-      // Arrived at target position (within 0.5m tolerance)
-      if (distanceToTarget <= 0.5) {
+      // Arrived at target position (within speed-adjusted tolerance)
+      if (distanceToTarget <= stoppingTolerance) {
         state.currentPosition = { ...state.targetPosition };
         this.stopMovement({ characterId: state.characterId, zoneId: state.zoneId }, 'target_reached');
         return state.currentPosition;
@@ -267,10 +271,12 @@ export class MovementSystem {
           state.heading = this.calculateHeadingToTarget(state.currentPosition, targetEntity.position);
 
           // Check if we're within target range (convert feet to meters)
+          // Use at least stoppingTolerance to prevent rubberbanding when chasing
           const distanceToTarget = this.calculateDistance(state.currentPosition, targetEntity.position);
           const targetRangeMeters = state.targetRange * FEET_TO_METERS;
+          const effectiveRange = Math.max(targetRangeMeters, stoppingTolerance);
 
-          if (distanceToTarget <= targetRangeMeters) {
+          if (distanceToTarget <= effectiveRange) {
             this.stopMovement({ characterId: state.characterId, zoneId: state.zoneId }, 'target_reached');
             return state.currentPosition;
           }
