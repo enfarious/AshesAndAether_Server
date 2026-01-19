@@ -34,6 +34,6 @@ process.on('SIGTERM', shutdown);
 
 // Start server
 server.start().catch((error) => {
-  logger.error({ error }, 'Fatal error starting Zone Server');
+  logger.error({ err: error }, 'Fatal error starting Zone Server');
   process.exit(1);
 });

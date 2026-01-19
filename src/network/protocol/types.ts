@@ -218,6 +218,7 @@ export interface Entity {
   position: Vector3;
   description: string;
   isAlive?: boolean;
+  health?: { current: number; max: number };
   interactive?: boolean;
   hostile?: boolean;
   animation?: string;

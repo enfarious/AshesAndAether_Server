@@ -5,6 +5,7 @@ import session from "express-session";
 import type { Express, RequestHandler } from "express";
 import memoize from "memoizee";
 import connectPg from "connect-pg-simple";
+import crypto from "crypto";
 import { prisma } from '@/database/DatabaseService';
 import { logger } from '@/utils/logger';
 
@@ -20,6 +21,10 @@ const getOidcConfig = memoize(
 
 function getSession() {
   const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
+  const sessionSecret = process.env.SESSION_SECRET;
+  if (!sessionSecret) {
+    logger.warn('SESSION_SECRET is not set; using an ephemeral secret for this session');
+  }
   const pgStore = connectPg(session);
   const sessionStore = new pgStore({
     conString: process.env.DATABASE_URL,
@@ -28,7 +33,7 @@ function getSession() {
     tableName: "sessions",
   });
   return session({
-    secret: process.env.SESSION_SECRET!,
+    secret: sessionSecret ?? crypto.randomBytes(32).toString('hex'),
     store: sessionStore,
     resave: false,
     saveUninitialized: false,

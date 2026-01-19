@@ -13,9 +13,12 @@ import { AbilitySystem } from '@/combat/AbilitySystem';
 import { DamageCalculator } from '@/combat/DamageCalculator';
 import type { CombatAbilityDefinition, CombatStats } from '@/combat/types';
 import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
+import { WildlifeManager, type BiomeType } from '@/wildlife';
 
 const FEET_TO_METERS = 0.3048;
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
+
+const BIOME_FALLBACK: BiomeType = 'forest';
 
 /**
  * Distributed World Manager - manages zones across multiple servers
@@ -37,6 +40,8 @@ export class DistributedWorldManager {
   private damageCalculator: DamageCalculator;
   private respawnTimers: Map<string, NodeJS.Timeout> = new Map();
   private movementSystem: MovementSystem;
+  private attackSpeedBonusCache: Map<string, number> = new Map();
+  private wildlifeManagers: Map<string, WildlifeManager> = new Map();
 
   // Command system
   private commandRegistry: CommandRegistry;
@@ -95,6 +100,47 @@ export class DistributedWorldManager {
 
       // Register with movement system for entity lookups
       this.movementSystem.registerZoneManager(zone.id, zoneManager);
+
+      // Initialize wildlife manager for this zone
+      const biomeType = this.resolveBiomeType(zone.terrainType);
+      const wildlifeManager = new WildlifeManager(zone.id, biomeType);
+      wildlifeManager.setCallbacks({
+        onEntitySpawn: (entity) => {
+          zoneManager.addWildlife({
+            id: entity.id,
+            name: entity.name,
+            speciesId: entity.speciesId,
+            position: entity.position,
+            sprite: entity.speciesId,
+            heading: entity.heading,
+          });
+          void this.broadcastNearbyUpdate(zone.id);
+        },
+        onEntityUpdate: (entity) => {
+          zoneManager.updateWildlife(
+            entity.id,
+            entity.position,
+            entity.heading,
+            entity.currentBehavior
+          );
+          void this.broadcastNearbyUpdate(zone.id);
+        },
+        onEntityDeath: (entity) => {
+          zoneManager.removeWildlife(entity.id);
+          void this.broadcastNearbyUpdate(zone.id);
+        },
+      });
+      wildlifeManager.setDataProviders({
+        getPlayersInRange: (position, range) => zoneManager.getPlayerPositions()
+          .filter(player => {
+            const dx = player.position.x - position.x;
+            const dy = player.position.y - position.y;
+            const dz = player.position.z - position.z;
+            return Math.sqrt(dx * dx + dy * dy + dz * dz) <= range;
+          }),
+        getTimeOfDay: () => 12,
+      });
+      this.wildlifeManagers.set(zone.id, wildlifeManager);
 
       // Initialize NPC AI controllers for this zone
       await this.initializeNPCsForZone(zoneId);
@@ -202,7 +248,7 @@ export class DistributedWorldManager {
 
     if (!zoneManager) {
       logger.error({ characterId: character.id, zoneId: character.zoneId }, 'Cannot add player - zone not managed by this server');
-      return;
+      return null;
     }
 
     zoneManager.addPlayer(character, socketId, isMachine ?? false);
@@ -210,6 +256,9 @@ export class DistributedWorldManager {
 
     // Update player location in registry
     await this.zoneRegistry.updatePlayerLocation(character.id, character.zoneId, socketId);
+
+    // Send a full state snapshot to the joining player for resync
+    await this.sendFullCharacterState(zoneManager, character, socketId);
 
     // Calculate and send proximity roster
     await this.sendProximityRosterToEntity(character.id);
@@ -240,6 +289,7 @@ export class DistributedWorldManager {
     // Clean up proximity roster data
     this.proximityRosterHashes.delete(characterId);
     this.previousRosters.delete(characterId);
+    this.attackSpeedBonusCache.delete(characterId);
 
     // Remove from registry
     await this.zoneRegistry.removePlayer(characterId);
@@ -270,14 +320,14 @@ export class DistributedWorldManager {
     if (speed === 'stop') {
       this.movementSystem.stopMovement({ characterId, zoneId });
       logger.debug({ characterId }, 'Player stopped');
-      return;
+      return null;
     }
 
     // Get current position from zone manager or database
     const entity = zoneManager.getEntity(characterId);
     if (!entity) {
       logger.warn({ characterId, zoneId }, 'Entity not found for movement');
-      return;
+      return null;
     }
 
     const startPosition = entity.position;
@@ -357,7 +407,7 @@ export class DistributedWorldManager {
     const sender = await CharacterService.findById(characterId);
     if (!sender) {
       logger.warn({ characterId }, 'Sender character not found for chat');
-      return;
+      return null;
     }
 
     // Determine range based on channel
@@ -462,7 +512,7 @@ export class DistributedWorldManager {
         narrative: `Target not found.`,
         eventTypeData: { reason: 'target_not_found', attackerId: characterId },
       });
-      return;
+      return null;
     }
 
     const ability =
@@ -487,7 +537,7 @@ export class DistributedWorldManager {
 
     if (!this.commandExecutor) {
       logger.warn('Command executor not initialized');
-      return;
+      return null;
     }
 
     const zoneManager = this.zones.get(zoneId);
@@ -496,13 +546,13 @@ export class DistributedWorldManager {
     const entity = zoneManager.getEntity(characterId);
     if (!entity || !entity.socketId) {
       logger.warn({ characterId, zoneId }, 'Command sender not found in zone');
-      return;
+      return null;
     }
 
     const character = await CharacterService.findById(characterId);
     if (!character) {
       logger.warn({ characterId }, 'Command sender not found in database');
-      return;
+      return null;
     }
 
     const context: CommandContext = {
@@ -535,6 +585,8 @@ export class DistributedWorldManager {
         data: result.data,
       };
     }
+
+    let overrideResponse: { success: boolean; message?: string; error?: string; data?: any } | null = null;
 
     for (const event of result.events) {
       switch (event.type) {
@@ -596,6 +648,50 @@ export class DistributedWorldManager {
             return {
               success: false,
               error: `Player '${targetName}' is not available.`,
+            };
+          }
+          break;
+        }
+        case 'perception': {
+          const { perceptionType, target } = event.data as {
+            perceptionType: string;
+            target?: string | null;
+          };
+
+          if (perceptionType !== 'look') {
+            return {
+              success: false,
+              error: `Perception '${perceptionType}' is not supported yet.`,
+            };
+          }
+
+          if (target) {
+            const response = this.describeLookTarget(zoneManager, context, target);
+            if (!response) {
+              return {
+                success: false,
+                error: `Target '${target}' not found.`,
+              };
+            }
+
+            overrideResponse = {
+              success: true,
+              message: response.message,
+              data: response.data,
+            };
+          } else {
+            const response = this.describeLookArea(zoneManager, context);
+            if (!response) {
+              return {
+                success: false,
+                error: 'Nothing to examine here.',
+              };
+            }
+
+            overrideResponse = {
+              success: true,
+              message: response.message,
+              data: response.data,
             };
           }
           break;
@@ -730,6 +826,10 @@ export class DistributedWorldManager {
       }
     }
 
+    if (overrideResponse) {
+      return overrideResponse;
+    }
+
     return {
       success: result.success,
       message: result.message,
@@ -859,21 +959,355 @@ export class DistributedWorldManager {
     return byName && byName.isAlive ? byName : null;
   }
 
+  private resolveBiomeType(terrainType?: string | null): BiomeType {
+    const normalized = (terrainType || '').toLowerCase();
+    const candidates: BiomeType[] = [
+      'forest',
+      'grassland',
+      'desert',
+      'tundra',
+      'swamp',
+      'mountain',
+      'coastal',
+      'freshwater',
+      'ocean',
+      'urban',
+      'underground',
+    ];
+
+    if (candidates.includes(normalized as BiomeType)) {
+      return normalized as BiomeType;
+    }
+
+    if (normalized.includes('grass') || normalized.includes('plain')) return 'grassland';
+    if (normalized.includes('swamp') || normalized.includes('marsh')) return 'swamp';
+    if (normalized.includes('mountain') || normalized.includes('hill')) return 'mountain';
+    if (normalized.includes('coast') || normalized.includes('shore')) return 'coastal';
+    if (normalized.includes('fresh') || normalized.includes('lake') || normalized.includes('river')) return 'freshwater';
+    if (normalized.includes('ocean') || normalized.includes('sea')) return 'ocean';
+    if (normalized.includes('urban') || normalized.includes('city') || normalized.includes('town')) return 'urban';
+    if (normalized.includes('underground') || normalized.includes('cave')) return 'underground';
+
+    return BIOME_FALLBACK;
+  }
+
+  private async sendCharacterResourcesUpdate(
+    zoneManager: ZoneManager,
+    characterId: string,
+    resources: {
+      health?: { current: number; max: number };
+      stamina?: { current: number; max: number };
+      mana?: { current: number; max: number };
+    }
+  ): Promise<void> {
+    const socketId = zoneManager.getSocketIdForCharacter(characterId);
+    if (!socketId) return;
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'state_update',
+        data: {
+          timestamp: Date.now(),
+          character: resources,
+        },
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  private async sendFullCharacterState(
+    zoneManager: ZoneManager,
+    character: Character,
+    socketId: string
+  ): Promise<void> {
+    const stateUpdate = {
+      timestamp: Date.now(),
+      character: {
+        health: { current: character.currentHp, max: character.maxHp },
+        stamina: { current: character.currentStamina, max: character.maxStamina },
+        mana: { current: character.currentMana, max: character.maxMana },
+      },
+      combat: {
+        inCombat: character.isAlive ? this.combatManager.isInCombat(character.id) : false,
+      },
+    };
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId: character.id,
+      socketId,
+      payload: {
+        socketId,
+        event: 'state_update',
+        data: stateUpdate,
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  private async broadcastEntityHealthUpdate(
+    zoneManager: ZoneManager,
+    origin: Vector3,
+    entityId: string,
+    health: { current: number; max: number }
+  ): Promise<void> {
+    const nearbyPlayers = zoneManager.getPlayerSocketIdsInRange(origin, COMBAT_EVENT_RANGE_METERS);
+    const nearbyCompanions = zoneManager.getCompanionSocketIdsInRange(origin, COMBAT_EVENT_RANGE_METERS);
+
+    const payload = {
+      timestamp: Date.now(),
+      entities: {
+        updated: [
+          {
+            id: entityId,
+            health,
+          },
+        ],
+      },
+    };
+
+    for (const socketId of [...nearbyPlayers, ...nearbyCompanions]) {
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        socketId,
+        payload: {
+          socketId,
+          event: 'state_update',
+          data: payload,
+        },
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  private maybeRetaliate(
+    targetEntity: { id: string; type: 'player' | 'npc' | 'companion' },
+    attackerEntity: { id: string; type: 'player' | 'npc' | 'companion' }
+  ): void {
+    if (targetEntity.id === attackerEntity.id) return;
+    if (this.combatManager.hasAutoAttackTarget(targetEntity.id)) return;
+    this.combatManager.setAutoAttackTarget(targetEntity.id, attackerEntity.id);
+  }
+
+  private async sendCombatEventToEntity(
+    zoneManager: ZoneManager,
+    entityId: string,
+    event: {
+      eventType: string;
+      timestamp: number;
+      narrative?: string;
+      eventTypeData?: Record<string, unknown>;
+    }
+  ): Promise<void> {
+    const socketId = zoneManager.getSocketIdForEntity(entityId);
+    if (!socketId) return;
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      socketId,
+      payload: {
+        socketId,
+        event: 'event',
+        data: {
+          eventType: event.eventType,
+          timestamp: event.timestamp,
+          narrative: event.narrative,
+          ...event.eventTypeData,
+        },
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  private getDeathFloatText(
+    kind: 'kill' | 'die'
+  ): {
+    text: string;
+    colorKey: string;
+    scale: number;
+    shake: number;
+  } {
+    if (kind === 'kill') {
+      return { text: 'KILL', colorKey: 'player.color.kill', scale: 1.35, shake: 0.2 };
+    }
+    return { text: 'YOU DIED', colorKey: 'player.color.die', scale: 1.8, shake: 0.4 };
+  }
+
+  private getCombatFloatTextForTarget(
+    result: { critical: boolean; penetrating: boolean; deflected: boolean; glancing: boolean; amount?: number }
+  ): {
+    text: string;
+    colorKey: string;
+    scale: number;
+    shake: number;
+  } {
+    const amount = result.amount ?? 0;
+    const crit = result.critical;
+    const pen = result.penetrating;
+    const deflect = result.deflected;
+    const glance = result.glancing;
+
+    if (crit && pen) {
+      return { text: `${amount}!`, colorKey: 'player.color.take_damage', scale: 1.5, shake: 0.5 };
+    }
+    if (crit) {
+      return { text: `${amount}!`, colorKey: 'player.color.take_damage', scale: 1.3, shake: 0.4 };
+    }
+    if (pen) {
+      return { text: `${amount}`, colorKey: 'player.color.take_damage', scale: 1.15, shake: 0.2 };
+    }
+    if (deflect) {
+      return { text: `${amount}`, colorKey: 'player.color.take_damage', scale: 0.95, shake: 0 };
+    }
+    if (glance) {
+      return { text: `${amount}`, colorKey: 'player.color.take_damage', scale: 0.9, shake: 0 };
+    }
+
+    return { text: `${amount}`, colorKey: 'player.color.take_damage', scale: 1.05, shake: 0.1 };
+  }
+
+  private getCombatFloatText(
+    kind: 'hit' | 'miss',
+    result?: { critical: boolean; penetrating: boolean; deflected: boolean; glancing: boolean; amount?: number }
+  ): {
+    text: string;
+    colorKey: string;
+    scale: number;
+    shake: number;
+  } {
+    if (kind === 'miss') {
+      return { text: 'MISS', colorKey: 'player.color.miss', scale: 0.9, shake: 0 };
+    }
+
+    const amount = result?.amount ?? 0;
+    const crit = result?.critical;
+    const pen = result?.penetrating;
+    const deflect = result?.deflected;
+    const glance = result?.glancing;
+
+    if (crit && pen) {
+      return { text: `${amount}!`, colorKey: 'player.color.crit_pen', scale: 1.6, shake: 0.6 };
+    }
+    if (crit) {
+      return { text: `${amount}!`, colorKey: 'player.color.crit', scale: 1.35, shake: 0.4 };
+    }
+    if (pen) {
+      return { text: `${amount}`, colorKey: 'player.color.penetrate', scale: 1.2, shake: 0.2 };
+    }
+    if (deflect) {
+      return { text: `${amount}`, colorKey: 'player.color.deflect', scale: 0.95, shake: 0 };
+    }
+    if (glance) {
+      return { text: `${amount}`, colorKey: 'player.color.glance', scale: 0.9, shake: 0 };
+    }
+
+    return { text: `${amount}`, colorKey: 'player.color.hit', scale: 1.0, shake: 0.1 };
+  }
+
+  private describeLookArea(
+    zoneManager: ZoneManager,
+    context: CommandContext
+  ): { message: string; data: any } | null {
+    const zone = zoneManager.getZone();
+    const rosterResult = zoneManager.calculateProximityRoster(context.characterId);
+    if (!rosterResult) return null;
+
+    const see = rosterResult.roster.channels.see;
+    const sample = see.sample ?? [];
+    const previewNames = see.entities.slice(0, 5).map(entity => entity.name);
+
+    let seeMessage = 'You see no one nearby.';
+    if (see.count > 0) {
+      if (sample.length > 0) {
+        seeMessage = `You see ${sample.join(', ')}.`;
+      } else {
+        const previewText = previewNames.length > 0
+          ? ` Nearby: ${previewNames.join(', ')}${see.count > previewNames.length ? '...' : ''}.`
+          : '';
+        seeMessage = `You see ${see.count} figures nearby.${previewText}`;
+      }
+    }
+
+    const description = zone.description ? zone.description.trim() : '';
+    const base = description || 'There is not much to note here.';
+    const message = `You are in ${zone.name}. ${base} ${seeMessage}`;
+
+    return {
+      message,
+      data: {
+        type: 'look',
+        zone: {
+          id: zone.id,
+          name: zone.name,
+          description: zone.description || '',
+        },
+        nearby: {
+          count: see.count,
+          sample,
+          preview: previewNames,
+        },
+      },
+    };
+  }
+
+  private describeLookTarget(
+    zoneManager: ZoneManager,
+    context: CommandContext,
+    target: string
+  ): { message: string; data: any } | null {
+    const entity = zoneManager.getEntity(target) || zoneManager.findEntityByName(target);
+    if (!entity) return null;
+
+    const dx = entity.position.x - context.position.x;
+    const dy = entity.position.y - context.position.y;
+    const dz = entity.position.z - context.position.z;
+    const range = Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz) * 100) / 100;
+
+    const statusParts: string[] = [];
+    statusParts.push(entity.isAlive ? 'alive' : 'dead');
+    if (entity.inCombat) {
+      statusParts.push('in combat');
+    }
+
+    const statusText = statusParts.length > 0 ? ` and ${statusParts.join(', ')}` : '';
+    const message = `${entity.name} (${entity.type}) is ${range}m away${statusText}.`;
+
+    return {
+      message,
+      data: {
+        type: 'look',
+        target: {
+          id: entity.id,
+          name: entity.name,
+          entityType: entity.type,
+          isAlive: entity.isAlive,
+          inCombat: entity.inCombat ?? false,
+          range,
+        },
+      },
+    };
+  }
+
   private async executeCombatAction(
     zoneManager: ZoneManager,
     attackerEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
     targetEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
     ability: CombatAbilityDefinition,
-    options?: { isAutoAttack?: boolean }
-  ): Promise<void> {
+    options?: { isAutoAttack?: boolean; isQueued?: boolean }
+  ): Promise<{ hit: boolean } | null> {
     const isAutoAttack = options?.isAutoAttack ?? false;
+    const isQueued = options?.isQueued ?? false;
     const characterId = attackerEntity.id;
     const targetId = targetEntity.id;
     const now = Date.now();
 
     const attackerSnapshot = await this.getCombatSnapshot(characterId, attackerEntity);
     const targetSnapshot = await this.getCombatSnapshot(targetId, targetEntity);
-    if (!attackerSnapshot || !targetSnapshot) return;
+    if (!attackerSnapshot || !targetSnapshot) return null;
 
     if (!this.validateRange(attackerEntity.position, targetEntity.position, ability)) {
       await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
@@ -882,7 +1316,7 @@ export class DistributedWorldManager {
         narrative: `Target out of range.`,
         eventTypeData: { reason: 'out_of_range', attackerId: characterId },
       });
-      return;
+      return null;
     }
 
     const cooldownRemaining = this.combatManager.getCooldownRemaining(characterId, ability.id, now);
@@ -893,7 +1327,7 @@ export class DistributedWorldManager {
         narrative: `Ability on cooldown.`,
         eventTypeData: { reason: 'cooldown', attackerId: characterId },
       });
-      return;
+      return null;
     }
 
     // Auto-attacks don't use ATB - they run on weapon speed timer
@@ -905,7 +1339,7 @@ export class DistributedWorldManager {
           narrative: `Not enough ATB.`,
           eventTypeData: { reason: 'atb_low', attackerId: characterId },
         });
-        return;
+        return null;
       }
     }
 
@@ -933,7 +1367,7 @@ export class DistributedWorldManager {
             current: currentCharges,
           },
         });
-        return;
+        return null;
       }
     }
 
@@ -944,10 +1378,63 @@ export class DistributedWorldManager {
         narrative: `Not enough resources.`,
         eventTypeData: { reason: 'insufficient_resources', attackerId: characterId },
       });
-      return;
+      return null;
+    }
+
+    const castTime = ability.castTime ?? 0;
+    if (!isAutoAttack && !isQueued && castTime > 0) {
+      const actionId = `${characterId}-${now}-${Math.random().toString(36).slice(2, 8)}`;
+      const readyAt = now + castTime * 1000;
+
+      this.combatManager.enqueueAction({
+        actionId,
+        attackerId: characterId,
+        targetId,
+        ability,
+        queuedAt: now,
+        readyAt,
+        castTime,
+      });
+
+      this.combatManager.recordHostileAction(characterId, now);
+      this.combatManager.recordHostileAction(targetId, now);
+
+      const attackerStarted = this.combatManager.startCombat(characterId, now);
+      const targetStarted = this.combatManager.startCombat(targetId, now);
+
+      if (attackerStarted) {
+        zoneManager.setEntityCombatState(characterId, true);
+      }
+      if (targetStarted) {
+        zoneManager.setEntityCombatState(targetId, true);
+      }
+
+      if (attackerStarted || targetStarted) {
+        await this.broadcastNearbyUpdate(zoneManager.getZone().id);
+        await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+          eventType: 'combat_start',
+          timestamp: now,
+          eventTypeData: { attackerId: characterId, targetId },
+        });
+      }
+
+      return null;
     }
 
     await this.applyCosts(attackerSnapshot, ability);
+    if (attackerSnapshot.isPlayer) {
+      const healthCost = ability.healthCost || 0;
+      const staminaCost = ability.staminaCost || 0;
+      const manaCost = ability.manaCost || 0;
+      const nextHealth = Math.max(1, attackerSnapshot.currentHealth - healthCost);
+      const nextStamina = Math.max(0, attackerSnapshot.currentStamina - staminaCost);
+      const nextMana = Math.max(0, attackerSnapshot.currentMana - manaCost);
+      await this.sendCharacterResourcesUpdate(zoneManager, characterId, {
+        health: { current: nextHealth, max: attackerSnapshot.maxHealth },
+        stamina: { current: nextStamina, max: attackerSnapshot.maxStamina },
+        mana: { current: nextMana, max: attackerSnapshot.maxMana },
+      });
+    }
     // Auto-attacks don't spend ATB
     if (!isAutoAttack && !ability.isFree) {
       this.combatManager.spendAtb(characterId, ability.atbCost);
@@ -971,7 +1458,8 @@ export class DistributedWorldManager {
       );
     }
 
-    this.combatManager.setCooldown(characterId, ability.id, ability.cooldown * 1000, now);
+    const effectDelayMs = ability.effectDuration ? ability.effectDuration * 1000 : 0;
+    this.combatManager.setCooldown(characterId, ability.id, ability.cooldown * 1000 + effectDelayMs, now);
     this.combatManager.recordHostileAction(characterId, now);
     this.combatManager.recordHostileAction(targetId, now);
 
@@ -994,6 +1482,10 @@ export class DistributedWorldManager {
       });
     }
 
+    if (!isAutoAttack) {
+      this.maybeRetaliate(targetEntity, attackerEntity);
+    }
+
     await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
       eventType: 'combat_action',
       timestamp: now,
@@ -1006,61 +1498,125 @@ export class DistributedWorldManager {
     });
 
     if (ability.damage) {
-      const scalingValue = this.getScalingValue(attackerSnapshot, ability);
-      const result = this.damageCalculator.calculate(
-        ability,
-        attackerSnapshot.stats,
-        targetSnapshot.stats,
-        scalingValue
-      );
-
-      if (!result.hit) {
-        await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
-          eventType: 'combat_miss',
-          timestamp: now,
-          eventTypeData: { attackerId: characterId, targetId, abilityId: ability.id },
-        });
-        return;
+      const targets = this.getCombatTargets(zoneManager, attackerEntity, targetEntity, ability);
+      if (targets.length === 0) {
+        return { hit: false };
       }
 
-      const newHp = Math.max(0, targetSnapshot.currentHealth - result.amount);
-      await this.updateHealth(targetSnapshot, newHp);
+      const scalingValue = this.getScalingValue(attackerSnapshot, ability);
+      const damageScale = this.getMultiTargetScale(targets.length);
+      const snapshots = new Map<string, typeof targetSnapshot>([[targetId, targetSnapshot]]);
+      let anyHit = false;
 
-      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
-        eventType: 'combat_hit',
-        timestamp: now,
-        eventTypeData: {
-          attackerId: characterId,
-          targetId,
-          abilityId: ability.id,
-          outcome: result.outcome,
-          amount: result.amount,
-          baseDamage: result.baseDamage,
-          mitigatedDamage: result.mitigatedDamage,
-        },
-      });
+      for (const target of targets) {
+        let targetData = snapshots.get(target.id);
+        if (!targetData) {
+          targetData = await this.getCombatSnapshot(target.id, { type: target.type });
+          if (!targetData) continue;
+          snapshots.set(target.id, targetData);
+        }
 
-      if (newHp <= 0) {
-        zoneManager.setEntityAlive(targetId, false);
-        zoneManager.setEntityCombatState(targetId, false);
+        const result = this.damageCalculator.calculate(
+          ability,
+          attackerSnapshot.stats,
+          targetData.stats,
+          scalingValue,
+          { damageMultiplier: damageScale }
+        );
 
-        // Clear auto-attack for the dying target and all entities targeting it
-        this.combatManager.clearAutoAttackTarget(targetId);
-        this.combatManager.clearAutoAttacksOnTarget(targetId);
+        if (!result.hit) {
+          await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+            eventType: 'combat_miss',
+            timestamp: now,
+            eventTypeData: {
+              attackerId: characterId,
+              targetId: targetData.entityId,
+              abilityId: ability.id,
+              floatText: this.getCombatFloatText('miss'),
+            },
+          });
+          continue;
+        }
 
-        await this.broadcastNearbyUpdate(zoneManager.getZone().id);
-
-        await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
-          eventType: 'combat_death',
-          timestamp: now,
-          eventTypeData: { targetId },
+        anyHit = true;
+        const newHp = Math.max(0, targetData.currentHealth - result.amount);
+        await this.updateHealth(targetData, newHp);
+        if (targetData.isPlayer) {
+          await this.sendCharacterResourcesUpdate(zoneManager, targetData.entityId, {
+            health: { current: newHp, max: targetData.maxHealth },
+            stamina: { current: targetData.currentStamina, max: targetData.maxStamina },
+            mana: { current: targetData.currentMana, max: targetData.maxMana },
+          });
+        }
+        await this.broadcastEntityHealthUpdate(zoneManager, targetEntity.position, targetData.entityId, {
+          current: newHp,
+          max: targetData.maxHealth,
         });
 
-        if (!targetSnapshot.isPlayer) {
-          await this.scheduleMobRespawn(targetId, zoneManager.getZone().id, targetSnapshot.maxHealth);
+        await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+          eventType: 'combat_hit',
+          timestamp: now,
+          eventTypeData: {
+            attackerId: characterId,
+            targetId: targetData.entityId,
+            abilityId: ability.id,
+            outcome: result.outcome,
+            critical: result.critical,
+            deflected: result.deflected,
+            penetrating: result.penetrating,
+            glancing: result.glancing,
+            amount: result.amount,
+            baseDamage: result.baseDamage,
+            mitigatedDamage: result.mitigatedDamage,
+            floatText: this.getCombatFloatText('hit', result),
+            floatTextTarget: this.getCombatFloatTextForTarget(result),
+          },
+        });
+
+        if (newHp <= 0) {
+          zoneManager.setEntityAlive(targetData.entityId, false);
+          zoneManager.setEntityCombatState(targetData.entityId, false);
+
+          // Clear auto-attack for the dying target and all entities targeting it
+          this.combatManager.clearAutoAttackTarget(targetData.entityId);
+          this.combatManager.clearAutoAttacksOnTarget(targetData.entityId);
+
+          await this.broadcastNearbyUpdate(zoneManager.getZone().id);
+
+          await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+            eventType: 'combat_death',
+            timestamp: now,
+            eventTypeData: { targetId: targetData.entityId },
+          });
+
+          await this.sendCombatEventToEntity(zoneManager, characterId, {
+            eventType: 'combat_death',
+            timestamp: now,
+            eventTypeData: {
+              targetId: targetData.entityId,
+              floatText: this.getDeathFloatText('kill'),
+            },
+          });
+
+          await this.sendCombatEventToEntity(zoneManager, targetData.entityId, {
+            eventType: 'combat_death',
+            timestamp: now,
+            eventTypeData: {
+              targetId: targetData.entityId,
+              floatText: this.getDeathFloatText('die'),
+            },
+          });
+
+          if (!targetData.isPlayer) {
+            await this.scheduleMobRespawn(targetData.entityId, zoneManager.getZone().id, targetData.maxHealth);
+          }
         }
       }
+
+      return { hit: anyHit };
     }
+
+    return { hit: true };
   }
 
   private async broadcastCombatEvent(
@@ -1114,6 +1670,8 @@ export class DistributedWorldManager {
     isPlayer: boolean;
     currentHealth: number;
     maxHealth: number;
+    maxStamina: number;
+    maxMana: number;
     currentStamina: number;
     currentMana: number;
     stats: CombatStats;
@@ -1140,6 +1698,7 @@ export class DistributedWorldManager {
       };
 
       const derived = StatCalculator.calculateDerivedStats(coreStats, character.level);
+      this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
 
       return {
         entityId,
@@ -1148,6 +1707,8 @@ export class DistributedWorldManager {
         maxHealth: character.maxHp,
         currentStamina: character.currentStamina,
         currentMana: character.currentMana,
+        maxStamina: character.maxStamina,
+        maxMana: character.maxMana,
         coreStats,
         stats: this.buildCombatStats(derived),
       };
@@ -1166,6 +1727,7 @@ export class DistributedWorldManager {
       wisdom: stats.wisdom ?? 10,
     };
     const derived = StatCalculator.calculateDerivedStats(coreStats, companion.level);
+    this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
 
     return {
       entityId,
@@ -1174,6 +1736,8 @@ export class DistributedWorldManager {
       maxHealth: companion.maxHealth,
       currentStamina: 0,
       currentMana: 0,
+      maxStamina: 0,
+      maxMana: 0,
       coreStats,
       stats: this.buildCombatStats(derived),
     };
@@ -1186,6 +1750,9 @@ export class DistributedWorldManager {
     evasion: number;
     damageAbsorption: number;
     glancingBlowChance: number;
+    criticalHitChance: number;
+    penetratingBlowChance: number;
+    deflectedBlowChance: number;
     magicAttack: number;
     magicDefense: number;
     magicAccuracy: number;
@@ -1204,9 +1771,9 @@ export class DistributedWorldManager {
       magicAccuracy: derived.magicAccuracy,
       magicEvasion: derived.magicEvasion,
       magicAbsorption: derived.magicAbsorption,
-      criticalHitChance: 5,
-      penetratingBlowChance: 5,
-      deflectedBlowChance: 5,
+      criticalHitChance: derived.criticalHitChance,
+      penetratingBlowChance: derived.penetratingBlowChance,
+      deflectedBlowChance: derived.deflectedBlowChance,
     };
   }
 
@@ -1221,6 +1788,128 @@ export class DistributedWorldManager {
     const dz = target.z - source.z;
     const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
     return distance <= ability.range;
+  }
+
+  private getMultiTargetScale(targetCount: number): number {
+    if (targetCount <= 1) return 1;
+    return (1 + 0.1 * (targetCount - 1)) / targetCount;
+  }
+
+  private getCombatTargets(
+    zoneManager: ZoneManager,
+    attacker: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
+    target: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
+    ability: CombatAbilityDefinition
+  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' }> {
+    if (ability.targetType === 'self') {
+      return [{ id: attacker.id, position: attacker.position, type: attacker.type }];
+    }
+
+    if (ability.targeting?.shape === 'cone') {
+      return this.getConeTargets(zoneManager, attacker, target, ability);
+    }
+
+    if (ability.targeting?.shape === 'line') {
+      return this.getLineTargets(zoneManager, attacker, target, ability);
+    }
+
+    if (ability.aoeRadius && ability.aoeRadius > 0) {
+      const entities = zoneManager.getEntitiesInRangeForCombat(target.position, ability.aoeRadius, attacker.id);
+      return entities.filter(entity => entity.type === 'player' || entity.type === 'companion');
+    }
+
+    return [{ id: target.id, position: target.position, type: target.type }];
+  }
+
+  private getConeTargets(
+    zoneManager: ZoneManager,
+    attacker: { id: string; position: { x: number; y: number; z: number } },
+    target: { id: string; position: { x: number; y: number; z: number } },
+    ability: CombatAbilityDefinition
+  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' }> {
+    const length = ability.targeting?.length ?? ability.range;
+    const angleDegrees = ability.targeting?.angle ?? 45;
+    const halfAngle = (angleDegrees * Math.PI) / 360;
+
+    const direction = this.normalizeVector({
+      x: target.position.x - attacker.position.x,
+      y: target.position.y - attacker.position.y,
+      z: target.position.z - attacker.position.z,
+    });
+
+    const entities = zoneManager.getEntitiesInRangeForCombat(attacker.position, length, attacker.id);
+    return entities
+      .filter(entity => entity.type === 'player' || entity.type === 'companion')
+      .filter(entity => {
+        const toEntity = {
+          x: entity.position.x - attacker.position.x,
+          y: entity.position.y - attacker.position.y,
+          z: entity.position.z - attacker.position.z,
+        };
+        const distance = Math.sqrt(toEntity.x * toEntity.x + toEntity.y * toEntity.y + toEntity.z * toEntity.z);
+        if (distance === 0) return false;
+        const normalized = this.normalizeVector(toEntity);
+        const dot = this.clamp(this.dotVector(normalized, direction), -1, 1);
+        const angle = Math.acos(dot);
+        return angle <= halfAngle;
+      });
+  }
+
+  private getLineTargets(
+    zoneManager: ZoneManager,
+    attacker: { id: string; position: { x: number; y: number; z: number } },
+    target: { id: string; position: { x: number; y: number; z: number } },
+    ability: CombatAbilityDefinition
+  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' }> {
+    const length = ability.targeting?.length ?? ability.range;
+    const width = ability.targeting?.width ?? 1;
+
+    const direction = this.normalizeVector({
+      x: target.position.x - attacker.position.x,
+      y: target.position.y - attacker.position.y,
+      z: target.position.z - attacker.position.z,
+    });
+
+    const entities = zoneManager.getEntitiesInRangeForCombat(attacker.position, length, attacker.id);
+    return entities
+      .filter(entity => entity.type === 'player' || entity.type === 'companion')
+      .filter(entity => {
+        const toEntity = {
+          x: entity.position.x - attacker.position.x,
+          y: entity.position.y - attacker.position.y,
+          z: entity.position.z - attacker.position.z,
+        };
+        const projection = this.dotVector(toEntity, direction);
+        if (projection < 0 || projection > length) return false;
+        const closestPoint = {
+          x: attacker.position.x + direction.x * projection,
+          y: attacker.position.y + direction.y * projection,
+          z: attacker.position.z + direction.z * projection,
+        };
+        const dx = entity.position.x - closestPoint.x;
+        const dy = entity.position.y - closestPoint.y;
+        const dz = entity.position.z - closestPoint.z;
+        const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        return distance <= width / 2;
+      });
+  }
+
+  private normalizeVector(vector: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
+    const magnitude = Math.sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
+    if (magnitude === 0) return { x: 0, y: 0, z: 0 };
+    return {
+      x: vector.x / magnitude,
+      y: vector.y / magnitude,
+      z: vector.z / magnitude,
+    };
+  }
+
+  private dotVector(a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }): number {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+  }
+
+  private clamp(value: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, value));
   }
 
   private getScalingValue(
@@ -1338,6 +2027,7 @@ export class DistributedWorldManager {
     zoneManager.setCompanionSocketId(companionId, null);
     this.companionToZone.delete(companionId);
     this.previousRosters.delete(companionId);
+    this.attackSpeedBonusCache.delete(companionId);
   }
 
   private async handleNpcChat(message: MessageEnvelope): Promise<void> {
@@ -1811,10 +2501,16 @@ export class DistributedWorldManager {
    */
   update(deltaTime: number): void {
     // Update combat system (ATB, cooldowns, combat timeouts)
-    const expired = this.combatManager.update(deltaTime, () => 0);
+    const expired = this.combatManager.update(
+      deltaTime,
+      (entityId) => this.attackSpeedBonusCache.get(entityId) ?? 0
+    );
     if (expired.length > 0) {
       void this.handleCombatTimeouts(expired);
     }
+
+    // Process queued combat actions (cast times)
+    void this.processQueuedCombatActions();
 
     // Process auto-attacks for entities whose weapon timer is ready
     void this.processAutoAttacks();
@@ -1826,6 +2522,12 @@ export class DistributedWorldManager {
     const positionUpdates = this.movementSystem.update(deltaTime);
     if (positionUpdates.size > 0) {
       void this.handleMovementUpdates(positionUpdates);
+    }
+
+    // Update wildlife simulation
+    const now = Date.now();
+    for (const wildlifeManager of this.wildlifeManagers.values()) {
+      wildlifeManager.update(deltaTime, now);
     }
   }
 
@@ -1881,6 +2583,64 @@ export class DistributedWorldManager {
         },
         timestamp: Date.now(),
       });
+    }
+  }
+
+  private async processQueuedCombatActions(): Promise<void> {
+    const readyActions = this.combatManager.getReadyActions(Date.now());
+    if (readyActions.length === 0) return;
+
+    for (const action of readyActions) {
+      const zoneId = this.characterToZone.get(action.attackerId) || this.companionToZone.get(action.attackerId);
+      if (!zoneId) {
+        continue;
+      }
+
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) {
+        continue;
+      }
+
+      const attackerEntity = zoneManager.getEntity(action.attackerId);
+      const targetEntity = zoneManager.getEntity(action.targetId);
+
+      if (!attackerEntity || !attackerEntity.isAlive) {
+        if (targetEntity) {
+          await this.broadcastCombatEvent(zoneId, targetEntity.position, {
+            eventType: 'combat_error',
+            timestamp: Date.now(),
+            narrative: 'Attacker not available.',
+            eventTypeData: { reason: 'attacker_missing', attackerId: action.attackerId },
+          });
+        }
+        continue;
+      }
+
+      if (!targetEntity || !targetEntity.isAlive) {
+        await this.broadcastCombatEvent(zoneId, attackerEntity.position, {
+          eventType: 'combat_error',
+          timestamp: Date.now(),
+          narrative: 'Target not available.',
+          eventTypeData: { reason: 'target_not_found', attackerId: action.attackerId },
+        });
+        continue;
+      }
+
+      await this.executeCombatAction(
+        zoneManager,
+        {
+          id: attackerEntity.id,
+          position: attackerEntity.position,
+          type: attackerEntity.type,
+        },
+        {
+          id: targetEntity.id,
+          position: targetEntity.position,
+          type: targetEntity.type,
+        },
+        action.ability,
+        { isQueued: true }
+      );
     }
   }
 
@@ -2069,6 +2829,7 @@ export class DistributedWorldManager {
 
       // Clear auto-attack when combat times out
       this.combatManager.clearAutoAttackTarget(entityId);
+      this.combatManager.clearQueuedActionsForEntity(entityId);
 
       zoneManager.setEntityCombatState(entityId, false);
       await this.broadcastNearbyUpdate(zoneId);
@@ -2120,5 +2881,6 @@ export class DistributedWorldManager {
     this.zones.clear();
     this.characterToZone.clear();
     this.companionToZone.clear();
+    this.wildlifeManagers.clear();
   }
 }

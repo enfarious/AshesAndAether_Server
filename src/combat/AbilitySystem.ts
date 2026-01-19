@@ -9,7 +9,7 @@ const BASIC_ATTACK: CombatAbilityDefinition = {
   targetType: 'enemy',
   range: 2, // meters
   cooldown: 0,
-  atbCost: 100,
+  atbCost: 0,
   staminaCost: 5,
   damage: {
     type: 'physical',
@@ -40,7 +40,8 @@ export class AbilitySystem {
       logger.warn({ error, abilityId }, 'Ability lookup failed, using in-memory definitions');
     }
 
-    return this.inMemory.get(abilityId) || null;
+    const fallback = this.inMemory.get(abilityId) || null;
+    return fallback;
   }
 
   async getAbilityByName(name: string): Promise<CombatAbilityDefinition | null> {

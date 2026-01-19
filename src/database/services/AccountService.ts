@@ -50,7 +50,7 @@ export class AccountService {
       data: {
         email: `guest-${timestamp}@temp.worldofdarkness.com`,
         username: uniqueUsername,
-        passwordHash: null,
+        passwordHash: `guest-${timestamp}-dev`,
       },
     });
   }

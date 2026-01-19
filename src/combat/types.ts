@@ -24,6 +24,12 @@ export interface CombatAbilityDefinition {
   healthCost?: number;
   castTime?: number; // seconds
   aoeRadius?: number; // meters
+  targeting?: {
+    shape: 'line' | 'cone';
+    angle?: number; // degrees for cone
+    length?: number; // meters
+    width?: number; // meters for line
+  };
   damage?: {
     type: DamageType;
     amount: number;
@@ -90,9 +96,23 @@ export interface CombatStats {
   deflectedBlowChance: number;
 }
 
+export interface QueuedCombatAction {
+  actionId: string;
+  attackerId: string;
+  targetId: string;
+  ability: CombatAbilityDefinition;
+  queuedAt: number;
+  readyAt: number;
+  castTime: number;
+}
+
 export interface DamageResult {
   hit: boolean;
   outcome: 'hit' | 'crit' | 'glance' | 'penetrating' | 'deflected' | 'miss';
+  critical: boolean;
+  deflected: boolean;
+  penetrating: boolean;
+  glancing: boolean;
   amount: number;
   baseDamage: number;
   mitigatedDamage: number;

@@ -6,7 +6,7 @@ import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } 
 
 export const lookCommand: CommandDefinition = {
   name: 'look',
-  aliases: ['l', 'examine'],
+  aliases: ['l', 'examine', 'exam'],
   description: 'Examine your surroundings or a specific target',
   category: 'world',
   usage: '/look [target]',
@@ -27,7 +27,9 @@ export const lookCommand: CommandDefinition = {
   },
 
   handler: async (context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
-    const target = args.positionalArgs[0] || null;
+    const target = args.positionalArgs.length > 0
+      ? args.positionalArgs.join(' ').trim()
+      : null;
 
     // Create perception event for narrator
     return {

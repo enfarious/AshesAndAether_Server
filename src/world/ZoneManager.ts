@@ -623,6 +623,10 @@ export class ZoneManager {
     return socketIds;
   }
 
+  getEntitiesInRangeForCombat(origin: Vector3, range: number, excludeId?: string): Entity[] {
+    return this.getEntitiesInRange(origin, range, excludeId);
+  }
+
   /**
    * Get zone info
    */

@@ -119,6 +119,14 @@ With spatial navigation now complete (bearing/elevation/range), we can implement
 - [ ] Text client can attack specific targets (e.g., `attack ant.worker.2`)
 - [ ] MUD client can use Approach/Evade buttons for tactical positioning
 
+### Phase 2 Combat Follow-Ups
+
+- [ ] Status effects manager (buff/debuff/DoT/HoT) + `combat_effect` events.
+- [ ] Haste/slow hooks that modify ATB fill (no RNG).
+- [ ] Casting escrow/now_casting bucket; refund on interrupt/failure.
+- [ ] Channeled upkeep system (persistent MP drain while other casts continue).
+- [ ] Validate/extend AoE + line/cone targeting (LOS, better shapes, balance).
+
 ---
 
 ## Priority 3: NPC AI Enhancement
@@ -323,12 +331,19 @@ With combat working, players need items, equipment, and loot.
 - Spawn points and population management
 - Creature AI (wandering, aggression, fleeing)
 - Ecosystem simulation (tick rate already configured)
+- Growth/aging impact on combat stats and level progression
+- Combat experience: creatures that survive fights level up and grow stronger
 
 ### 7. Party/Group System
 - Party formation and management
 - Shared experience and loot
 - Party chat channel
 - Group-based abilities
+- Core flow: invite, join, leave, kick
+- Max party size: 5 members
+- `state_update.allies` should include party members' MP/Stamina percentages and ATB only
+- Alliance layer: up to 6 parties (raid structure)
+- Decide on alliance vs. large war-band model (EVE-style vs. capped raids)
 
 ### 8. Guild/Clan System
 - Guild creation and membership

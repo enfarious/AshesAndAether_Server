@@ -25,11 +25,13 @@ export class DamageCalculator {
     ability: CombatAbilityDefinition,
     attacker: CombatStats,
     defender: CombatStats,
-    scalingValue: number
+    scalingValue: number,
+    options?: { damageMultiplier?: number }
   ): DamageResult {
     const damageType = ability.damage?.type || 'physical';
     const mitigationCategory = MITIGATION_CATEGORY[damageType];
-    const baseDamage = this.calculateBaseDamage(ability, attacker, scalingValue);
+    const damageMultiplier = options?.damageMultiplier ?? 1;
+    const baseDamage = this.calculateBaseDamage(ability, attacker, scalingValue) * damageMultiplier;
 
     const hitChance = mitigationCategory === 'magic'
       ? StatCalculator.calculateHitChance(attacker.magicAccuracy, defender.magicEvasion)
@@ -40,6 +42,10 @@ export class DamageCalculator {
       return {
         hit: false,
         outcome: 'miss',
+        critical: false,
+        deflected: false,
+        penetrating: false,
+        glancing: false,
         amount: 0,
         baseDamage,
         mitigatedDamage: 0,
@@ -50,29 +56,29 @@ export class DamageCalculator {
     let damage = baseDamage;
     let mitigatedDamage = baseDamage;
 
-    if (outcome === 'crit') {
+    if (outcome.critical) {
       damage = StatCalculator.calculateCriticalDamage(baseDamage, 1.5);
-      mitigatedDamage = this.applyMitigation(damage, defender, mitigationCategory, false);
-    } else if (outcome === 'glance') {
-      mitigatedDamage = this.applyMitigation(baseDamage, defender, mitigationCategory, true);
-      damage = mitigatedDamage;
-    } else if (outcome === 'penetrating') {
-      mitigatedDamage = this.applyPenetrating(baseDamage, defender, mitigationCategory);
-      damage = mitigatedDamage;
-    } else if (outcome === 'deflected') {
-      mitigatedDamage = Math.max(
-        1,
-        Math.floor(this.applyMitigation(baseDamage, defender, mitigationCategory, false) * 0.5)
-      );
-      damage = mitigatedDamage;
-    } else {
-      mitigatedDamage = this.applyMitigation(baseDamage, defender, mitigationCategory, false);
-      damage = mitigatedDamage;
     }
+
+    if (outcome.penetrating) {
+      mitigatedDamage = this.applyPenetrating(damage, defender, mitigationCategory);
+    } else {
+      mitigatedDamage = this.applyMitigation(damage, defender, mitigationCategory, outcome.glancing);
+    }
+
+    if (outcome.deflected) {
+      mitigatedDamage = Math.max(1, Math.floor(mitigatedDamage * 0.5));
+    }
+
+    damage = mitigatedDamage;
 
     return {
       hit: true,
-      outcome,
+      outcome: outcome.outcome,
+      critical: outcome.critical,
+      deflected: outcome.deflected,
+      penetrating: outcome.penetrating,
+      glancing: outcome.glancing,
       amount: damage,
       baseDamage,
       mitigatedDamage,
@@ -131,19 +137,65 @@ export class DamageCalculator {
     return Math.max(1, Math.floor(damage));
   }
 
-  private rollOutcome(attacker: CombatStats): DamageResult['outcome'] {
+  private rollOutcome(attacker: CombatStats): {
+    outcome: DamageResult['outcome'];
+    critical: boolean;
+    deflected: boolean;
+    penetrating: boolean;
+    glancing: boolean;
+  } {
     const crit = this.clampChance(attacker.criticalHitChance, BASE_CRIT_CHANCE);
     const glance = this.clampChance(attacker.glancingBlowChance, 0);
     const penetrating = this.clampChance(attacker.penetratingBlowChance, BASE_PENETRATING_CHANCE);
     const deflected = this.clampChance(attacker.deflectedBlowChance, BASE_DEFLECTED_CHANCE);
 
-    const roll = Math.random() * 100;
+    const outcome: {
+      outcome: DamageResult['outcome'];
+      critical: boolean;
+      deflected: boolean;
+      penetrating: boolean;
+      glancing: boolean;
+    } = {
+      outcome: 'hit',
+      critical: false,
+      deflected: false,
+      penetrating: false,
+      glancing: false,
+    };
 
-    if (roll < crit) return 'crit';
-    if (roll < crit + glance) return 'glance';
-    if (roll < crit + glance + penetrating) return 'penetrating';
-    if (roll < crit + glance + penetrating + deflected) return 'deflected';
-    return 'hit';
+    // Crit vs deflected (mutually exclusive)
+    const rollPrimary = Math.random() * 100;
+    if (rollPrimary < crit) {
+      outcome.critical = true;
+    } else if (rollPrimary < crit + deflected) {
+      outcome.deflected = true;
+    }
+
+    // Penetrating vs glancing (mutually exclusive); glancing allowed with deflected
+    const rollSecondary = Math.random() * 100;
+    const canPenetrate = !outcome.deflected;
+    const canGlance = !outcome.critical;
+
+    if (canPenetrate && rollSecondary < penetrating) {
+      outcome.penetrating = true;
+    } else if (canGlance) {
+      const glanceThreshold = canPenetrate ? penetrating + glance : glance;
+      if (rollSecondary < glanceThreshold) {
+        outcome.glancing = true;
+      }
+    }
+
+    if (outcome.critical) {
+      outcome.outcome = 'crit';
+    } else if (outcome.deflected) {
+      outcome.outcome = 'deflected';
+    } else if (outcome.penetrating) {
+      outcome.outcome = 'penetrating';
+    } else if (outcome.glancing) {
+      outcome.outcome = 'glance';
+    }
+
+    return outcome;
   }
 
   private clampChance(value: number, fallback: number): number {

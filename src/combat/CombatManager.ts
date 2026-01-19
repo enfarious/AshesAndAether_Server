@@ -1,4 +1,4 @@
-import { CombatantState, ATB_DEFAULT_MAX, ATB_ABSOLUTE_MAX, SPECIAL_CHARGE_MAX } from './types';
+import { CombatantState, ATB_DEFAULT_MAX, ATB_ABSOLUTE_MAX, SPECIAL_CHARGE_MAX, QueuedCombatAction } from './types';
 
 const DEFAULT_ATB_BASE_RATE = 10; // gauge per second
 const DEFAULT_COMBAT_TIMEOUT_MS = 15000;
@@ -6,6 +6,7 @@ const DEFAULT_WEAPON_SPEED = 3.0; // seconds between auto-attacks (default unarm
 
 export class CombatManager {
   private combatants: Map<string, CombatantState> = new Map();
+  private queuedActions: QueuedCombatAction[] = [];
   private readonly baseRate: number;
   private readonly timeoutMs: number;
 
@@ -51,17 +52,17 @@ export class CombatManager {
     const expired: string[] = [];
 
     for (const state of this.combatants.values()) {
+      // Update auto-attack timer (separate from ATB)
+      if (state.autoAttackTarget) {
+        state.autoAttackTimer += deltaTime;
+      }
+
       if (state.inCombat) {
         // Update ATB gauge (for abilities/spells/items)
         // Caps at entity's atbMax (default 200, can be up to 500 with gear)
         const bonus = getAttackSpeedBonus(state.entityId);
         const rate = this.baseRate + bonus;
         state.atbGauge = Math.min(state.atbMax, state.atbGauge + rate * deltaTime);
-
-        // Update auto-attack timer (separate from ATB)
-        if (state.autoAttackTarget) {
-          state.autoAttackTimer += deltaTime;
-        }
 
         // Check combat timeout
         if (now - state.lastHostileAt >= this.timeoutMs) {
@@ -238,7 +239,7 @@ export class CombatManager {
     const ready: Array<{ attackerId: string; targetId: string }> = [];
 
     for (const state of this.combatants.values()) {
-      if (state.inCombat && state.autoAttackTarget && state.autoAttackTimer >= state.weaponSpeed) {
+      if (state.autoAttackTarget && state.autoAttackTimer >= state.weaponSpeed) {
         ready.push({
           attackerId: state.entityId,
           targetId: state.autoAttackTarget,
@@ -342,5 +343,29 @@ export class CombatManager {
       }
     }
     return entities;
+  }
+
+  enqueueAction(action: QueuedCombatAction): void {
+    this.queuedActions.push(action);
+  }
+
+  getReadyActions(now: number): QueuedCombatAction[] {
+    const ready: QueuedCombatAction[] = [];
+    const pending: QueuedCombatAction[] = [];
+
+    for (const action of this.queuedActions) {
+      if (action.readyAt <= now) {
+        ready.push(action);
+      } else {
+        pending.push(action);
+      }
+    }
+
+    this.queuedActions = pending;
+    return ready;
+  }
+
+  clearQueuedActionsForEntity(entityId: string): void {
+    this.queuedActions = this.queuedActions.filter(action => action.attackerId !== entityId);
   }
 }

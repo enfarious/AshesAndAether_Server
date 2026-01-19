@@ -25,6 +25,9 @@ export interface DerivedStats {
   evasion: number;
   damageAbsorption: number;
   glancingBlowChance: number;
+  criticalHitChance: number;
+  penetratingBlowChance: number;
+  deflectedBlowChance: number;
 
   // Magic Combat
   magicAttack: number;
@@ -52,6 +55,9 @@ export interface EquipmentBonuses {
   maxHp?: number;
   maxStamina?: number;
   maxMana?: number;
+  criticalHitChance?: number;
+  penetratingBlowChance?: number;
+  deflectedBlowChance?: number;
 }
 
 export class StatCalculator {
@@ -77,6 +83,9 @@ export class StatCalculator {
       evasion: this.calculateEvasion(core.agility, equipment.evasion),
       damageAbsorption: this.calculateDamageAbsorption(core.vitality, equipment.damageAbsorption),
       glancingBlowChance: this.calculateGlancingBlowChance(core.agility),
+      criticalHitChance: this.calculateCriticalHitChance(core.dexterity, equipment.criticalHitChance),
+      penetratingBlowChance: this.calculatePenetratingBlowChance(core.strength, equipment.penetratingBlowChance),
+      deflectedBlowChance: this.calculateDeflectedBlowChance(core.dexterity, equipment.deflectedBlowChance),
 
       // Magic Combat
       magicAttack: this.calculateMagicAttack(core.intelligence, equipment.attackRating),
@@ -143,6 +152,18 @@ export class StatCalculator {
 
   private static calculateGlancingBlowChance(agility: number): number {
     return agility * 0.5; // Percentage
+  }
+
+  private static calculateCriticalHitChance(dexterity: number, bonus: number = 0): number {
+    return 5 + dexterity * 0.2 + bonus;
+  }
+
+  private static calculatePenetratingBlowChance(strength: number, bonus: number = 0): number {
+    return 5 + strength * 0.1 + bonus;
+  }
+
+  private static calculateDeflectedBlowChance(dexterity: number, bonus: number = 0): number {
+    return 5 + dexterity * 0.1 + bonus;
   }
 
   // ========== Magic Combat Calculations ==========
