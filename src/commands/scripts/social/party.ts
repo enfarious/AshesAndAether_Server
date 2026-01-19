@@ -1,5 +1,5 @@
 /**
- * /party command - party management (invite, accept, decline, leave, kick, list)
+ * /party command - party management (invite, accept, decline, leave, kick, lead, list)
  */
 
 import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } from '@/commands/types';
@@ -9,7 +9,7 @@ export const partyCommand: CommandDefinition = {
   aliases: ['group'],
   description: 'Manage your party',
   category: 'social',
-  usage: '/party <invite|accept|decline|leave|kick|list> [target]',
+  usage: '/party <invite|accept|decline|leave|kick|lead|list> [target]',
   examples: [
     '/party invite Shadowblade',
     '/party accept',
@@ -17,11 +17,12 @@ export const partyCommand: CommandDefinition = {
     '/party leave',
     '/party kick Shadowblade',
     '/party list',
+    '/party lead Shadowblade',
   ],
 
   parameters: {
     positional: [
-      { type: 'string', required: true, description: 'Action (invite/accept/decline/leave/kick/list)' },
+      { type: 'string', required: true, description: 'Action (invite/accept/decline/leave/kick/lead/list)' },
       { type: 'string', required: false, description: 'Target name or ID' },
     ],
   },
@@ -34,7 +35,7 @@ export const partyCommand: CommandDefinition = {
       return { success: false, error: 'Usage: /party <invite|accept|decline|leave|kick|list> [target]' };
     }
 
-    if (['invite', 'kick'].includes(action) && !target) {
+    if (['invite', 'kick', 'lead'].includes(action) && !target) {
       return { success: false, error: `Usage: /party ${action} <target>` };
     }
 

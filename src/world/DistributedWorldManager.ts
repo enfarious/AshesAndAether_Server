@@ -1397,6 +1397,45 @@ export class DistributedWorldManager {
       return { success: true, message: `${targetCharacter.name} was removed from the party.` };
     }
 
+    if (normalized === 'lead') {
+      if (!target) {
+        return { success: false, error: 'Usage: /party lead <target>' };
+      }
+
+      const partyId = await this.partyService.getPartyIdForMember(context.characterId);
+      if (!partyId) {
+        return { success: false, error: 'You are not in a party.' };
+      }
+
+      const party = await this.partyService.getPartyInfo(partyId);
+      if (!party) {
+        return { success: false, error: 'Party not found.' };
+      }
+
+      if (party.leaderId !== context.characterId) {
+        return { success: false, error: 'Only the party leader can promote a new leader.' };
+      }
+
+      const targetCharacter = await this.resolveCharacterByNameOrId(target);
+      if (!targetCharacter) {
+        return { success: false, error: `Target '${target}' not found.` };
+      }
+
+      if (!party.members.includes(targetCharacter.id)) {
+        return { success: false, error: `${targetCharacter.name} is not in your party.` };
+      }
+
+      if (targetCharacter.id === party.leaderId) {
+        return { success: false, error: `${targetCharacter.name} is already the party leader.` };
+      }
+
+      await this.partyService.setLeader(partyId, targetCharacter.id);
+
+      await this.sendPartyRoster(partyId);
+
+      return { success: true, message: `${targetCharacter.name} is now the party leader.` };
+    }
+
     return { success: false, error: `Unknown party action '${action}'.` };
   }
 
