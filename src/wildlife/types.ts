@@ -159,6 +159,7 @@ export interface WildlifeEntity {
   isAlive: boolean;
   currentHealth: number;
   maxHealth: number;
+  attackDamage: number;
   needs: WildlifeNeeds;
 
   // Behavior
@@ -178,11 +179,17 @@ export interface WildlifeEntity {
   pregnancyEndsAt?: number;
   age: number;                 // seconds since spawn
   isMature: boolean;
+  ageStage: WildlifeAgeStage;
+  level: number;
+  experience: number;
+  experienceToNext: number;
 
   // Combat integration
   inCombat: boolean;
   lastHostileAt: number;
 }
+
+export type WildlifeAgeStage = 'juvenile' | 'adult' | 'elder';
 
 // ========== Behavior States ==========
 

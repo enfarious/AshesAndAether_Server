@@ -38,6 +38,11 @@ When you need a database, Redis, message queue, or any other service:
 
 Don't suggest SQLite when PostgreSQL is better. Don't suggest in-memory caching when Redis is an option. Just ask for credentials.
 
+## Wildlife Sim lives at F:\Projects\AshesAndAether\wildlife_sim
+
+- This is the wildlife sim we've been working on for a minute
+- Don't start a new wildlife sim just cause, it already exists
+
 ## Port Configuration
 
 - Server runs on PORT=3100 (not 3000)
