@@ -14,11 +14,14 @@ import { DamageCalculator } from '@/combat/DamageCalculator';
 import type { CombatAbilityDefinition, CombatStats } from '@/combat/types';
 import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
 import { WildlifeManager, type BiomeType } from '@/wildlife';
+import { PartyService } from '@/party/PartyService';
 
 const FEET_TO_METERS = 0.3048;
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
 
 const BIOME_FALLBACK: BiomeType = 'forest';
+const PARTY_MAX_MEMBERS = 5;
+const PARTY_STATUS_INTERVAL_MS = 1000;
 
 /**
  * Distributed World Manager - manages zones across multiple servers
@@ -42,6 +45,9 @@ export class DistributedWorldManager {
   private movementSystem: MovementSystem;
   private attackSpeedBonusCache: Map<string, number> = new Map();
   private wildlifeManagers: Map<string, WildlifeManager> = new Map();
+  private partyService: PartyService;
+  private partyResourceCache: Map<string, { currentStamina: number; maxStamina: number; currentMana: number; maxMana: number }> = new Map();
+  private lastPartyStatusBroadcastAt: number = 0;
 
   // Command system
   private commandRegistry: CommandRegistry;
@@ -59,6 +65,7 @@ export class DistributedWorldManager {
     this.abilitySystem = new AbilitySystem();
     this.damageCalculator = new DamageCalculator();
     this.movementSystem = new MovementSystem();
+    this.partyService = new PartyService(this.messageBus.getRedisClient());
 
     // Set up movement completion callback
     this.movementSystem.setMovementCompleteCallback(
@@ -253,12 +260,24 @@ export class DistributedWorldManager {
 
     zoneManager.addPlayer(character, socketId, isMachine ?? false);
     this.characterToZone.set(character.id, character.zoneId);
+    this.partyResourceCache.set(character.id, {
+      currentStamina: character.currentStamina,
+      maxStamina: character.maxStamina,
+      currentMana: character.currentMana,
+      maxMana: character.maxMana,
+    });
 
     // Update player location in registry
     await this.zoneRegistry.updatePlayerLocation(character.id, character.zoneId, socketId);
 
     // Send a full state snapshot to the joining player for resync
     await this.sendFullCharacterState(zoneManager, character, socketId);
+
+    // Send party roster on zone entry to refresh client-side state
+    const partyId = await this.partyService.getPartyIdForMember(character.id);
+    if (partyId) {
+      await this.sendPartyRosterToMember(partyId, character.id);
+    }
 
     // Calculate and send proximity roster
     await this.sendProximityRosterToEntity(character.id);
@@ -290,6 +309,7 @@ export class DistributedWorldManager {
     this.proximityRosterHashes.delete(characterId);
     this.previousRosters.delete(characterId);
     this.attackSpeedBonusCache.delete(characterId);
+    this.partyResourceCache.delete(characterId);
 
     // Remove from registry
     await this.zoneRegistry.removePlayer(characterId);
@@ -696,6 +716,15 @@ export class DistributedWorldManager {
           }
           break;
         }
+        case 'party_action': {
+          const { action, target } = event.data as { action: string; target?: string | null };
+          const response = await this.handlePartyAction(context, action, target ?? null);
+          if (!response.success) {
+            return response;
+          }
+          overrideResponse = response;
+          break;
+        }
         case 'combat_action': {
           const { abilityId, abilityName, target, setAutoAttack } = event.data as {
             abilityId?: string;
@@ -1003,6 +1032,15 @@ export class DistributedWorldManager {
     const socketId = zoneManager.getSocketIdForCharacter(characterId);
     if (!socketId) return;
 
+    if (resources.stamina && resources.mana) {
+      this.partyResourceCache.set(characterId, {
+        currentStamina: resources.stamina.current,
+        maxStamina: resources.stamina.max,
+        currentMana: resources.mana.current,
+        maxMana: resources.mana.max,
+      });
+    }
+
     await this.messageBus.publish('gateway:output', {
       type: MessageType.CLIENT_MESSAGE,
       characterId,
@@ -1024,6 +1062,12 @@ export class DistributedWorldManager {
     character: Character,
     socketId: string
   ): Promise<void> {
+    this.partyResourceCache.set(character.id, {
+      currentStamina: character.currentStamina,
+      maxStamina: character.maxStamina,
+      currentMana: character.currentMana,
+      maxMana: character.maxMana,
+    });
     const stateUpdate = {
       timestamp: Date.now(),
       character: {
@@ -1084,6 +1128,63 @@ export class DistributedWorldManager {
     }
   }
 
+  private async broadcastPartyStatus(): Promise<void> {
+    const processed = new Set<string>();
+
+    for (const memberId of this.characterToZone.keys()) {
+      if (processed.has(memberId)) continue;
+
+      const partyId = await this.partyService.getPartyIdForMember(memberId);
+      if (!partyId) continue;
+
+      const party = await this.partyService.getPartyInfo(partyId);
+      if (!party) continue;
+
+      for (const partyMember of party.members) {
+        processed.add(partyMember);
+      }
+
+      for (const partyMember of party.members) {
+        const location = await this.zoneRegistry.getPlayerLocation(partyMember);
+        if (!location) continue;
+
+        const allies = party.members
+          .filter(id => id !== partyMember)
+          .map(id => {
+            const resources = this.partyResourceCache.get(id);
+            const staminaPct = resources && resources.maxStamina > 0
+              ? Math.round((resources.currentStamina / resources.maxStamina) * 100)
+              : undefined;
+            const manaPct = resources && resources.maxMana > 0
+              ? Math.round((resources.currentMana / resources.maxMana) * 100)
+              : undefined;
+            const atb = this.combatManager.getAtbState(id) || undefined;
+
+            return {
+              entityId: id,
+              staminaPct,
+              manaPct,
+              atb,
+            };
+          });
+
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          socketId: location.socketId,
+          payload: {
+            socketId: location.socketId,
+            event: 'state_update',
+            data: {
+              timestamp: Date.now(),
+              allies,
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
   private maybeRetaliate(
     targetEntity: { id: string; type: 'player' | 'npc' | 'companion' },
     attackerEntity: { id: string; type: 'player' | 'npc' | 'companion' }
@@ -1091,6 +1192,344 @@ export class DistributedWorldManager {
     if (targetEntity.id === attackerEntity.id) return;
     if (this.combatManager.hasAutoAttackTarget(targetEntity.id)) return;
     this.combatManager.setAutoAttackTarget(targetEntity.id, attackerEntity.id);
+  }
+
+  private async handlePartyAction(
+    context: CommandContext,
+    action: string,
+    target: string | null
+  ): Promise<{ success: boolean; message?: string; error?: string; data?: any }> {
+    const normalized = action.toLowerCase();
+
+    if (normalized === 'list') {
+      const partyId = await this.partyService.getPartyIdForMember(context.characterId);
+      if (!partyId) {
+        return { success: false, error: 'You are not in a party.' };
+      }
+      const party = await this.partyService.getPartyInfo(partyId);
+      if (!party) {
+        return { success: false, error: 'Party not found.' };
+      }
+      const members = await Promise.all(
+        party.members.map(async (memberId) => {
+          const character = await CharacterService.findById(memberId);
+          return character?.name || memberId;
+        })
+      );
+
+      return {
+        success: true,
+        message: `Party members: ${members.join(', ')}`,
+        data: { partyId, leaderId: party.leaderId, members },
+      };
+    }
+
+    if (normalized === 'invite') {
+      if (!target) {
+        return { success: false, error: 'Usage: /party invite <target>' };
+      }
+
+      const targetCharacter = await this.resolveOnlineCharacterForInvite(context, target);
+      if (!targetCharacter) {
+        return { success: false, error: `Target '${target}' not found or is offline.` };
+      }
+
+      if (targetCharacter.id === context.characterId) {
+        return { success: false, error: 'You cannot invite yourself.' };
+      }
+
+      const existingParty = await this.partyService.getPartyIdForMember(targetCharacter.id);
+      if (existingParty) {
+        return { success: false, error: `${targetCharacter.name} is already in a party.` };
+      }
+
+      const party = await this.partyService.ensurePartyForLeader(context.characterId);
+      if (party.members.length >= PARTY_MAX_MEMBERS) {
+        return { success: false, error: 'Your party is full.' };
+      }
+
+      const location = await this.zoneRegistry.getPlayerLocation(targetCharacter.id);
+      if (!location) {
+        return { success: false, error: `${targetCharacter.name} is not online.` };
+      }
+
+      const invite = await this.partyService.createInvite(context.characterId, targetCharacter.id);
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        socketId: location.socketId,
+        payload: {
+          socketId: location.socketId,
+          event: 'event',
+          data: {
+            eventType: 'party_invite',
+            timestamp: Date.now(),
+            fromId: context.characterId,
+            fromName: context.characterName,
+            partyId: invite.partyId,
+            expiresAt: invite.expiresAt,
+          },
+        },
+        timestamp: Date.now(),
+      });
+
+      return {
+        success: true,
+        message: `Party invite sent to ${targetCharacter.name}.`,
+      };
+    }
+
+    if (normalized === 'accept' || normalized === 'decline') {
+      const invite = await this.partyService.getInvite(context.characterId);
+      if (!invite) {
+        return { success: false, error: 'No pending party invite.' };
+      }
+
+      const fromCharacter = await CharacterService.findById(invite.fromId);
+      const fromName = fromCharacter?.name || invite.fromId;
+
+      if (normalized === 'decline') {
+        await this.partyService.clearInvite(context.characterId);
+        return { success: true, message: `Declined party invite from ${fromName}.` };
+      }
+
+      const existingParty = await this.partyService.getPartyIdForMember(context.characterId);
+      if (existingParty) {
+        return { success: false, error: 'You are already in a party.' };
+      }
+
+      const party = await this.partyService.getPartyInfo(invite.partyId);
+      if (!party) {
+        return { success: false, error: 'Party no longer exists.' };
+      }
+
+      if (party.members.length >= PARTY_MAX_MEMBERS) {
+        return { success: false, error: 'Party is full.' };
+      }
+
+      await this.partyService.addMember(invite.partyId, context.characterId);
+      await this.partyService.clearInvite(context.characterId);
+
+      await this.notifyPartyMembers(invite.partyId, {
+        eventType: 'party_joined',
+        timestamp: Date.now(),
+        memberId: context.characterId,
+        memberName: context.characterName,
+      });
+      await this.sendPartyRoster(invite.partyId);
+
+      return {
+        success: true,
+        message: `Joined ${fromName}'s party.`,
+      };
+    }
+
+    if (normalized === 'leave') {
+      const partyId = await this.partyService.getPartyIdForMember(context.characterId);
+      if (!partyId) {
+        return { success: false, error: 'You are not in a party.' };
+      }
+
+      const party = await this.partyService.getPartyInfo(partyId);
+      if (!party) {
+        return { success: false, error: 'Party not found.' };
+      }
+
+      await this.partyService.removeMember(partyId, context.characterId);
+
+      if (party.leaderId === context.characterId) {
+        const updated = await this.partyService.getPartyInfo(partyId);
+        if (updated && updated.members.length > 0) {
+          await this.partyService.setLeader(partyId, updated.members[0]);
+        } else {
+          await this.partyService.disband(partyId);
+        }
+      }
+
+      await this.notifyPartyMembers(partyId, {
+        eventType: 'party_left',
+        timestamp: Date.now(),
+        memberId: context.characterId,
+        memberName: context.characterName,
+      });
+      await this.sendPartyRoster(partyId);
+
+      return { success: true, message: 'You left the party.' };
+    }
+
+    if (normalized === 'kick') {
+      if (!target) {
+        return { success: false, error: 'Usage: /party kick <target>' };
+      }
+
+      const partyId = await this.partyService.getPartyIdForMember(context.characterId);
+      if (!partyId) {
+        return { success: false, error: 'You are not in a party.' };
+      }
+
+      const party = await this.partyService.getPartyInfo(partyId);
+      if (!party) {
+        return { success: false, error: 'Party not found.' };
+      }
+
+      if (party.leaderId !== context.characterId) {
+        return { success: false, error: 'Only the party leader can kick members.' };
+      }
+
+      const targetCharacter = await this.resolveCharacterByNameOrId(target);
+      if (!targetCharacter) {
+        return { success: false, error: `Target '${target}' not found.` };
+      }
+
+      if (!party.members.includes(targetCharacter.id)) {
+        return { success: false, error: `${targetCharacter.name} is not in your party.` };
+      }
+
+      await this.partyService.removeMember(partyId, targetCharacter.id);
+
+      await this.notifyPartyMembers(partyId, {
+        eventType: 'party_kicked',
+        timestamp: Date.now(),
+        memberId: targetCharacter.id,
+        memberName: targetCharacter.name,
+      });
+      await this.sendPartyRoster(partyId);
+
+      return { success: true, message: `${targetCharacter.name} was removed from the party.` };
+    }
+
+    return { success: false, error: `Unknown party action '${action}'.` };
+  }
+
+  private async resolveCharacterByNameOrId(nameOrId: string): Promise<Character | null> {
+    const direct = await CharacterService.findById(nameOrId);
+    if (direct) return direct;
+    return CharacterService.findByName(nameOrId);
+  }
+
+  private async resolveOnlineCharacterForInvite(
+    context: CommandContext,
+    nameOrId: string
+  ): Promise<Character | null> {
+    const direct = await CharacterService.findById(nameOrId);
+    if (direct) {
+      const location = await this.zoneRegistry.getPlayerLocation(direct.id);
+      return location ? direct : null;
+    }
+
+    const zoneId = this.characterToZone.get(context.characterId);
+    const zoneManager = zoneId ? this.zones.get(zoneId) : null;
+    if (zoneManager) {
+      const entity = zoneManager.findEntityByName(nameOrId);
+      if (entity?.type === 'player') {
+        const location = await this.zoneRegistry.getPlayerLocation(entity.id);
+        if (location) {
+          return CharacterService.findById(entity.id);
+        }
+      }
+    }
+
+    const byName = await CharacterService.findByName(nameOrId);
+    if (!byName) return null;
+    const location = await this.zoneRegistry.getPlayerLocation(byName.id);
+    return location ? byName : null;
+  }
+
+  private async notifyPartyMembers(
+    partyId: string,
+    event: { eventType: string; timestamp: number; memberId?: string; memberName?: string }
+  ): Promise<void> {
+    const party = await this.partyService.getPartyInfo(partyId);
+    if (!party) return;
+
+    await Promise.all(
+      party.members.map(async (memberId) => {
+        const location = await this.zoneRegistry.getPlayerLocation(memberId);
+        if (!location) return;
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          socketId: location.socketId,
+          payload: {
+            socketId: location.socketId,
+            event: 'event',
+            data: event,
+          },
+          timestamp: Date.now(),
+        });
+      })
+    );
+  }
+
+  private async sendPartyRoster(partyId: string): Promise<void> {
+    const party = await this.partyService.getPartyInfo(partyId);
+    if (!party) return;
+
+    const members = await Promise.all(
+      party.members.map(async (memberId) => {
+        const character = await CharacterService.findById(memberId);
+        return {
+          id: memberId,
+          name: character?.name || memberId,
+        };
+      })
+    );
+
+    await Promise.all(
+      party.members.map(async (memberId) => {
+        const location = await this.zoneRegistry.getPlayerLocation(memberId);
+        if (!location) return;
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          socketId: location.socketId,
+          payload: {
+            socketId: location.socketId,
+            event: 'event',
+            data: {
+              eventType: 'party_roster',
+              timestamp: Date.now(),
+              partyId,
+              leaderId: party.leaderId,
+              members,
+            },
+          },
+          timestamp: Date.now(),
+        });
+      })
+    );
+  }
+
+  private async sendPartyRosterToMember(partyId: string, memberId: string): Promise<void> {
+    const party = await this.partyService.getPartyInfo(partyId);
+    if (!party) return;
+
+    const members = await Promise.all(
+      party.members.map(async (id) => {
+        const character = await CharacterService.findById(id);
+        return {
+          id,
+          name: character?.name || id,
+        };
+      })
+    );
+
+    const location = await this.zoneRegistry.getPlayerLocation(memberId);
+    if (!location) return;
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      socketId: location.socketId,
+      payload: {
+        socketId: location.socketId,
+        event: 'event',
+        data: {
+          eventType: 'party_roster',
+          timestamp: Date.now(),
+          partyId,
+          leaderId: party.leaderId,
+          members,
+        },
+      },
+      timestamp: Date.now(),
+    });
   }
 
   private async sendCombatEventToEntity(
@@ -2528,6 +2967,11 @@ export class DistributedWorldManager {
     const now = Date.now();
     for (const wildlifeManager of this.wildlifeManagers.values()) {
       wildlifeManager.update(deltaTime, now);
+    }
+
+    if (now - this.lastPartyStatusBroadcastAt >= PARTY_STATUS_INTERVAL_MS) {
+      void this.broadcastPartyStatus();
+      this.lastPartyStatusBroadcastAt = now;
     }
   }
 

@@ -278,7 +278,9 @@ export interface StateUpdateMessage {
     // Allied combat gauges (party/alliance members - ATB only, no auto-attack)
     allies?: Array<{
       entityId: string;
-      atb: { current: number; max: number };
+      atb?: { current: number; max: number };
+      staminaPct?: number;
+      manaPct?: number;
     }>;
     zone?: Partial<ZoneInfo>;
   };

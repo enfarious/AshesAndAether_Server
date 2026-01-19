@@ -10,6 +10,7 @@ import { tellCommand } from './social/tell';
 import { emoteCommand } from './social/emote';
 import { shoutCommand } from './social/shout';
 import { talkCommand } from './social/talk';
+import { partyCommand } from './social/party';
 import { attackCommand } from './combat/attack';
 import { castCommand } from './combat/cast';
 import { disengageCommand } from './combat/disengage';
@@ -37,6 +38,7 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(emoteCommand);
   registry.register(shoutCommand);
   registry.register(talkCommand);
+  registry.register(partyCommand);
 
   // Perception commands
   registry.register(lookCommand);
@@ -68,7 +70,7 @@ export function registerAllCommands(registry: CommandRegistry): void {
 export function getAllCommandNames(): string[] {
   return [
     // Social
-    'say', 'tell', 'emote', 'shout', 'talk',
+    'say', 'tell', 'emote', 'shout', 'talk', 'party',
     // Perception
     'look', 'listen', 'sense',
     // System
