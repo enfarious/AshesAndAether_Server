@@ -6,9 +6,11 @@
  */
 
 import io from 'socket.io-client';
+import readline from 'readline';
 
 const SERVER_URL = 'http://localhost:3100';
 const PROTOCOL_VERSION = '1.0.0';
+const INTERACTIVE = process.env.INTERACTIVE === '1';
 
 // ANSI color codes for pretty output
 const colors = {
@@ -108,6 +110,11 @@ socket.on('world_entry', (data) => {
 
   // Display the world in text format
   displayWorld(data);
+
+  if (INTERACTIVE) {
+    startInteractiveInput(socket);
+    return;
+  }
 
   // Test sequence: move + chat variations
   let actionCount = 0;
@@ -218,6 +225,22 @@ socket.on('communication', (data) => {
 // Handle state updates
 socket.on('state_update', (data) => {
   logEvent('state_update', data);
+});
+
+// Handle command responses
+socket.on('command_response', (data) => {
+  logEvent('command_response', data);
+  if (data.success) {
+    if (data.message) log(`✔ ${data.message}`, 'green');
+  } else {
+    const errorText = data.error || 'Command failed.';
+    log(`✖ ${errorText}`, 'red');
+  }
+});
+
+// Dev acknowledgments (non-production)
+socket.on('dev_ack', (data) => {
+  logEvent('dev_ack', data);
 });
 
 // Handle pong response
@@ -361,4 +384,39 @@ function displayProximityRoster(roster) {
   });
 
   log('\n' + '='.repeat(60), 'cyan');
+}
+
+function startInteractiveInput(socket) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: '> ',
+  });
+
+  log('\nInteractive mode enabled. Type slash commands like /equip "Steel Breastplate".', 'yellow');
+  rl.prompt();
+
+  rl.on('line', (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      rl.prompt();
+      return;
+    }
+
+    if (trimmed.toLowerCase() === '/quit') {
+      log('Disconnecting...', 'yellow');
+      socket.disconnect();
+      rl.close();
+      return;
+    }
+
+    socket.emit('command', { command: trimmed });
+    rl.prompt();
+  });
+
+  rl.on('close', () => {
+    if (socket.connected) {
+      socket.disconnect();
+    }
+  });
 }

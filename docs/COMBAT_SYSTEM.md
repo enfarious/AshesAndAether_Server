@@ -107,6 +107,55 @@ It focuses on server-authoritative rules, event flow, and the minimal data model
 - `combat_hit` with amount, type, and mitigation breakdown.
 - `combat_miss` when accuracy roll fails.
 
+### Weapon Damage Profiles (Item Templates)
+
+Weapon data lives in `ItemTemplate.properties.weapon` so we can extend without schema churn.
+Profiles allow multi-type hits (e.g., blunt + pierce) with ratios that split base damage.
+
+Example `properties` payload:
+
+```json
+{
+  "weapon": {
+    "baseDamage": 12,
+    "speed": 2.6,
+    "damageProfiles": [
+      { "damageType": "physical", "physicalType": "blunt", "ratio": 0.75 },
+      { "damageType": "physical", "physicalType": "pierce", "ratio": 0.25 }
+    ]
+  }
+}
+```
+
+Notes:
+- Primary physical type is the highest ratio for narrative.
+- Crits never roll negative quality; near misses never roll positive quality.
+- Multi-type profiles can mix physical + elemental damage later (fire, ice, etc.).
+
+### Armor Quality Bias (Item Templates)
+
+Armor uses a quality bias to shift the chance of good/poor rolls per physical subtype.
+Bias stacks multiplicatively across equipped pieces (diminishing returns).
+
+Example `properties` payload:
+
+```json
+{
+  "armor": {
+    "qualityBias": {
+      "slash": 0.18,
+      "pierce": 0.25,
+      "blunt": -0.12
+    }
+  }
+}
+```
+
+Notes:
+- Positive bias reduces good rolls and increases poor rolls (resistance).
+- Negative bias increases good rolls and reduces poor rolls (weakness).
+- Bias values accept decimals (0.18) or percents (18).
+
 ## Status Effects
 
 - Buffs: increase stats or grant shields.

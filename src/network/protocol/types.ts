@@ -571,7 +571,7 @@ export const COMMUNICATION_RANGES = {
 export interface ProximityEntity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion' | 'wildlife';
+  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife';
   isMachine: boolean;  // true = AI/NPC, false = human player
   isAlive: boolean;
   bearing: number;     // 0-360 degrees (0=North, 90=East, 180=South, 270=West)

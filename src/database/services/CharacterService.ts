@@ -154,6 +154,61 @@ export class CharacterService {
   }
 
   /**
+   * Get equipped items for a character (hand slots).
+   */
+  static async findEquippedHandItems(characterId: string): Promise<Array<{
+    id: string;
+    equipSlot: string | null;
+    template: { id: string; name: string; properties: unknown };
+  }>> {
+    return prisma.inventoryItem.findMany({
+      where: {
+        characterId,
+        equipped: true,
+        equipSlot: { in: ['right_hand', 'left_hand'] },
+      },
+      select: {
+        id: true,
+        equipSlot: true,
+        template: {
+          select: {
+            id: true,
+            name: true,
+            properties: true,
+          },
+        },
+      },
+    });
+  }
+
+  /**
+   * Get all equipped items for a character.
+   */
+  static async findEquippedItems(characterId: string): Promise<Array<{
+    id: string;
+    equipSlot: string | null;
+    template: { id: string; name: string; properties: unknown };
+  }>> {
+    return prisma.inventoryItem.findMany({
+      where: {
+        characterId,
+        equipped: true,
+      },
+      select: {
+        id: true,
+        equipSlot: true,
+        template: {
+          select: {
+            id: true,
+            name: true,
+            properties: true,
+          },
+        },
+      },
+    });
+  }
+
+  /**
    * Update last seen timestamp
    */
   static async updateLastSeen(characterId: string): Promise<void> {

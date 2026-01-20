@@ -15,6 +15,8 @@ import { attackCommand } from './combat/attack';
 import { castCommand } from './combat/cast';
 import { disengageCommand } from './combat/disengage';
 import { useCommand } from './inventory/use';
+import { equipCommand } from './inventory/equip';
+import { unequipCommand } from './inventory/unequip';
 
 import { lookCommand } from './perception/look';
 import { listenCommand } from './perception/listen';
@@ -50,6 +52,8 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(statsCommand);
   registry.register(inventoryCommand);
   registry.register(useCommand);
+  registry.register(equipCommand);
+  registry.register(unequipCommand);
 
   // Movement commands
   registry.register(moveCommand);
@@ -75,6 +79,7 @@ export function getAllCommandNames(): string[] {
     'look', 'listen', 'sense',
     // System
     'help', 'stats', 'inventory', 'use',
+    'equip', 'unequip',
     // Movement
     'move', 'stop',
     // World

@@ -20,7 +20,7 @@ interface Vector3 {
 interface Entity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion' | 'wildlife';
+  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife';
   position: Vector3;
   socketId?: string; // For players only
   inCombat?: boolean;
@@ -64,10 +64,11 @@ export class ZoneManager {
     const companions = await ZoneService.getCompanionsInZone(this.zone.id);
 
     for (const companion of companions) {
+      const isMob = companion.tag?.startsWith('mob.') === true;
       this.entities.set(companion.id, {
         id: companion.id,
         name: companion.name,
-        type: 'companion',
+        type: isMob ? 'mob' : 'companion',
         position: {
           x: companion.positionX,
           y: companion.positionY,
@@ -131,7 +132,7 @@ export class ZoneManager {
 
   setCompanionSocketId(companionId: string, socketId: string | null): void {
     const entity = this.entities.get(companionId);
-    if (entity && entity.type !== 'player') {
+    if (entity && entity.type === 'companion') {
       entity.socketId = socketId || undefined;
     }
   }
@@ -599,7 +600,7 @@ export class ZoneManager {
     const socketIds: string[] = [];
 
     for (const entity of nearbyEntities) {
-      if (entity.type !== 'player' && entity.socketId) {
+      if (entity.type === 'companion' && entity.socketId) {
         socketIds.push(entity.socketId);
       }
     }

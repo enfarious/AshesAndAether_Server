@@ -377,23 +377,246 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
   // Create some basic item templates
   console.log('Creating item templates...');
 
+  const tagNames = [
+    'weapon',
+    'sword',
+    'mace',
+    'spear',
+    'staff',
+    'elemental',
+    'fire',
+    'armor',
+    'plate',
+    'leather',
+    'cloth',
+  ];
+
+  const tags = new Map<string, { id: string; name: string }>();
+  for (const name of tagNames) {
+    const tag = await prisma.itemTag.upsert({
+      where: { name },
+      update: {},
+      create: { name },
+    });
+    tags.set(name, tag);
+  }
+
   const rustySword = await prisma.itemTemplate.create({
     data: {
       name: 'Rusty Sword',
       description: 'An old iron sword, covered in rust but still serviceable.',
       itemType: 'weapon',
       properties: {
-        weaponType: 'sword',
-        damage: 15,
-        scaling: {
-          strength: 'C',
-          dexterity: 'D',
+        equipSlots: ['right_hand', 'left_hand'],
+        weapon: {
+          baseDamage: 12,
+          speed: 2.4,
+          damageProfiles: [
+            { damageType: 'physical', physicalType: 'slash', ratio: 1 },
+          ],
         },
-        attackSpeed: 1.2,
       },
       value: 50,
       stackable: false,
       maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('weapon')!.id },
+          { tagId: tags.get('sword')!.id },
+        ],
+      },
+    },
+  });
+
+  const ironMace = await prisma.itemTemplate.create({
+    data: {
+      name: 'Iron Mace',
+      description: 'A heavy mace with a dented steel head.',
+      itemType: 'weapon',
+      properties: {
+        equipSlots: ['right_hand', 'left_hand'],
+        weapon: {
+          baseDamage: 14,
+          speed: 2.8,
+          damageProfiles: [
+            { damageType: 'physical', physicalType: 'blunt', ratio: 1 },
+          ],
+        },
+      },
+      value: 65,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('weapon')!.id },
+          { tagId: tags.get('mace')!.id },
+        ],
+      },
+    },
+  });
+
+  const ashwoodSpear = await prisma.itemTemplate.create({
+    data: {
+      name: 'Ashwood Spear',
+      description: 'A long ashwood spear with a sharpened tip.',
+      itemType: 'weapon',
+      properties: {
+        equipSlots: ['right_hand', 'left_hand'],
+        weapon: {
+          baseDamage: 13,
+          speed: 2.6,
+          damageProfiles: [
+            { damageType: 'physical', physicalType: 'pierce', ratio: 1 },
+          ],
+        },
+      },
+      value: 60,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('weapon')!.id },
+          { tagId: tags.get('spear')!.id },
+        ],
+      },
+    },
+  });
+
+  const morningStar = await prisma.itemTemplate.create({
+    data: {
+      name: 'Morning Star',
+      description: 'A spiked flail that crushes and pierces.',
+      itemType: 'weapon',
+      properties: {
+        equipSlots: ['right_hand', 'left_hand'],
+        weapon: {
+          baseDamage: 15,
+          speed: 2.9,
+          damageProfiles: [
+            { damageType: 'physical', physicalType: 'blunt', ratio: 0.7 },
+            { damageType: 'physical', physicalType: 'pierce', ratio: 0.3 },
+          ],
+        },
+      },
+      value: 90,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('weapon')!.id },
+          { tagId: tags.get('mace')!.id },
+        ],
+      },
+    },
+  });
+
+  const fireStaff = await prisma.itemTemplate.create({
+    data: {
+      name: 'Fire Staff',
+      description: 'A staff that hums with heat, ideal for back-line casters.',
+      itemType: 'weapon',
+      properties: {
+        equipSlots: ['right_hand', 'left_hand'],
+        weapon: {
+          baseDamage: 11,
+          speed: 2.7,
+          damageProfiles: [
+            { damageType: 'fire', ratio: 1 },
+          ],
+        },
+      },
+      value: 110,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('weapon')!.id },
+          { tagId: tags.get('staff')!.id },
+          { tagId: tags.get('elemental')!.id },
+          { tagId: tags.get('fire')!.id },
+        ],
+      },
+    },
+  });
+
+  const steelBreastplate = await prisma.itemTemplate.create({
+    data: {
+      name: 'Steel Breastplate',
+      description: 'Solid plate armor that shrugs off slashes and thrusts.',
+      itemType: 'armor',
+      properties: {
+        equipSlots: ['chest'],
+        armor: {
+          qualityBias: {
+            slash: 0.18,
+            pierce: 0.25,
+            blunt: -0.12,
+          },
+        },
+      },
+      value: 140,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('armor')!.id },
+          { tagId: tags.get('plate')!.id },
+        ],
+      },
+    },
+  });
+
+  const leatherJerkin = await prisma.itemTemplate.create({
+    data: {
+      name: 'Leather Jerkin',
+      description: 'A supple jerkin offering modest protection.',
+      itemType: 'armor',
+      properties: {
+        equipSlots: ['chest'],
+        armor: {
+          qualityBias: {
+            slash: 0.08,
+            pierce: -0.05,
+            blunt: 0.02,
+          },
+        },
+      },
+      value: 80,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('armor')!.id },
+          { tagId: tags.get('leather')!.id },
+        ],
+      },
+    },
+  });
+
+  const silkRobe = await prisma.itemTemplate.create({
+    data: {
+      name: 'Silk Robe',
+      description: 'Light robes that favor mobility over protection.',
+      itemType: 'armor',
+      properties: {
+        equipSlots: ['chest'],
+        armor: {
+          qualityBias: {
+            slash: 0,
+            pierce: 0,
+            blunt: 0,
+          },
+        },
+      },
+      value: 60,
+      stackable: false,
+      maxStackSize: 1,
+      tags: {
+        create: [
+          { tagId: tags.get('armor')!.id },
+          { tagId: tags.get('cloth')!.id },
+        ],
+      },
     },
   });
 
@@ -416,7 +639,7 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
     },
   });
 
-  console.log(`Γ£ô Created item templates: ${rustySword.name}, ${healthPotion.name}`);
+  console.log(`Γ£ô Created item templates: ${rustySword.name}, ${ironMace.name}, ${ashwoodSpear.name}, ${morningStar.name}, ${fireStaff.name}, ${steelBreastplate.name}, ${leatherJerkin.name}, ${silkRobe.name}, ${healthPotion.name}`);
 
   // Give the test character a starting weapon
   console.log('Equipping test character...');
@@ -426,7 +649,7 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
       itemTemplateId: rustySword.id,
       quantity: 1,
       equipped: true,
-      equipSlot: 'mainHand',
+      equipSlot: 'right_hand',
     },
   });
 
@@ -436,6 +659,42 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
       characterId: testCharacter.id,
       itemTemplateId: healthPotion.id,
       quantity: 5,
+      equipped: false,
+    },
+  });
+
+  await prisma.inventoryItem.create({
+    data: {
+      characterId: testCharacter.id,
+      itemTemplateId: fireStaff.id,
+      quantity: 1,
+      equipped: false,
+    },
+  });
+
+  await prisma.inventoryItem.create({
+    data: {
+      characterId: testCharacter.id,
+      itemTemplateId: steelBreastplate.id,
+      quantity: 1,
+      equipped: false,
+    },
+  });
+
+  await prisma.inventoryItem.create({
+    data: {
+      characterId: testCharacter.id,
+      itemTemplateId: leatherJerkin.id,
+      quantity: 1,
+      equipped: false,
+    },
+  });
+
+  await prisma.inventoryItem.create({
+    data: {
+      characterId: testCharacter.id,
+      itemTemplateId: silkRobe.id,
+      quantity: 1,
       equipped: false,
     },
   });
@@ -450,8 +709,9 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
   console.log(`  - 3 NPCs: ${merchant.name}, ${swordsman.name}, ${bowman.name}`);
   console.log(`  - 7 mobs: 5 rats, ${rabidDog.name}, ${direToad.name}`);
   console.log(`  - 1 ability (basic_attack)`);
-  console.log(`  - 2 item templates`);
+  console.log(`  - 9 item templates`);
   console.log(`  - Character equipped with ${rustySword.name} and 5x ${healthPotion.name}`);
+  console.log(`  - Character inventory includes ${fireStaff.name}, ${steelBreastplate.name}, ${leatherJerkin.name}, ${silkRobe.name}`);
   console.log('\nYou can now connect with:');
   console.log(`  Email: ${testAccount.email}`);
   console.log(`  Character: ${testCharacter.name}`);

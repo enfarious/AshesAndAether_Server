@@ -3,6 +3,8 @@
 ## Overview
 Distributed Node.js/TypeScript server with a Gateway/Zone split and Redis pub/sub. The Gateway handles client WebSocket connections; Zone servers run authoritative simulation (movement, proximity, combat, AI, wildlife).
 
+**See also:** [RESPONSIBILITY_MATRIX.md](RESPONSIBILITY_MATRIX.md) - Clarifies what lives where (server vs Airlock vs wildlife_sim).
+
 ## Core Principles
 
 1. **Server-authoritative**: All validation and simulation run on the server.
@@ -10,37 +12,45 @@ Distributed Node.js/TypeScript server with a Gateway/Zone split and Redis pub/su
 3. **Distributed by default**: Zones can be scaled horizontally via Redis messaging.
 4. **Delta-first state**: Proximity roster deltas and state_update deltas keep bandwidth low.
 5. **Command-first input**: Slash commands resolve to validated server events.
+6. **Lean core**: Interpretation (LLM), wildlife simulation, and NPC reasoning live in separate services.
 
 ## Runtime Stack
 
 - **Runtime**: Node.js 20+ with TypeScript 5+
 - **Networking**: Socket.IO + REST (auth/info/health)
 - **Database**: PostgreSQL (persistent data)
-- **Messaging**: Redis pub/sub (Gateway ⇆ Zone)
+- **Messaging**: Redis pub/sub (Gateway ⇆ Zone, also bridges external services)
 - **ORM**: Prisma
-- **LLM**: OpenAI/Claude compatible or local (Ollama/LMStudio)
+- **LLM**: Handled by Airlock service (external), not server
+- **Wildlife**: Handled by wildlife_sim (Rust, external), not server
 
 ## High-Level Topology
 
 ```
-Clients (MUD/2D/3D/VR)
-  ↕ Socket.IO
-Gateway Server (auth + socket router)
-  ↕ Redis pub/sub
-Zone Servers (simulation)
-  ↕ PostgreSQL
+[MUD Text] [2D Client] [3D Client] [Airlock LLM] [Wildlife Sim]
+    ↕           ↕          ↕            ↕            ↕
+    └────── Socket.IO / Redis pub/sub ──────────────┘
+              ↕
+    [Gateway Server]
+              ↕
+         Redis pub/sub
+              ↕
+    [Zone 1] [Zone 2] [Zone N]
+              ↕
+         PostgreSQL
 ```
 
 ## Server Responsibilities
 
 ### Gateway Server (`/src/gateway`)
-Handles client connections and authentication, and forwards all game actions to Zone servers.
+Handles client connections and authentication, and forwards all game actions to Zone servers. Also handles Airlock (NPC control).
 
 **Key responsibilities**
-- Socket.IO handshake/auth
+- Socket.IO handshake/auth (regular clients and Airlock)
 - Character select/create
+- Airlock inhabitancy (which NPC does this session control?)
 - Routing messages to Zone servers via Redis
-- Serving static web content + API endpoints (`/health`, `/api/info`)
+- Serving static web content + API endpoints (`/health`, `/api/info`, `/world/assets`)
 
 ### Zone Server (`/src/zoneserver`)
 Runs authoritative simulation for assigned zones.

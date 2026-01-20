@@ -61,16 +61,36 @@ interface CommunicationReceived {
 
 Before sending communication (especially for LLMs), clients can request a list of entities within communication range. This prevents talking to empty rooms and provides context for age-appropriate interaction.
 
-### Request Format
+### Request Format (Socket.io)
 ```typescript
+// Client → Gateway
+socket.emit('get_proximity', {
+  entityId: string,      // Your character/NPC ID
+  radius?: number        // Optional, defaults to proximity radius (50)
+});
+
+// Legacy format (still supported)
 interface NearbyEntitiesRequest {
   type: 'get_nearby';
   maxDistance?: number;  // Optional, defaults to 250 (CFH range)
 }
 ```
 
-### Response Format
+### Response Format (Socket.io)
 ```typescript
+// Gateway → Client
+socket.on('proximity_data', (data) => {
+  // {
+  //   entityId: 'char-123',
+  //   nearby: [
+  //     {id: 'char-456', name: 'Kael', type: 'character', distance: 20},
+  //     {id: 'npc-789', name: 'Merchant', type: 'companion', distance: 30}
+  //   ],
+  //   timestamp: 1705769600000
+  // }
+});
+
+// Legacy response format
 interface NearbyEntitiesResponse {
   timestamp: number;
   entities: {

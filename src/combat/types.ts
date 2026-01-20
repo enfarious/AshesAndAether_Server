@@ -1,5 +1,7 @@
 import type { DamageType, TargetType } from '@/game/abilities/AbilityTypes';
 
+export type PhysicalDamageType = 'blunt' | 'slash' | 'pierce';
+
 export type CombatEventType =
   | 'combat_start'
   | 'combat_action'
@@ -35,6 +37,7 @@ export interface CombatAbilityDefinition {
     amount: number;
     scalingStat?: 'strength' | 'dexterity' | 'agility' | 'intelligence' | 'wisdom';
     scalingMultiplier?: number;
+    physicalType?: PhysicalDamageType;
   };
   healing?: {
     amount: number;
@@ -113,6 +116,23 @@ export interface DamageResult {
   deflected: boolean;
   penetrating: boolean;
   glancing: boolean;
+  quality: 'poor' | 'normal' | 'good';
+  qualityMultiplier: number;
+  amount: number;
+  baseDamage: number;
+  mitigatedDamage: number;
+  damageBreakdown?: DamageProfileResult[];
+}
+
+export interface DamageProfileSegment {
+  damageType: DamageType;
+  physicalType?: PhysicalDamageType;
+  ratio: number;
+}
+
+export interface DamageProfileResult {
+  damageType: DamageType;
+  physicalType?: PhysicalDamageType;
   amount: number;
   baseDamage: number;
   mitigatedDamage: number;

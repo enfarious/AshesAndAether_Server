@@ -77,6 +77,20 @@ Start the development server with hot reload:
 npm run dev
 ```
 
+#### Running on Unique Ports (Testing on Live Machines)
+
+When testing on a machine with running production servers, use unique ports to avoid conflicts:
+
+```powershell
+# Start gateway on test port (default: 3100, test: 212121)
+./start-gateway.ps1 -ServerId "gateway-test" -Port 212121
+
+# Start zone server with test ID
+./start-zone.ps1 -ServerId "zone-test" -TickRate 10
+```
+
+This prevents port collisions and allows safe testing alongside live servers.
+
 ### Building
 
 Build for production:
@@ -124,41 +138,37 @@ Original supernatural system allowing players to develop unique abilities as the
 
 ## Development Roadmap
 
-### Phase 1: Foundation ✅
+### ✅ Completed
 
-- [x] Project setup and architecture
-- [x] Basic networking layer
-- [x] Database schema
-- [x] World and zone management
-- [ ] Text client protocol
+- [x] Distributed server architecture (Gateway + Zone servers)
+- [x] Redis pub/sub messaging system
+- [x] WebSocket networking with Socket.io
+- [x] Database schema (PostgreSQL + Prisma)
+- [x] Text client (MUD-like with TUI)
+- [x] Movement system (bearing/heading/compass)
+- [x] Proximity roster with spatial awareness
+- [x] Stat system (core + derived)
+- [x] NPC/Companion system with LLM hooks
+- [x] Airlock protocol (LLM client control)
+- [x] Wildlife simulation (Rust standalone)
 
-### Phase 2: Core Systems (In Progress)
+### 🚧 In Progress
 
-- [ ] Entity Component System
-- [ ] Pathfinding and navmesh
-- [ ] Basic combat system
-- [ ] Wildlife AI and life simulation
+- [ ] **NPC Intent System** - Context items + LLM → action pipeline
+- [ ] **Combat System** - Full ATB, cooldowns, status effects, AoE
+- [ ] **World Content** - OSM integration, zone generation, NPC placement
 
-### Phase 3: Advanced Features
+### 📋 Planned
 
-- [ ] LLM integration for companions
-- [ ] Full tactical combat
-- [ ] Character progression
-- [ ] 2D client support
+- [ ] 2D Web Client (isometric/top-down)
+- [ ] 3D Client (Unity)
+- [ ] LLM Narrator System
+- [ ] Quest System
+- [ ] Crafting & Economy
+- [ ] Faction/Reputation System
+- [ ] AR/VR Clients
 
-### Phase 4: Content & Polish
-
-- [ ] Quest system
-- [ ] Supernatural powers
-- [ ] 3D client support
-- [ ] Content creation tools
-
-### Phase 5: Future
-
-- [ ] VR client support
-- [ ] Advanced faction systems
-- [ ] Player housing/bases
-- [ ] Large-scale PvP/RvR
+See [TODO.md](TODO.md) and [docs/NEXT_SESSION_PRIORITIES.md](docs/NEXT_SESSION_PRIORITIES.md) for detailed implementation priorities.
 
 ## Contributing
 

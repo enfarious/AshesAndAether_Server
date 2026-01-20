@@ -11,10 +11,14 @@ import { StatCalculator } from '@/game/stats/StatCalculator';
 import { CombatManager } from '@/combat/CombatManager';
 import { AbilitySystem } from '@/combat/AbilitySystem';
 import { DamageCalculator } from '@/combat/DamageCalculator';
-import type { CombatAbilityDefinition, CombatStats } from '@/combat/types';
+import { buildCombatNarrative } from '@/combat/CombatNarratives';
+import type { CombatAbilityDefinition, CombatStats, DamageProfileSegment, PhysicalDamageType } from '@/combat/types';
+import type { DamageType } from '@/game/abilities/AbilityTypes';
 import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
 import { WildlifeManager, type BiomeType } from '@/wildlife';
 import { PartyService } from '@/party/PartyService';
+import { buildDamageProfiles, getPrimaryDamageType, getPrimaryPhysicalType, getWeaponDefinition } from '@/items/WeaponData';
+import { buildQualityBiasMultipliers, type QualityBiasMultipliers } from '@/items/ArmorData';
 
 const FEET_TO_METERS = 0.3048;
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
@@ -841,6 +845,10 @@ export class DistributedWorldManager {
         }
         case 'item_use': {
           // Item system not wired yet; accept command for now.
+          break;
+        }
+        case 'equipment_changed': {
+          await this.refreshEquipmentState(context.characterId);
           break;
         }
         case 'companion_command': {
@@ -1981,6 +1989,29 @@ export class DistributedWorldManager {
         return { hit: false };
       }
 
+      const weaponData = attackerSnapshot.weapon ?? null;
+      const weaponProfiles = ability.id === 'basic_attack' ? (weaponData?.damageProfiles ?? null) : null;
+      const primaryDamageType = weaponData?.primaryDamageType;
+      const primaryPhysicalType = ability.damage?.type === 'physical'
+        ? (weaponData?.primaryPhysicalType ?? ability.damage?.physicalType)
+        : ability.damage?.physicalType;
+      const resolvedDamageType = (ability.id === 'basic_attack' && primaryDamageType)
+        ? primaryDamageType
+        : ability.damage?.type;
+      const resolvedAbility = (ability.damage && (primaryPhysicalType || resolvedDamageType))
+        ? {
+          ...ability,
+          damage: {
+            ...ability.damage,
+            ...(resolvedDamageType && { type: resolvedDamageType }),
+            ...(primaryPhysicalType && { physicalType: primaryPhysicalType }),
+          },
+        }
+        : ability;
+      const baseDamageOverride = (ability.id === 'basic_attack' && weaponData?.baseDamage)
+        ? weaponData.baseDamage
+        : undefined;
+
       const scalingValue = this.getScalingValue(attackerSnapshot, ability);
       const damageScale = this.getMultiTargetScale(targets.length);
       const snapshots = new Map<string, typeof targetSnapshot>([[targetId, targetSnapshot]]);
@@ -1995,17 +2026,29 @@ export class DistributedWorldManager {
         }
 
         const result = this.damageCalculator.calculate(
-          ability,
+          resolvedAbility,
           attackerSnapshot.stats,
           targetData.stats,
           scalingValue,
-          { damageMultiplier: damageScale }
+          {
+            damageMultiplier: damageScale,
+            damageProfiles: weaponProfiles ?? undefined,
+            baseDamageOverride,
+            qualityBiasMultipliers: targetData.armorQualityMultipliers,
+          }
         );
 
         if (!result.hit) {
+          const missTarget = zoneManager.getEntity(targetData.entityId);
+          const missNarrative = buildCombatNarrative('miss', {
+            attackerName: attackerEntity.name,
+            targetName: missTarget?.name ?? 'target',
+            ability: resolvedAbility,
+          });
           await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
             eventType: 'combat_miss',
             timestamp: now,
+            narrative: missNarrative,
             eventTypeData: {
               attackerId: characterId,
               targetId: targetData.entityId,
@@ -2031,21 +2074,34 @@ export class DistributedWorldManager {
           max: targetData.maxHealth,
         });
 
+        const hitTarget = zoneManager.getEntity(targetData.entityId);
+        const hitNarrative = buildCombatNarrative('hit', {
+          attackerName: attackerEntity.name,
+          targetName: hitTarget?.name ?? 'target',
+          ability: resolvedAbility,
+          result,
+        });
         await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
           eventType: 'combat_hit',
           timestamp: now,
+          narrative: hitNarrative,
           eventTypeData: {
             attackerId: characterId,
             targetId: targetData.entityId,
             abilityId: ability.id,
+            damageType: resolvedAbility.damage?.type ?? 'physical',
+            physicalType: resolvedAbility.damage?.physicalType,
             outcome: result.outcome,
             critical: result.critical,
             deflected: result.deflected,
             penetrating: result.penetrating,
             glancing: result.glancing,
+            quality: result.quality,
+            qualityMultiplier: result.qualityMultiplier,
             amount: result.amount,
             baseDamage: result.baseDamage,
             mitigatedDamage: result.mitigatedDamage,
+            damageBreakdown: result.damageBreakdown,
             floatText: this.getCombatFloatText('hit', result),
             floatTextTarget: this.getCombatFloatTextForTarget(result),
           },
@@ -2161,6 +2217,14 @@ export class DistributedWorldManager {
       intelligence: number;
       wisdom: number;
     };
+    armorQualityMultipliers?: QualityBiasMultipliers;
+    weapon?: {
+      baseDamage?: number;
+      speed?: number;
+      damageProfiles?: DamageProfileSegment[] | null;
+      primaryPhysicalType?: PhysicalDamageType;
+      primaryDamageType?: DamageType;
+    } | null;
   } | null> {
     if (entity.type === 'player') {
       const character = await CharacterService.findById(entityId);
@@ -2177,6 +2241,11 @@ export class DistributedWorldManager {
 
       const derived = StatCalculator.calculateDerivedStats(coreStats, character.level);
       this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
+      const weaponData = await this.getEquippedWeaponData(entityId);
+      const armorQualityMultipliers = await this.getArmorQualityMultipliers(entityId);
+      if (weaponData?.speed) {
+        this.combatManager.setWeaponSpeed(entityId, weaponData.speed);
+      }
 
       return {
         entityId,
@@ -2189,6 +2258,8 @@ export class DistributedWorldManager {
         maxMana: character.maxMana,
         coreStats,
         stats: this.buildCombatStats(derived),
+        armorQualityMultipliers,
+        weapon: weaponData,
       };
     }
 
@@ -2219,6 +2290,53 @@ export class DistributedWorldManager {
       coreStats,
       stats: this.buildCombatStats(derived),
     };
+  }
+
+  private async getEquippedWeaponData(
+    characterId: string
+  ): Promise<{
+    baseDamage?: number;
+    speed?: number;
+    damageProfiles?: DamageProfileSegment[] | null;
+    primaryPhysicalType?: PhysicalDamageType;
+    primaryDamageType?: DamageType;
+  } | null> {
+    const equipped = await CharacterService.findEquippedHandItems(characterId);
+    if (equipped.length === 0) return null;
+
+    const right = equipped.find(item => item.equipSlot === 'right_hand');
+    const left = equipped.find(item => item.equipSlot === 'left_hand');
+    const weaponItem = right || left;
+    if (!weaponItem) return null;
+
+    const weapon = getWeaponDefinition(weaponItem.template.properties);
+    if (!weapon) return null;
+
+    const profiles = buildDamageProfiles(weapon);
+    const primaryPhysicalType = getPrimaryPhysicalType(profiles);
+
+    return {
+      baseDamage: weapon.baseDamage,
+      speed: weapon.speed,
+      damageProfiles: profiles,
+      primaryPhysicalType,
+      primaryDamageType: getPrimaryDamageType(profiles),
+    };
+  }
+
+  private async refreshEquipmentState(characterId: string): Promise<void> {
+    const weaponData = await this.getEquippedWeaponData(characterId);
+    if (weaponData?.speed) {
+      this.combatManager.setWeaponSpeed(characterId, weaponData.speed);
+    } else {
+      this.combatManager.resetWeaponSpeed(characterId);
+    }
+  }
+
+  private async getArmorQualityMultipliers(characterId: string): Promise<QualityBiasMultipliers> {
+    const equipped = await CharacterService.findEquippedItems(characterId);
+    const propertiesList = equipped.map(item => item.template.properties);
+    return buildQualityBiasMultipliers(propertiesList);
   }
 
   private buildCombatStats(derived: {
@@ -2275,10 +2393,10 @@ export class DistributedWorldManager {
 
   private getCombatTargets(
     zoneManager: ZoneManager,
-    attacker: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
-    target: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
+    attacker: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' },
+    target: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' },
     ability: CombatAbilityDefinition
-  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' }> {
+  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' }> {
     if (ability.targetType === 'self') {
       return [{ id: attacker.id, position: attacker.position, type: attacker.type }];
     }
@@ -2293,7 +2411,7 @@ export class DistributedWorldManager {
 
     if (ability.aoeRadius && ability.aoeRadius > 0) {
       const entities = zoneManager.getEntitiesInRangeForCombat(target.position, ability.aoeRadius, attacker.id);
-      return entities.filter(entity => entity.type === 'player' || entity.type === 'companion');
+      return entities.filter(entity => entity.type === 'player' || entity.type === 'companion' || entity.type === 'mob');
     }
 
     return [{ id: target.id, position: target.position, type: target.type }];
@@ -2304,7 +2422,7 @@ export class DistributedWorldManager {
     attacker: { id: string; position: { x: number; y: number; z: number } },
     target: { id: string; position: { x: number; y: number; z: number } },
     ability: CombatAbilityDefinition
-  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' }> {
+  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' }> {
     const length = ability.targeting?.length ?? ability.range;
     const angleDegrees = ability.targeting?.angle ?? 45;
     const halfAngle = (angleDegrees * Math.PI) / 360;
@@ -2317,7 +2435,7 @@ export class DistributedWorldManager {
 
     const entities = zoneManager.getEntitiesInRangeForCombat(attacker.position, length, attacker.id);
     return entities
-      .filter(entity => entity.type === 'player' || entity.type === 'companion')
+      .filter(entity => entity.type === 'player' || entity.type === 'companion' || entity.type === 'mob')
       .filter(entity => {
         const toEntity = {
           x: entity.position.x - attacker.position.x,
@@ -2338,7 +2456,7 @@ export class DistributedWorldManager {
     attacker: { id: string; position: { x: number; y: number; z: number } },
     target: { id: string; position: { x: number; y: number; z: number } },
     ability: CombatAbilityDefinition
-  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' }> {
+  ): Array<{ id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' }> {
     const length = ability.targeting?.length ?? ability.range;
     const width = ability.targeting?.width ?? 1;
 
@@ -2350,7 +2468,7 @@ export class DistributedWorldManager {
 
     const entities = zoneManager.getEntitiesInRangeForCombat(attacker.position, length, attacker.id);
     return entities
-      .filter(entity => entity.type === 'player' || entity.type === 'companion')
+      .filter(entity => entity.type === 'player' || entity.type === 'companion' || entity.type === 'mob')
       .filter(entity => {
         const toEntity = {
           x: entity.position.x - attacker.position.x,

@@ -16,6 +16,7 @@ const BASIC_ATTACK: CombatAbilityDefinition = {
     amount: 8,
     scalingStat: 'strength',
     scalingMultiplier: 0.4,
+    physicalType: 'blunt',
   },
 };
 

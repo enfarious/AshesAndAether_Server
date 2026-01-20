@@ -103,6 +103,7 @@ model ItemTemplate {
   maxStackSize Int             @default(1)
   createdAt    DateTime        @default(now())
   instances    InventoryItem[]
+  tags         ItemTemplateTag[]
 
   @@map("item_templates")
 }
@@ -121,6 +122,26 @@ model InventoryItem {
 
   @@index([characterId])
   @@map("inventory_items")
+}
+
+model ItemTag {
+  id        String            @id @default(uuid())
+  name      String            @unique
+  createdAt DateTime          @default(now())
+  templates ItemTemplateTag[]
+
+  @@map("item_tags")
+}
+
+model ItemTemplateTag {
+  itemTemplateId String
+  tagId          String
+  itemTemplate   ItemTemplate @relation(fields: [itemTemplateId], references: [id], onDelete: Cascade)
+  tag            ItemTag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([itemTemplateId, tagId])
+  @@index([tagId])
+  @@map("item_template_tags")
 }
 
 model Companion {
@@ -144,12 +165,49 @@ model Companion {
   systemPrompt        String?
   possessedAirlockId  String?
   conversationHistory Json     @default("[]")
+  
+  // NPC personality & capabilities (for Airlock's LLM context)
+  traits              String[]
+  goals               String[]
+  relationships       Json     @default("{}")
+  abilityIds          String[]
+  
+  // Quests this NPC can give
+  questIds            String[]
+
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
+  
+  // Airlock's long-term memory for this NPC
+  memory              CompanionMemory?
 
   @@index([tag])
   @@index([possessedAirlockId])
   @@map("companions")
+}
+
+model CompanionMemory {
+  id                  String   @id @default(uuid())
+  companionId         String   @unique
+  companion           Companion @relation(fields: [companionId], references: [id], onDelete: Cascade)
+  
+  // Raw interaction log (pruned to ~500 most recent)
+  interactions        Json     @default("[]")
+  
+  // Consolidated disposition summary {characterId: {feeling, reason, strength, lastInteractionAt}}
+  dispositionSummary  Json     @default("{}")
+  
+  // Semantic facts Airlock has inferred ("Player X is strong", "Player Y betrayed me")
+  knownFacts          String[] @default([])
+  
+  // Track sync status between Redis and Postgres
+  syncedToRedisAt     DateTime?
+  
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  
+  @@index([companionId])
+  @@map("companion_memories")
 }
 
 model Ability {
@@ -195,11 +253,22 @@ model Quest {
   id                   String   @id @default(uuid())
   title                String
   description          String
-  questType            String
+  questType            String   // "sidequest", "bounty", "investigation", "delivery", etc.
   requiredLevel        Int      @default(1)
   requiredFaction      String?
+  
+  // NPC who gives this quest (can be multiple NPCs)
+  giversNpcIds         String[]
+  
+  // Quest objectives: [{ type: "kill", target: "rat", count: 5 }, ...]
   objectives           Json
+  
+  // Quest rewards: { xp: 500, money: 100, items: ["item1", "item2"] }
   rewards              Json
+  
+  // Dialogue stages: { accepted: "Go forth...", completed: "Well done!", inProgress: "Finding progress?" }
+  dialogueStages       Json
+  
   prerequisiteQuestIds String[]
   followupQuestIds     String[]
   createdAt            DateTime @default(now())

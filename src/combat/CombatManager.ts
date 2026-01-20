@@ -269,6 +269,14 @@ export class CombatManager {
   }
 
   /**
+   * Reset weapon speed to default (unarmed)
+   */
+  resetWeaponSpeed(entityId: string): void {
+    const state = this.ensureCombatant(entityId, Date.now());
+    state.weaponSpeed = DEFAULT_WEAPON_SPEED;
+  }
+
+  /**
    * Get weapon speed for an entity
    */
   getWeaponSpeed(entityId: string): number {
