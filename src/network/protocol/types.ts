@@ -75,6 +75,7 @@ export interface CharacterInfo {
   level: number;
   lastPlayed: number;
   location: string;
+  cosmetics?: Record<string, unknown>;
 }
 
 export interface AuthSuccessMessage {
@@ -85,6 +86,10 @@ export interface AuthSuccessMessage {
     characters: CharacterInfo[];
     canCreateCharacter: boolean;
     maxCharacters: number;
+    // Guest session info
+    isEphemeral?: boolean;  // true = guest session, character wiped on logout
+    ephemeralMessage?: string;  // "You are logged in as Guest_abc123. Character will be deleted on logout."
+    // Airlock session info
     airlockSessionId?: string;
     expiresAt?: number;
     canInhabit?: boolean;
@@ -101,12 +106,49 @@ export interface AuthErrorMessage {
   };
 }
 
+// Registration flow: server asks client to confirm username for new account
+export interface AuthConfirmNameMessage {
+  type: 'auth_confirm_name';
+  payload: {
+    username: string;
+    message: string;  // "Create account with username 'foo'?"
+  };
+}
+
+// Registration flow: client confirms they want to create the account
+export interface AuthNameConfirmedMessage {
+  type: 'auth_name_confirmed';
+  payload: {
+    username: string;
+    password: string;
+    confirmed: boolean;  // true = create account, false = cancel
+  };
+}
+
 // ========== Character Selection/Creation ==========
 
 export interface CharacterSelectMessage {
   type: 'character_select';
   payload: {
     characterId: string;
+  };
+}
+
+// Character creation flow: server asks client to confirm character name
+export interface CharacterConfirmNameMessage {
+  type: 'character_confirm_name';
+  payload: {
+    name: string;
+    message: string;  // "Create character named 'Shadowblade'?"
+  };
+}
+
+// Character creation flow: client confirms they want to create the character
+export interface CharacterNameConfirmedMessage {
+  type: 'character_name_confirmed';
+  payload: {
+    name: string;
+    confirmed: boolean;  // true = create character, false = cancel
   };
 }
 
@@ -118,6 +160,64 @@ export interface CharacterCreateMessage {
       description: string;
     };
     // Additional character creation data can be added here
+  };
+}
+
+export interface CharacterDeleteMessage {
+  type: 'character_delete';
+  payload: {
+    characterId: string;
+  };
+}
+
+export interface CharacterUpdateMessage {
+  type: 'character_update';
+  payload: {
+    characterId: string;
+    name?: string;
+    cosmetics?: Record<string, unknown> | null;
+  };
+}
+
+export interface CharacterListRequestMessage {
+  type: 'character_list_request';
+  payload: {
+    timestamp: number;
+  };
+}
+
+export interface CharacterListMessage {
+  type: 'character_list';
+  payload: {
+    characters: CharacterInfo[];
+    maxCharacters: number;
+    emptySlots: number;
+    canCreateCharacter: boolean;
+  };
+}
+
+export interface CharacterInfoUpdate extends Partial<CharacterInfo> {
+  id: string;
+}
+
+export interface CharacterRosterDeltaMessage {
+  type: 'character_roster_delta';
+  payload: {
+    added?: CharacterInfo[];
+    removed?: string[];
+    updated?: CharacterInfoUpdate[];
+    maxCharacters?: number;
+    emptySlots?: number;
+    canCreateCharacter?: boolean;
+  };
+}
+
+export interface CharacterErrorMessage {
+  type: 'character_error';
+  payload: {
+    code: string;
+    message: string;
+    action: 'create' | 'delete' | 'list' | 'select' | 'update' | 'unknown';
   };
 }
 
@@ -190,6 +290,10 @@ export interface CharacterState {
   health: { current: number; max: number };
   stamina: { current: number; max: number };
   mana: { current: number; max: number };
+
+  // Corruption system
+  corruption: CorruptionStatus;
+  corruptionBenefits: CorruptionBenefits;
 
   // Progression
   unlockedFeats: string[];  // Array of feat IDs
@@ -494,6 +598,36 @@ export interface ErrorMessage {
   };
 }
 
+// ========== Corruption System ==========
+
+export type CorruptionState = 'CLEAN' | 'STAINED' | 'WARPED' | 'LOST';
+
+export interface CorruptionStatus {
+  current: number;           // 0-100 corruption value
+  state: CorruptionState;    // Current threshold band
+  isolationMinutes: number;  // Time isolated from community
+  contributionPoints: number; // Accumulated contribution
+}
+
+export interface CorruptionUpdateMessage {
+  type: 'corruption_update';
+  payload: {
+    corruption: number;           // Current corruption (0-100)
+    state: CorruptionState;       // Current state band
+    previousState?: CorruptionState; // Only present if state changed
+    delta: number;                // Change amount (positive = gain, negative = reduction)
+    reason?: string;              // Human-readable reason for change
+    timestamp: number;
+  };
+}
+
+// Corruption benefits (sent on state change or world entry)
+export interface CorruptionBenefits {
+  cacheDetectionBonus: number;   // Percentage bonus (0, 5, 15, 30)
+  hazardResistBonus: number;     // Percentage bonus (0, 0, 10, 25)
+  deadSystemInterface: boolean;  // Can interact with dead AI terminals
+}
+
 // ========== Content Ratings ==========
 
 export type ContentRating = 'T' | 'M' | 'AO';  // Teen (13+), Mature (17+), Adults Only (18+)
@@ -689,8 +823,13 @@ export interface PlayerPeekResponse {
 export type ClientMessage =
   | HandshakeMessage
   | AuthMessage
+  | AuthNameConfirmedMessage
   | CharacterSelectMessage
   | CharacterCreateMessage
+  | CharacterNameConfirmedMessage
+  | CharacterDeleteMessage
+  | CharacterUpdateMessage
+  | CharacterListRequestMessage
   | MoveMessage
   | ChatMessage
   | InteractMessage
@@ -709,6 +848,11 @@ export type ServerMessage =
   | HandshakeAckMessage
   | AuthSuccessMessage
   | AuthErrorMessage
+  | AuthConfirmNameMessage
+  | CharacterListMessage
+  | CharacterConfirmNameMessage
+  | CharacterRosterDeltaMessage
+  | CharacterErrorMessage
   | WorldEntryMessage
   | StateUpdateMessage
   | EventMessage
@@ -720,4 +864,5 @@ export type ServerMessage =
   | PlayerPeekResponse
   | InhabitGrantedMessage
   | InhabitDeniedMessage
-  | InhabitRevokedMessage;
+  | InhabitRevokedMessage
+  | CorruptionUpdateMessage;

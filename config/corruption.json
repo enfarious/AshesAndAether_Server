@@ -1,0 +1,278 @@
+{
+  "system": {
+    "name": "Ashes & Aether Corruption System",
+    "version": "1.0",
+    "tick_interval_seconds": 60,
+    "corruption_min": 0,
+    "corruption_max": 100
+  },
+  "thresholds": {
+    "states": [
+      {
+        "name": "CLEAN",
+        "min": 0,
+        "max": 24
+      },
+      {
+        "name": "STAINED",
+        "min": 25,
+        "max": 49
+      },
+      {
+        "name": "WARPED",
+        "min": 50,
+        "max": 74
+      },
+      {
+        "name": "LOST",
+        "min": 75,
+        "max": 100
+      }
+    ]
+  },
+  "zone_tags": {
+    "WILDS": {
+      "corruption_per_minute": 0.0,
+      "night_multiplier": 1.0
+    },
+    "RUINS_CITY_EDGE": {
+      "corruption_per_minute": 0.02,
+      "night_multiplier": 1.5
+    },
+    "OLD_CITY_CORE": {
+      "corruption_per_minute": 0.06,
+      "night_multiplier": 1.5
+    },
+    "MOUNTAIN_HOLD": {
+      "corruption_per_minute": 0.1,
+      "night_multiplier": 1.5
+    },
+    "DEEP_LAB": {
+      "corruption_per_minute": 0.18,
+      "night_multiplier": 1.0
+    },
+    "WARD_ZONE": {
+      "corruption_per_minute": -0.05,
+      "night_multiplier": 1.0
+    },
+    "CURSED_RESORT": {
+      "corruption_per_minute": 0.04,
+      "night_multiplier": 2.5,
+      "notes": "Jiminy Peak - corporate corruption spirals. Safe in groups during day, dangerous alone at night."
+    },
+    "DEEP_ROADS": {
+      "corruption_per_minute": 0.12,
+      "night_multiplier": 1.0,
+      "notes": "Instanced dungeon tunnels. No day/night cycle underground."
+    }
+  },
+  "party_field_reduction": {
+    "enabled": true,
+    "applies_to": ["zone", "isolation", "entity_exposure"],
+    "excludes": ["wealth", "forbidden_actions"],
+    "thresholds": [
+      {
+        "min_members": 2,
+        "reduction_percent": 10,
+        "notes": "Duo exploration - minor protection"
+      },
+      {
+        "min_members": 3,
+        "reduction_percent": 30,
+        "notes": "Small group - moderate protection"
+      },
+      {
+        "min_members": 4,
+        "reduction_percent": 50,
+        "notes": "Strong group - significant protection"
+      },
+      {
+        "min_members": 5,
+        "reduction_percent": 70,
+        "notes": "Full party - major protection, enables deep exploration"
+      }
+    ]
+  },
+  "time_of_day": {
+    "enabled": true,
+    "night_hours": {
+      "start": 20,
+      "end": 6
+    },
+    "notes": "Night multiplier applied to zone corruption during night hours (8pm-6am)"
+  },
+  "community_detection": {
+    "settlement_boundary_enabled": true,
+    "nearby_player_radius_meters": 35.0,
+    "nearby_player_min_count": 3,
+    "community_object_radius_meters": 25.0,
+    "community_object_types": [
+      "CAMPFIRE",
+      "SHRINE",
+      "MARKET",
+      "COMMUNITY_CENTER",
+      "TAVERN",
+      "GARDEN_PLOT"
+    ]
+  },
+  "isolation": {
+    "grace_minutes": 10,
+    "ramp": [
+      {
+        "after_minutes_isolated": 10,
+        "corruption_per_minute": 0.01
+      },
+      {
+        "after_minutes_isolated": 30,
+        "corruption_per_minute": 0.02
+      },
+      {
+        "after_minutes_isolated": 120,
+        "corruption_per_minute": 0.03
+      }
+    ]
+  },
+  "wealth": {
+    "enabled": true,
+    "wealth_score_cache_seconds": 300,
+    "threshold": 10000,
+    "bands": [
+      {
+        "min_multiplier_of_threshold": 0,
+        "max_multiplier_of_threshold": 1,
+        "corruption_per_minute": 0.0
+      },
+      {
+        "min_multiplier_of_threshold": 1,
+        "max_multiplier_of_threshold": 2,
+        "corruption_per_minute": 0.01
+      },
+      {
+        "min_multiplier_of_threshold": 2,
+        "max_multiplier_of_threshold": 5,
+        "corruption_per_minute": 0.03
+      },
+      {
+        "min_multiplier_of_threshold": 5,
+        "max_multiplier_of_threshold": null,
+        "corruption_per_minute": 0.06
+      }
+    ],
+    "notes": "wealth_score should be computed server-side using authoritative item price tables. Consider reducing wealth gain when contribution buffs are active."
+  },
+  "contribution": {
+    "enabled": true,
+    "points_to_corruption_reduction": {
+      "points": 100,
+      "corruption_delta": -1.0
+    },
+    "wealth_gain_multiplier_buff": {
+      "enabled": true,
+      "per_award_multiplier": 0.9,
+      "duration_seconds": 86400
+    },
+    "sources": [
+      "DONATE_TO_TOWN_STORAGE",
+      "REPAIR_STRUCTURE",
+      "BUILD_STRUCTURE",
+      "CRAFT_FOR_OTHER_PLAYER_CONFIRMED",
+      "ESCORT_MISSION_COMPLETE",
+      "RESCUE_MISSION_COMPLETE"
+    ]
+  },
+  "forbidden_actions": {
+    "enabled": true,
+    "events": [
+      {
+        "event_type": "BETRAYAL_PK_ALLY",
+        "corruption_add": 5
+      },
+      {
+        "event_type": "LOOT_COMMUNITY_STORE",
+        "corruption_add": 8
+      },
+      {
+        "event_type": "DEEP_LAB_ARTIFACT_ACTIVATE",
+        "corruption_add": 10
+      },
+      {
+        "event_type": "AETHER_SIPHON_RITUAL",
+        "corruption_add": 12
+      },
+      {
+        "event_type": "INSTALL_FORBIDDEN_AUGMENT",
+        "corruption_add": 15
+      }
+    ]
+  },
+  "benefits": {
+    "enabled": true,
+    "bands": [
+      {
+        "state": "CLEAN",
+        "cache_detection_bonus_pct": 0,
+        "hazard_resist_bonus_pct": 0,
+        "dead_system_interface": false
+      },
+      {
+        "state": "STAINED",
+        "cache_detection_bonus_pct": 5,
+        "hazard_resist_bonus_pct": 0,
+        "dead_system_interface": false
+      },
+      {
+        "state": "WARPED",
+        "cache_detection_bonus_pct": 15,
+        "hazard_resist_bonus_pct": 10,
+        "dead_system_interface": true
+      },
+      {
+        "state": "LOST",
+        "cache_detection_bonus_pct": 30,
+        "hazard_resist_bonus_pct": 25,
+        "dead_system_interface": true
+      }
+    ],
+    "notes": "Perks should be meaningful enough to tempt players, but not mandatory. Dead system interface can gate special terminals/AI fragments."
+  },
+  "town_rules": {
+    "enabled": true,
+    "default_goodly_town": {
+      "max_corruption_allowed": 50,
+      "pricing_multiplier_by_state": {
+        "CLEAN": 1.0,
+        "STAINED": 1.1,
+        "WARPED": 1.3,
+        "LOST": null
+      },
+      "refuse_service_if_lost": true,
+      "cleansing_available": true
+    },
+    "neutral_trade_town": {
+      "max_corruption_allowed": 75,
+      "pricing_multiplier_by_state": {
+        "CLEAN": 1.0,
+        "STAINED": 1.05,
+        "WARPED": 1.15,
+        "LOST": 1.35
+      },
+      "refuse_service_if_lost": false,
+      "cleansing_available": false
+    },
+    "corrupted_camp": {
+      "min_corruption_required": 50,
+      "pricing_multiplier_by_state": {
+        "CLEAN": null,
+        "STAINED": null,
+        "WARPED": 1.0,
+        "LOST": 0.9
+      },
+      "cleansing_available": false
+    }
+  },
+  "debug": {
+    "audit_events_enabled": true,
+    "audit_sample_rate": 1.0,
+    "log_zone_changes": true
+  }
+}

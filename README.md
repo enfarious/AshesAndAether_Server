@@ -114,6 +114,22 @@ Run tests in watch mode:
 npm run test:watch
 ```
 
+## World Generation
+
+Generate 3D terrain, buildings, and roads from real-world data (USGS elevation + OpenStreetMap):
+
+```powershell
+# Install Python dependencies first
+pip install -r scripts/requirements.txt
+
+# Generate a zone (example: Jiminy Peak, MA)
+.\scripts\build_world.ps1 -ZoneId "USA_MA_JiminyPeak" -Lat 42.4995 -Lon -73.2843 -RadiusMiles 1.5
+```
+
+Output: `.glb` meshes for terrain, buildings, and roads in `data/world/assets/`.
+
+See [scripts/README.md](scripts/README.md) for full documentation.
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
@@ -156,7 +172,8 @@ Original supernatural system allowing players to develop unique abilities as the
 
 - [ ] **NPC Intent System** - Context items + LLM → action pipeline
 - [ ] **Combat System** - Full ATB, cooldowns, status effects, AoE
-- [ ] **World Content** - OSM integration, zone generation, NPC placement
+- [x] **World Generation** - USGS terrain + OSM buildings/roads → GLB meshes
+- [ ] **Corruption System** - Zone-based, party mechanics, time-of-day modifiers
 
 ### 📋 Planned
 

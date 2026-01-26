@@ -132,7 +132,12 @@ For testing or demo purposes:
         "name": "Shadowblade",
         "level": 5,
         "lastPlayed": 1234567890,
-        "location": "The Crossroads"
+        "location": "The Crossroads",
+        "cosmetics": {
+          "appearance": {
+            "description": "A tall figure shrouded in midnight blue robes..."
+          }
+        }
       },
       {
         "id": "char-uuid-2",
@@ -160,6 +165,38 @@ For testing or demo purposes:
   }
 }
 ```
+
+#### Account Registration (New Account Flow)
+
+When a user attempts to log in with credentials but no account exists, the server prompts for confirmation before creating the account:
+
+**Server → Client: Confirm Name**
+
+```json
+{
+  "type": "auth_confirm_name",
+  "payload": {
+    "username": "Wanderer",
+    "message": "No account found for \"Wanderer\". Create a new account with this name?"
+  }
+}
+```
+
+**Client → Server: Confirm or Cancel**
+
+```json
+{
+  "type": "auth_name_confirmed",
+  "payload": {
+    "username": "Wanderer",
+    "password": "original_password",
+    "confirmed": true  // false to cancel registration
+  }
+}
+```
+
+If `confirmed: true`, the server creates the account and responds with `auth_success`.
+If `confirmed: false`, the server responds with `auth_error` (reason: "registration_cancelled").
 
 ---
 
@@ -192,6 +229,163 @@ Client selects or creates a character:
   }
 }
 ```
+
+**Server → Client: Confirm Name**
+
+After validation, the server asks for confirmation before creating:
+
+```json
+{
+  "type": "character_confirm_name",
+  "payload": {
+    "name": "Nightshade",
+    "message": "Create character named \"Nightshade\"?"
+  }
+}
+```
+
+**Client → Server: Confirm or Cancel**
+
+```json
+{
+  "type": "character_name_confirmed",
+  "payload": {
+    "name": "Nightshade",
+    "confirmed": true  // false to cancel
+  }
+}
+```
+
+If `confirmed: true`, the server creates the character, sends `character_roster_delta`, and enters the world.
+If `confirmed: false`, the server responds with `character_error` (code: "CANCELLED").
+
+#### Delete Character:
+
+```json
+{
+  "type": "character_delete",
+  "payload": {
+    "characterId": "char-uuid-1"
+  }
+}
+```
+
+#### Update Character (Cosmetics):
+
+```json
+{
+  "type": "character_update",
+  "payload": {
+    "characterId": "char-uuid-1",
+    "name": "Shadowblade",
+    "cosmetics": {
+      "appearance": {
+        "description": "A tall figure shrouded in midnight blue robes..."
+      },
+      "gender": "non-binary",
+      "pronouns": "they/them"
+    }
+  }
+}
+```
+
+---
+
+## Character Roster Updates (Post-Auth)
+
+Character rosters are sent on login via `auth_success`. After that, the server MAY send roster updates when the player creates or deletes characters, or when the client explicitly requests a refresh.
+
+### Server → Client: Full Roster
+
+```json
+{
+  "type": "character_list",
+  "payload": {
+    "characters": [
+      {
+        "id": "char-uuid-1",
+        "name": "Shadowblade",
+        "level": 5,
+        "lastPlayed": 1234567890,
+        "location": "The Crossroads"
+      }
+    ],
+    "maxCharacters": 5,
+    "emptySlots": 4,
+    "canCreateCharacter": true
+  }
+}
+```
+
+### Server → Client: Roster Delta
+
+```json
+{
+  "type": "character_roster_delta",
+  "payload": {
+    "added": [
+      {
+        "id": "char-uuid-3",
+        "name": "Elara",
+        "level": 1,
+        "lastPlayed": 1234569000,
+        "location": "Moonlit Grove"
+      }
+    ],
+    "removed": ["char-uuid-1"],
+    "updated": [
+      {
+        "id": "char-uuid-2",
+        "lastPlayed": 1234569100,
+        "location": "The Crossroads"
+      }
+    ],
+    "maxCharacters": 5,
+    "emptySlots": 3,
+    "canCreateCharacter": true
+  }
+}
+```
+
+**Notes:**
+- Server sends `character_list` on explicit refresh or when it cannot produce a reliable delta.
+- Server sends `character_roster_delta` on create/delete/update (typically small deltas).
+- `cosmetics` is a freeform object for appearance metadata agreed upon by client/server.
+
+### Client → Server: Roster Refresh Request
+
+```json
+{
+  "type": "character_list_request",
+  "payload": {
+    "timestamp": 1234567890
+  }
+}
+```
+
+### Error Events (Create/Delete)
+
+```json
+{
+  "type": "character_error",
+  "payload": {
+    "code": "NAME_TAKEN",
+    "message": "That name is already taken.",
+    "action": "create"
+  }
+}
+```
+
+**Common error codes:**
+- `NAME_TAKEN`
+- `LIMIT_REACHED`
+- `INVALID_NAME`
+- `NOT_AUTHENTICATED`
+- `NOT_FOUND`
+- `NOT_OWNED`
+- `ACTIVE_CHARACTER`
+- `NO_CHANGES`
+- `SERVER_ERROR`
 
 ---
 

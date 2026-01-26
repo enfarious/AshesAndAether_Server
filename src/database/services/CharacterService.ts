@@ -51,6 +51,7 @@ export class CharacterService {
     positionX: number;
     positionY: number;
     positionZ: number;
+    cosmetics?: Record<string, unknown>;
   }): Promise<Character> {
     // Calculate derived stats from default core stats (all 10)
     const coreStats = {
@@ -103,7 +104,56 @@ export class CharacterService {
         activeLoadout: [],
         passiveLoadout: [],
         specialLoadout: [],
+
+        // Cosmetics (stored in supernaturalData until a dedicated profile schema exists)
+        supernaturalData: data.cosmetics ? { cosmetics: data.cosmetics } : undefined,
       },
+    });
+  }
+
+  /**
+   * Update character name and cosmetics
+   */
+  static async updateCharacter(
+    characterId: string,
+    data: { name?: string; cosmetics?: Record<string, unknown> | null }
+  ): Promise<Character> {
+    const existing = await prisma.character.findUnique({
+      where: { id: characterId },
+      select: { supernaturalData: true },
+    });
+
+    let nextSupernaturalData: Record<string, unknown> | null | undefined = undefined;
+    if (data.cosmetics !== undefined) {
+      const base = (existing?.supernaturalData &&
+        typeof existing.supernaturalData === 'object' &&
+        !Array.isArray(existing.supernaturalData))
+        ? (existing.supernaturalData as Record<string, unknown>)
+        : {};
+
+      if (data.cosmetics === null) {
+        const { cosmetics, ...rest } = base;
+        nextSupernaturalData = Object.keys(rest).length > 0 ? rest : null;
+      } else {
+        nextSupernaturalData = { ...base, cosmetics: data.cosmetics };
+      }
+    }
+
+    return prisma.character.update({
+      where: { id: characterId },
+      data: {
+        ...(data.name !== undefined && { name: data.name }),
+        ...(nextSupernaturalData !== undefined && { supernaturalData: nextSupernaturalData }),
+      },
+    });
+  }
+
+  /**
+   * Delete a character by ID
+   */
+  static async deleteCharacter(characterId: string): Promise<void> {
+    await prisma.character.delete({
+      where: { id: characterId },
     });
   }
 

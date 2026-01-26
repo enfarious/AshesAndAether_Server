@@ -20,48 +20,62 @@ model Account {
 }
 
 model Character {
-  id                String          @id @default(uuid())
+  id                String   @id @default(uuid())
   accountId         String
   name              String
-  level             Int             @default(1)
-  experience        Int             @default(0)
-  abilityPoints     Int             @default(0)
+  level             Int      @default(1)
+  experience        Int      @default(0)
+  abilityPoints     Int      @default(0)
   supernaturalType  String?
   supernaturalData  Json?
-  strength          Int             @default(10)
-  vitality          Int             @default(10)
-  dexterity         Int             @default(10)
-  agility           Int             @default(10)
-  intelligence      Int             @default(10)
-  wisdom            Int             @default(10)
-  maxHp             Int             @default(200)
-  maxStamina        Int             @default(100)
-  maxMana           Int             @default(100)
-  attackRating      Float           @default(30)
-  defenseRating     Float           @default(5)
-  magicAttack       Float           @default(30)
-  magicDefense      Float           @default(5)
-  currentHp         Int             @default(200)
-  currentStamina    Int             @default(100)
-  currentMana       Int             @default(100)
-  isAlive           Boolean         @default(true)
+  strength          Int      @default(10)
+  vitality          Int      @default(10)
+  dexterity         Int      @default(10)
+  agility           Int      @default(10)
+  intelligence      Int      @default(10)
+  wisdom            Int      @default(10)
+  maxHp             Int      @default(200)
+  maxStamina        Int      @default(100)
+  maxMana           Int      @default(100)
+  attackRating      Float    @default(30)
+  defenseRating     Float    @default(5)
+  magicAttack       Float    @default(30)
+  magicDefense      Float    @default(5)
+  currentHp         Int      @default(200)
+  currentStamina    Int      @default(100)
+  currentMana       Int      @default(100)
+  isAlive           Boolean  @default(true)
   zoneId            String
   positionX         Float
   positionY         Float
   positionZ         Float
-  heading           Float           @default(0)
-  rotation          Float           @default(0)
-  unlockedFeats     Json            @default("[]")
-  unlockedAbilities Json            @default("[]")
-  activeLoadout     Json            @default("[]")
-  passiveLoadout    Json            @default("[]")
-  specialLoadout    Json            @default("[]")
-  createdAt         DateTime        @default(now())
-  updatedAt         DateTime        @updatedAt
-  lastSeenAt        DateTime        @default(now())
-  account           Account         @relation(fields: [accountId], references: [id])
-  zone              Zone            @relation(fields: [zoneId], references: [id])
-  inventory         InventoryItem[]
+  heading           Float    @default(0)
+  rotation          Float    @default(0)
+  unlockedFeats     Json     @default("[]")
+  unlockedAbilities Json     @default("[]")
+  activeLoadout     Json     @default("[]")
+  passiveLoadout    Json     @default("[]")
+  specialLoadout    Json     @default("[]")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  lastSeenAt        DateTime @default(now())
+
+  // Corruption system
+  corruption              Float     @default(0) // 0-100 scale
+  lastCorruptionTickAt    DateTime  @default(now())
+  isolationSeconds        Int       @default(0) // Time away from community
+  communitySeconds        Int       @default(0) // Time in community (resets isolation)
+  wealthScoreCached       Int       @default(0) // Server-computed wealth value
+  wealthScoreCachedAt     DateTime  @default(now())
+  contributionPoints      Int       @default(0) // Earned via community actions
+  contributionBuffExpires DateTime? // When wealth_gain_multiplier buff expires
+
+  account            Account             @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  zone               Zone                @relation(fields: [zoneId], references: [id])
+  inventory          InventoryItem[]
+  corruptionEvents   CorruptionEvent[]
+  factionReputations FactionReputation[]
+  questProgress      QuestProgress[]
 
   @@index([accountId])
   @@index([zoneId])
@@ -69,7 +83,7 @@ model Character {
 }
 
 model Zone {
-  id               String      @id @default(uuid())
+  id               String   @id @default(uuid())
   name             String
   description      String?
   worldX           Int
@@ -78,30 +92,35 @@ model Zone {
   sizeY            Float
   sizeZ            Float
   terrainType      String
-  weatherEnabled   Boolean     @default(true)
-  timeOfDayEnabled Boolean     @default(true)
-  contentRating    String      @default("T")
+  weatherEnabled   Boolean  @default(true)
+  timeOfDayEnabled Boolean  @default(true)
+  contentRating    String   @default("T")
   navmeshData      Json?
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
-  characters       Character[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Corruption system - zone environmental corruption
+  corruptionTag String  @default("WILDS") // WILDS, RUINS_CITY_EDGE, OLD_CITY_CORE, MOUNTAIN_HOLD, DEEP_LAB, WARD_ZONE
+  isWarded      Boolean @default(false) // Warded zones actively reduce corruption
+
+  characters Character[]
 
   @@unique([worldX, worldY])
   @@map("zones")
 }
 
 model ItemTemplate {
-  id           String          @id @default(uuid())
+  id           String            @id @default(uuid())
   name         String
   description  String?
   itemType     String
   properties   Json
   iconUrl      String?
   modelUrl     String?
-  value        Int             @default(0)
-  stackable    Boolean         @default(false)
-  maxStackSize Int             @default(1)
-  createdAt    DateTime        @default(now())
+  value        Int               @default(0)
+  stackable    Boolean           @default(false)
+  maxStackSize Int               @default(1)
+  createdAt    DateTime          @default(now())
   instances    InventoryItem[]
   tags         ItemTemplateTag[]
 
@@ -145,41 +164,41 @@ model ItemTemplateTag {
 }
 
 model Companion {
-  id                  String   @id @default(uuid())
+  id                  String  @id @default(uuid())
   name                String
   tag                 String?
   description         String?
   personalityType     String
   memoryData          Json
-  level               Int      @default(1)
+  level               Int     @default(1)
   stats               Json
   currentHealth       Int
   maxHealth           Int
-  isAlive             Boolean  @default(true)
+  isAlive             Boolean @default(true)
   zoneId              String
   positionX           Float
   positionY           Float
   positionZ           Float
-  llmProvider         String   @default("anthropic")
-  llmModel            String   @default("claude-3-5-sonnet-20241022")
+  llmProvider         String  @default("anthropic")
+  llmModel            String  @default("claude-3-5-sonnet-20241022")
   systemPrompt        String?
   possessedAirlockId  String?
-  conversationHistory Json     @default("[]")
-  
-  // NPC personality & capabilities (for Airlock's LLM context)
-  traits              String[]
-  goals               String[]
-  relationships       Json     @default("{}")
-  abilityIds          String[]
-  
-  // Quests this NPC can give
-  questIds            String[]
+  conversationHistory Json    @default("[]")
 
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
-  
+  // NPC personality & capabilities (for Airlock's LLM context)
+  traits        String[]
+  goals         String[]
+  relationships Json     @default("{}")
+  abilityIds    String[]
+
+  // Quests this NPC can give
+  questIds String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   // Airlock's long-term memory for this NPC
-  memory              CompanionMemory?
+  memory CompanionMemory?
 
   @@index([tag])
   @@index([possessedAirlockId])
@@ -187,25 +206,25 @@ model Companion {
 }
 
 model CompanionMemory {
-  id                  String   @id @default(uuid())
-  companionId         String   @unique
-  companion           Companion @relation(fields: [companionId], references: [id], onDelete: Cascade)
-  
+  id          String    @id @default(uuid())
+  companionId String    @unique
+  companion   Companion @relation(fields: [companionId], references: [id], onDelete: Cascade)
+
   // Raw interaction log (pruned to ~500 most recent)
-  interactions        Json     @default("[]")
-  
+  interactions Json @default("[]")
+
   // Consolidated disposition summary {characterId: {feeling, reason, strength, lastInteractionAt}}
-  dispositionSummary  Json     @default("{}")
-  
+  dispositionSummary Json @default("{}")
+
   // Semantic facts Airlock has inferred ("Player X is strong", "Player Y betrayed me")
-  knownFacts          String[] @default([])
-  
+  knownFacts String[] @default([])
+
   // Track sync status between Redis and Postgres
-  syncedToRedisAt     DateTime?
-  
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
-  
+  syncedToRedisAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([companionId])
   @@map("companion_memories")
 }
@@ -237,12 +256,13 @@ model Faction {
 }
 
 model FactionReputation {
-  id          String  @id @default(uuid())
+  id          String    @id @default(uuid())
   characterId String
   factionId   String
-  reputation  Int     @default(0)
+  reputation  Int       @default(0)
   standing    String
-  faction     Faction @relation(fields: [factionId], references: [id])
+  character   Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  faction     Faction   @relation(fields: [factionId], references: [id], onDelete: Cascade)
 
   @@unique([characterId, factionId])
   @@index([characterId])
@@ -250,28 +270,29 @@ model FactionReputation {
 }
 
 model Quest {
-  id                   String   @id @default(uuid())
-  title                String
-  description          String
-  questType            String   // "sidequest", "bounty", "investigation", "delivery", etc.
-  requiredLevel        Int      @default(1)
-  requiredFaction      String?
-  
+  id              String  @id @default(uuid())
+  title           String
+  description     String
+  questType       String // "sidequest", "bounty", "investigation", "delivery", etc.
+  requiredLevel   Int     @default(1)
+  requiredFaction String?
+
   // NPC who gives this quest (can be multiple NPCs)
-  giversNpcIds         String[]
-  
+  giversNpcIds String[]
+
   // Quest objectives: [{ type: "kill", target: "rat", count: 5 }, ...]
-  objectives           Json
-  
+  objectives Json
+
   // Quest rewards: { xp: 500, money: 100, items: ["item1", "item2"] }
-  rewards              Json
-  
+  rewards Json
+
   // Dialogue stages: { accepted: "Go forth...", completed: "Well done!", inProgress: "Finding progress?" }
-  dialogueStages       Json
-  
+  dialogueStages Json
+
   prerequisiteQuestIds String[]
   followupQuestIds     String[]
-  createdAt            DateTime @default(now())
+  createdAt            DateTime        @default(now())
+  progress             QuestProgress[]
 
   @@map("quests")
 }
@@ -284,6 +305,8 @@ model QuestProgress {
   objectiveProgress Json
   startedAt         DateTime  @default(now())
   completedAt       DateTime?
+  character         Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  quest             Quest     @relation(fields: [questId], references: [id], onDelete: Cascade)
 
   @@unique([characterId, questId])
   @@index([characterId])
@@ -302,4 +325,23 @@ model CombatLog {
 
   @@index([combatId])
   @@map("combat_logs")
+}
+
+model CorruptionEvent {
+  id               String   @id @default(uuid())
+  characterId      String
+  eventType        String // ZONE_TICK, ISOLATION_TICK, WEALTH_TICK, FORBIDDEN_ACTION, CONTRIBUTION, CLEANSING, etc.
+  delta            Float // Amount corruption changed (positive = gain, negative = reduction)
+  corruptionBefore Float
+  corruptionAfter  Float
+  reason           String? // Human-readable reason: "30 min in DEEP_LAB", "Looted community store", etc.
+  metadata         Json? // Additional context: { zoneId, zoneTag, isolationMinutes, wealthScore, etc. }
+  createdAt        DateTime @default(now())
+
+  character Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  @@index([characterId])
+  @@index([eventType])
+  @@index([createdAt])
+  @@map("corruption_events")
 }

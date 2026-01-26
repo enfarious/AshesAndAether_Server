@@ -10,14 +10,25 @@ import {
   AuthMessage,
   AuthSuccessMessage,
   AuthErrorMessage,
+  AuthConfirmNameMessage,
+  AuthNameConfirmedMessage,
   CharacterSelectMessage,
   CharacterCreateMessage,
+  CharacterDeleteMessage,
+  CharacterUpdateMessage,
+  CharacterListRequestMessage,
+  CharacterListMessage,
+  CharacterRosterDeltaMessage,
+  CharacterConfirmNameMessage,
+  CharacterNameConfirmedMessage,
+  CharacterErrorMessage,
   WorldEntryMessage,
   MoveMessage,
   ChatMessage,
   InteractMessage,
   CombatActionMessage,
 } from '@/network/protocol/types';
+import type { Character } from '@prisma/client';
 
 interface ClientInfo {
   type: ClientType;
@@ -39,11 +50,18 @@ export class GatewayClientSession {
   private airlockSessionId: string | null = null;
   private airlockId: string | null = null;
   private maxConcurrentInhabits: number = 0;
+  private maxCharacters: number = 0;
   private characterId: string | null = null;
   private accountId: string | null = null;
   private currentZoneId: string | null = null;
   private lastPingTime: number = Date.now();
   private clientInfo: ClientInfo | null = null;
+  // Pending registration: stores password while awaiting name confirmation
+  private pendingRegistration: { username: string; password: string } | null = null;
+  // Pending character creation: stores appearance while awaiting name confirmation
+  private pendingCharacterCreate: { name: string; appearance?: { description: string } } | null = null;
+  // Guest session flag - if true, account+character deleted on disconnect
+  private isGuestSession: boolean = false;
 
   constructor(
     private socket: Socket,
@@ -85,6 +103,11 @@ export class GatewayClientSession {
       this.authenticate(data);
     });
 
+    // Registration confirmation (when creating new account)
+    this.socket.on('auth_name_confirmed', (data: AuthNameConfirmedMessage['payload']) => {
+      this.handleNameConfirmation(data);
+    });
+
     // Character selection/creation
     this.socket.on('character_select', (data: CharacterSelectMessage['payload']) => {
       if (this.isAirlock) {
@@ -108,6 +131,50 @@ export class GatewayClientSession {
         return;
       }
       this.handleCharacterCreate(data);
+    });
+
+    this.socket.on('character_name_confirmed', (data: CharacterNameConfirmedMessage['payload']) => {
+      if (this.isAirlock) {
+        this.sendError('AIRLOCK_SESSION', 'Airlock sessions cannot create characters');
+        return;
+      }
+      if (!this.authenticated) {
+        this.sendError('NOT_AUTHENTICATED', 'Must authenticate before creating character');
+        return;
+      }
+      this.handleCharacterNameConfirmation(data);
+    });
+
+    this.socket.on('character_delete', (data: CharacterDeleteMessage['payload']) => {
+      if (this.isAirlock) {
+        this.sendError('AIRLOCK_SESSION', 'Airlock sessions cannot delete characters');
+        return;
+      }
+      if (!this.authenticated) {
+        this.sendError('NOT_AUTHENTICATED', 'Must authenticate before deleting character');
+        return;
+      }
+      this.handleCharacterDelete(data);
+    });
+
+    this.socket.on('character_update', (data: CharacterUpdateMessage['payload']) => {
+      if (this.isAirlock) {
+        this.sendError('AIRLOCK_SESSION', 'Airlock sessions cannot update characters');
+        return;
+      }
+      if (!this.authenticated) {
+        this.sendError('NOT_AUTHENTICATED', 'Must authenticate before updating character');
+        return;
+      }
+      this.handleCharacterUpdate(data);
+    });
+
+    this.socket.on('character_list_request', (_data: CharacterListRequestMessage['payload']) => {
+      if (!this.authenticated) {
+        this.sendCharacterError('NOT_AUTHENTICATED', 'Must authenticate before requesting roster', 'list');
+        return;
+      }
+      this.sendCharacterList();
     });
 
     // Game messages - route to Zone server
@@ -363,55 +430,175 @@ export class GatewayClientSession {
   }
 
   private async authenticateGuest(guestName: string): Promise<void> {
-    const account = await AccountService.createGuestAccount(guestName);
+    // Generate a unique guest name
+    const guestSuffix = Math.random().toString(36).substring(2, 8);
+    const characterName = guestName ? `${guestName}_${guestSuffix}` : `Guest_${guestSuffix}`;
+
+    // Create guest account
+    const account = await AccountService.createGuestAccount(characterName);
 
     this.authenticated = true;
     this.accountId = account.id;
+    this.maxCharacters = 0;  // Guests can't create more characters
+    this.isGuestSession = true;
 
-    const characters = await CharacterService.findByAccountId(account.id);
+    // Auto-create a guest character
+    const starterZoneId = 'USA_NY_Stephentown';
+    const character = await CharacterService.createCharacter({
+      accountId: account.id,
+      name: characterName,
+      zoneId: starterZoneId,
+      positionX: 0,    // Town Hall origin
+      positionY: 870,  // Elevation at Town Hall (~265m)
+      positionZ: 0,
+    });
+
+    this.characterId = character.id;
+
+    const characterInfo = await this.buildCharacterInfo(character);
+    const ephemeralMessage = `You are exploring as "${characterName}". This character will be deleted when you disconnect.`;
 
     const response: AuthSuccessMessage['payload'] = {
       accountId: account.id,
       token: 'guest-token',
-      characters: characters.map(char => ({
-        id: char.id,
-        name: char.name,
-        level: char.level,
-        lastPlayed: char.lastSeenAt.getTime(),
-        location: 'Unknown',
-      })),
-      canCreateCharacter: true,
-      maxCharacters: 1,
+      characters: [characterInfo],
+      canCreateCharacter: false,
+      maxCharacters: 0,
+      isEphemeral: true,
+      ephemeralMessage,
     };
 
     this.socket.emit('auth_success', response);
-    logger.info(`Guest authenticated: ${this.socket.id} as ${guestName} (Account: ${account.id})`);
+    logger.info(`Guest authenticated: ${this.socket.id} as ${characterName} (Account: ${account.id})`);
+
+    // Auto-enter the world
+    await this.enterWorld();
   }
 
-  private async authenticateCredentials(_username: string, _password: string): Promise<void> {
-    logger.warn('Credential authentication not fully implemented, using mock data');
+  private async authenticateCredentials(username: string, password: string): Promise<void> {
+    // Validate input
+    if (!username || !password) {
+      throw new Error('Username and password are required');
+    }
 
+    const trimmedUsername = username.trim();
+    if (trimmedUsername.length < 3 || trimmedUsername.length > 32) {
+      throw new Error('Username must be between 3 and 32 characters');
+    }
+
+    if (password.length < 6) {
+      throw new Error('Password must be at least 6 characters');
+    }
+
+    // Check if account exists
+    const existingAccount = await AccountService.findByUsername(trimmedUsername);
+
+    if (existingAccount) {
+      // Account exists - verify password
+      const passwordValid = await AccountService.verifyPassword(existingAccount, password);
+
+      if (!passwordValid) {
+        throw new Error('Invalid username or password');
+      }
+
+      // Password correct - complete authentication
+      await this.completeCredentialAuth(existingAccount);
+    } else {
+      // Account doesn't exist - ask for confirmation to create
+      this.pendingRegistration = { username: trimmedUsername, password };
+
+      const confirmMessage: AuthConfirmNameMessage['payload'] = {
+        username: trimmedUsername,
+        message: `No account found for "${trimmedUsername}". Create a new account with this name?`,
+      };
+
+      this.socket.emit('auth_confirm_name', confirmMessage);
+      logger.info(`Registration confirmation requested for ${this.socket.id}: ${trimmedUsername}`);
+    }
+  }
+
+  private async handleNameConfirmation(data: AuthNameConfirmedMessage['payload']): Promise<void> {
+    if (!this.pendingRegistration) {
+      this.sendError('NO_PENDING_REGISTRATION', 'No pending registration to confirm');
+      return;
+    }
+
+    if (data.username !== this.pendingRegistration.username) {
+      this.sendError('USERNAME_MISMATCH', 'Username does not match pending registration');
+      this.pendingRegistration = null;
+      return;
+    }
+
+    if (!data.confirmed) {
+      // User cancelled - clear pending and send error
+      this.pendingRegistration = null;
+      const errorResponse: AuthErrorMessage['payload'] = {
+        reason: 'registration_cancelled',
+        message: 'Account creation cancelled',
+        canRetry: true,
+      };
+      this.socket.emit('auth_error', errorResponse);
+      return;
+    }
+
+    try {
+      // Double-check username is still available (race condition protection)
+      const isAvailable = await AccountService.isUsernameAvailable(this.pendingRegistration.username);
+      if (!isAvailable) {
+        this.pendingRegistration = null;
+        throw new Error('Username was taken while confirming. Please try a different name.');
+      }
+
+      // Create the account
+      const newAccount = await AccountService.createWithPassword(
+        this.pendingRegistration.username,
+        this.pendingRegistration.password
+      );
+
+      this.pendingRegistration = null;
+      logger.info(`New account created: ${newAccount.username} (${newAccount.id})`);
+
+      // Complete authentication
+      await this.completeCredentialAuth(newAccount);
+    } catch (error) {
+      this.pendingRegistration = null;
+      logger.error({ error }, `Account creation failed for ${this.socket.id}`);
+      const errorResponse: AuthErrorMessage['payload'] = {
+        reason: 'registration_failed',
+        message: error instanceof Error ? error.message : 'Account creation failed',
+        canRetry: true,
+      };
+      this.socket.emit('auth_error', errorResponse);
+    }
+  }
+
+  private async completeCredentialAuth(account: import('@prisma/client').Account): Promise<void> {
     this.authenticated = true;
-    this.accountId = 'mock-account-id';
+    this.accountId = account.id;
+    this.maxCharacters = 5;
+
+    // Update last login time
+    await AccountService.updateLastLogin(account.id);
+
+    // Get character list
+    const characters = await CharacterService.findByAccountId(account.id);
+    const characterSummaries = await Promise.all(
+      characters.map(char => this.buildCharacterInfo(char))
+    );
+
+    // TODO: Generate real JWT token when we add token auth
+    const token = `session-${account.id}-${Date.now()}`;
 
     const response: AuthSuccessMessage['payload'] = {
-      accountId: this.accountId,
-      token: 'mock-jwt-token',
-      characters: [
-        {
-          id: 'char-1',
-          name: 'Test Character',
-          level: 1,
-          lastPlayed: Date.now() - 86400000,
-          location: 'The Crossroads',
-        },
-      ],
-      canCreateCharacter: true,
-      maxCharacters: 5,
+      accountId: account.id,
+      token,
+      characters: characterSummaries,
+      canCreateCharacter: characters.length < this.maxCharacters,
+      maxCharacters: this.maxCharacters,
     };
 
     this.socket.emit('auth_success', response);
-    logger.info(`Credentials authenticated: ${this.socket.id} for account ${this.accountId}`);
+    logger.info(`Credentials authenticated: ${this.socket.id} for account ${account.username} (${account.id})`);
   }
 
   private async authenticateToken(_token: string): Promise<void> {
@@ -448,6 +635,7 @@ export class GatewayClientSession {
     this.airlockSessionId = sessionId;
     this.airlockId = airlockId;
     this.maxConcurrentInhabits = maxConcurrent;
+    this.maxCharacters = 0;
     this.authenticated = true;
 
     const response: AuthSuccessMessage['payload'] = {
@@ -455,7 +643,7 @@ export class GatewayClientSession {
       token: 'airlock-session',
       characters: [],
       canCreateCharacter: false,
-      maxCharacters: 0,
+      maxCharacters: this.maxCharacters,
       airlockSessionId: sessionId,
       expiresAt,
       canInhabit: true,
@@ -487,27 +675,207 @@ export class GatewayClientSession {
   }
 
   private async handleCharacterCreate(data: CharacterCreateMessage['payload']): Promise<void> {
-    logger.info(`Character create for ${this.socket.id}: ${data.name}`);
+    logger.info(`Character create request for ${this.socket.id}: ${data.name}`);
 
     if (!this.accountId) {
       this.sendError('NOT_AUTHENTICATED', 'Must be authenticated to create character');
       return;
     }
 
-    const starterZoneId = 'USA_NY_Stephentown';
-    const character = await CharacterService.createCharacter({
-      accountId: this.accountId,
-      name: data.name,
-      zoneId: starterZoneId,
-      positionX: 100,
-      positionY: 0,
-      positionZ: 100,
+    const name = (data.name || '').trim();
+    if (!name) {
+      this.sendCharacterError('INVALID_NAME', 'Character name is required', 'create');
+      return;
+    }
+
+    if (name.length < 2 || name.length > 24) {
+      this.sendCharacterError('INVALID_NAME', 'Character name must be between 2 and 24 characters', 'create');
+      return;
+    }
+
+    const characters = await CharacterService.findByAccountId(this.accountId);
+    if (this.maxCharacters > 0 && characters.length >= this.maxCharacters) {
+      this.sendCharacterError('LIMIT_REACHED', 'Character limit reached', 'create');
+      return;
+    }
+
+    const existing = await CharacterService.findByName(name);
+    if (existing) {
+      this.sendCharacterError('NAME_TAKEN', 'That name is already taken', 'create');
+      return;
+    }
+
+    // Store pending creation and ask for confirmation
+    this.pendingCharacterCreate = { name, appearance: data.appearance };
+
+    const confirmMessage: CharacterConfirmNameMessage['payload'] = {
+      name,
+      message: `Create character named "${name}"?`,
+    };
+
+    this.socket.emit('character_confirm_name', confirmMessage);
+    logger.info(`Character name confirmation requested for ${this.socket.id}: ${name}`);
+  }
+
+  private async handleCharacterNameConfirmation(data: CharacterNameConfirmedMessage['payload']): Promise<void> {
+    if (!this.pendingCharacterCreate) {
+      this.sendCharacterError('NO_PENDING', 'No pending character creation to confirm', 'create');
+      return;
+    }
+
+    if (data.name !== this.pendingCharacterCreate.name) {
+      this.sendCharacterError('NAME_MISMATCH', 'Name does not match pending character creation', 'create');
+      this.pendingCharacterCreate = null;
+      return;
+    }
+
+    if (!data.confirmed) {
+      // User cancelled
+      this.pendingCharacterCreate = null;
+      this.sendCharacterError('CANCELLED', 'Character creation cancelled', 'create');
+      return;
+    }
+
+    try {
+      // Double-check name is still available (race condition protection)
+      const existing = await CharacterService.findByName(this.pendingCharacterCreate.name);
+      if (existing) {
+        this.pendingCharacterCreate = null;
+        this.sendCharacterError('NAME_TAKEN', 'That name was taken while confirming. Please try a different name.', 'create');
+        return;
+      }
+
+      // Double-check character limit
+      const characters = await CharacterService.findByAccountId(this.accountId!);
+      if (this.maxCharacters > 0 && characters.length >= this.maxCharacters) {
+        this.pendingCharacterCreate = null;
+        this.sendCharacterError('LIMIT_REACHED', 'Character limit reached', 'create');
+        return;
+      }
+
+      // Create the character
+      const cosmetics = this.pendingCharacterCreate.appearance
+        ? { appearance: this.pendingCharacterCreate.appearance }
+        : undefined;
+      const starterZoneId = 'USA_NY_Stephentown';
+      const character = await CharacterService.createCharacter({
+        accountId: this.accountId!,
+        name: this.pendingCharacterCreate.name,
+        zoneId: starterZoneId,
+        positionX: 0,    // Town Hall origin
+        positionY: 870,  // Elevation at Town Hall (~265m)
+        positionZ: 0,
+        cosmetics,
+      });
+
+      this.pendingCharacterCreate = null;
+      this.characterId = character.id;
+      logger.info(`Created character: ${character.name} (ID: ${character.id})`);
+
+      await this.sendCharacterRosterDelta({
+        added: [await this.buildCharacterInfo(character)],
+        ...this.buildRosterLimits(characters.length + 1),
+      });
+
+      await this.enterWorld();
+    } catch (error) {
+      this.pendingCharacterCreate = null;
+      logger.error({ error }, `Character creation failed for ${this.socket.id}`);
+      this.sendCharacterError('CREATE_FAILED', error instanceof Error ? error.message : 'Character creation failed', 'create');
+    }
+  }
+
+  private async handleCharacterDelete(data: CharacterDeleteMessage['payload']): Promise<void> {
+    if (!this.accountId) {
+      this.sendCharacterError('NOT_AUTHENTICATED', 'Must be authenticated to delete character', 'delete');
+      return;
+    }
+
+    if (this.characterId || this.currentZoneId) {
+      this.sendCharacterError('ACTIVE_CHARACTER', 'Cannot delete while a character is active', 'delete');
+      return;
+    }
+
+    const characterId = data.characterId;
+    if (!characterId) {
+      this.sendCharacterError('NOT_FOUND', 'Character id is required', 'delete');
+      return;
+    }
+
+    const character = await CharacterService.findById(characterId);
+    if (!character) {
+      this.sendCharacterError('NOT_FOUND', 'Character not found', 'delete');
+      return;
+    }
+
+    if (character.accountId !== this.accountId) {
+      this.sendCharacterError('NOT_OWNED', 'This character does not belong to your account', 'delete');
+      return;
+    }
+
+    await CharacterService.deleteCharacter(characterId);
+
+    const characters = await CharacterService.findByAccountId(this.accountId);
+    await this.sendCharacterRosterDelta({
+      removed: [characterId],
+      ...this.buildRosterLimits(characters.length),
     });
+  }
 
-    this.characterId = character.id;
-    logger.info(`Created character: ${character.name} (ID: ${character.id})`);
+  private async handleCharacterUpdate(data: CharacterUpdateMessage['payload']): Promise<void> {
+    if (!this.accountId) {
+      this.sendCharacterError('NOT_AUTHENTICATED', 'Must be authenticated to update character', 'update');
+      return;
+    }
 
-    await this.enterWorld();
+    if (this.characterId || this.currentZoneId) {
+      this.sendCharacterError('ACTIVE_CHARACTER', 'Cannot update while a character is active', 'update');
+      return;
+    }
+
+    if (!data.characterId) {
+      this.sendCharacterError('NOT_FOUND', 'Character id is required', 'update');
+      return;
+    }
+
+    const character = await CharacterService.findById(data.characterId);
+    if (!character) {
+      this.sendCharacterError('NOT_FOUND', 'Character not found', 'update');
+      return;
+    }
+
+    if (character.accountId !== this.accountId) {
+      this.sendCharacterError('NOT_OWNED', 'This character does not belong to your account', 'update');
+      return;
+    }
+
+    let name: string | undefined = undefined;
+    if (data.name !== undefined) {
+      const trimmed = data.name.trim();
+      if (!trimmed) {
+        this.sendCharacterError('INVALID_NAME', 'Character name is required', 'update');
+        return;
+      }
+
+      const existing = await CharacterService.findByName(trimmed);
+      if (existing && existing.id !== character.id) {
+        this.sendCharacterError('NAME_TAKEN', 'That name is already taken', 'update');
+        return;
+      }
+
+      name = trimmed;
+    }
+
+    const cosmetics = data.cosmetics;
+    if (name === undefined && cosmetics === undefined) {
+      this.sendCharacterError('NO_CHANGES', 'No character updates provided', 'update');
+      return;
+    }
+
+    const updated = await CharacterService.updateCharacter(character.id, { name, cosmetics });
+    await this.sendCharacterRosterDelta({
+      updated: [await this.buildCharacterInfo(updated)],
+    });
   }
 
   private async enterWorld(): Promise<void> {
@@ -833,11 +1201,28 @@ export class GatewayClientSession {
       await this.zoneRegistry.removePlayer(this.characterId);
     }
 
+    // Clean up guest session - delete character and account
+    if (this.isGuestSession && this.accountId) {
+      try {
+        // Delete character first (foreign key constraint)
+        if (this.characterId) {
+          await CharacterService.deleteCharacter(this.characterId);
+          logger.info(`Guest character deleted: ${this.characterId}`);
+        }
+        // Delete the guest account
+        await AccountService.deleteAccount(this.accountId);
+        logger.info(`Guest account deleted: ${this.accountId}`);
+      } catch (error) {
+        logger.error({ error }, `Failed to clean up guest session: ${this.accountId}`);
+      }
+    }
+
     this.authenticated = false;
     this.characterId = null;
     this.accountId = null;
     this.currentZoneId = null;
     this.clientInfo = null;
+    this.isGuestSession = false;
   }
 
   private async releaseInhabit(inhabitId: string, reason: string, notifyClient: boolean): Promise<void> {
@@ -959,5 +1344,55 @@ export class GatewayClientSession {
       minor: parts[1],
       patch: parts[2] ?? 0,
     };
+  }
+
+  private buildRosterLimits(characterCount: number): Pick<CharacterListMessage['payload'], 'maxCharacters' | 'emptySlots' | 'canCreateCharacter'> {
+    const maxCharacters = this.maxCharacters;
+    const emptySlots = Math.max(0, maxCharacters - characterCount);
+    const canCreateCharacter = maxCharacters > 0 && emptySlots > 0;
+    return { maxCharacters, emptySlots, canCreateCharacter };
+  }
+
+  private async buildCharacterInfo(character: Character): Promise<CharacterListMessage['payload']['characters'][number]> {
+    const zone = await ZoneService.findById(character.zoneId);
+    const cosmetics = this.extractCosmetics(character);
+    return {
+      id: character.id,
+      name: character.name,
+      level: character.level,
+      lastPlayed: character.lastSeenAt.getTime(),
+      location: zone?.name ?? 'Unknown',
+      ...(cosmetics && { cosmetics }),
+    };
+  }
+
+  private async sendCharacterList(): Promise<void> {
+    if (!this.accountId) return;
+    const characters = await CharacterService.findByAccountId(this.accountId);
+    const list: CharacterListMessage['payload'] = {
+      characters: await Promise.all(characters.map(char => this.buildCharacterInfo(char))),
+      ...this.buildRosterLimits(characters.length),
+    };
+    this.socket.emit('character_list', list);
+  }
+
+  private async sendCharacterRosterDelta(payload: CharacterRosterDeltaMessage['payload']): Promise<void> {
+    this.socket.emit('character_roster_delta', payload);
+  }
+
+  private sendCharacterError(code: string, message: string, action: CharacterErrorMessage['payload']['action']): void {
+    this.socket.emit('character_error', { code, message, action });
+  }
+
+  private extractCosmetics(character: Character): Record<string, unknown> | null {
+    const data = character.supernaturalData;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return null;
+    }
+    const cosmetics = (data as Record<string, unknown>).cosmetics;
+    if (!cosmetics || typeof cosmetics !== 'object' || Array.isArray(cosmetics)) {
+      return null;
+    }
+    return cosmetics as Record<string, unknown>;
   }
 }

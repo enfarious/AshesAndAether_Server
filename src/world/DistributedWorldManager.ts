@@ -19,6 +19,13 @@ import { WildlifeManager, type BiomeType } from '@/wildlife';
 import { PartyService } from '@/party/PartyService';
 import { buildDamageProfiles, getPrimaryDamageType, getPrimaryPhysicalType, getWeaponDefinition } from '@/items/WeaponData';
 import { buildQualityBiasMultipliers, type QualityBiasMultipliers } from '@/items/ArmorData';
+import {
+  CorruptionSystem,
+  getCorruptionConfig,
+  getCorruptionBenefits,
+  type CorruptionState,
+  type ZoneCorruptionData,
+} from '@/corruption';
 
 const FEET_TO_METERS = 0.3048;
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
@@ -53,6 +60,10 @@ export class DistributedWorldManager {
   private partyResourceCache: Map<string, { currentStamina: number; maxStamina: number; currentMana: number; maxMana: number }> = new Map();
   private lastPartyStatusBroadcastAt: number = 0;
 
+  // Corruption system
+  private corruptionSystem: CorruptionSystem;
+  private zoneCorruptionTags: Map<string, string> = new Map(); // zoneId -> corruptionTag
+
   // Command system
   private commandRegistry: CommandRegistry;
   private commandParser: CommandParser;
@@ -74,6 +85,19 @@ export class DistributedWorldManager {
     // Set up movement completion callback
     this.movementSystem.setMovementCompleteCallback(
       (characterId, reason, finalPosition) => this.onMovementComplete(characterId, reason, finalPosition)
+    );
+
+    // Initialize corruption system
+    this.corruptionSystem = new CorruptionSystem();
+    this.corruptionSystem.setBroadcastCallback(
+      (characterId, corruption, state, previousState, delta) =>
+        this.broadcastCorruptionUpdate(characterId, corruption, state, previousState, delta)
+    );
+    this.corruptionSystem.setCommunityCheckCallback(
+      (characterId, zoneId) => this.isCharacterInCommunity(characterId, zoneId)
+    );
+    this.corruptionSystem.setPartySizeCallback(
+      (characterId) => this.getCharacterPartySize(characterId)
     );
 
     // Initialize command system
@@ -108,6 +132,9 @@ export class DistributedWorldManager {
       const zoneManager = new ZoneManager(zone);
       await zoneManager.initialize();
       this.zones.set(zone.id, zoneManager);
+
+      // Cache zone corruption tag
+      this.zoneCorruptionTags.set(zone.id, (zone as any).corruptionTag || 'WILDS');
 
       // Register with movement system for entity lookups
       this.movementSystem.registerZoneManager(zone.id, zoneManager);
@@ -313,6 +340,9 @@ export class DistributedWorldManager {
     this.proximityRosterHashes.delete(characterId);
     this.previousRosters.delete(characterId);
     this.attackSpeedBonusCache.delete(characterId);
+
+    // Clean up corruption tracking
+    this.corruptionSystem.removeCharacter(characterId);
     this.partyResourceCache.delete(characterId);
 
     // Remove from registry
@@ -3130,6 +3160,9 @@ export class DistributedWorldManager {
       void this.broadcastPartyStatus();
       this.lastPartyStatusBroadcastAt = now;
     }
+
+    // Update corruption system (manages its own tick interval internally)
+    this.corruptionSystem.update(this.getZoneCorruptionData());
   }
 
   /**
@@ -3459,11 +3492,192 @@ export class DistributedWorldManager {
     };
   }
 
+  // ========== Corruption System Helpers ==========
+
+  /**
+   * Get zone corruption data for all managed zones
+   */
+  private getZoneCorruptionData(): ZoneCorruptionData[] {
+    const data: ZoneCorruptionData[] = [];
+
+    for (const [zoneId, zoneManager] of this.zones.entries()) {
+      const corruptionTag = this.zoneCorruptionTags.get(zoneId) || 'WILDS';
+      const characterIds: string[] = [];
+
+      // Get all player character IDs in this zone
+      for (const [charId, charZoneId] of this.characterToZone.entries()) {
+        if (charZoneId === zoneId) {
+          characterIds.push(charId);
+        }
+      }
+
+      if (characterIds.length > 0) {
+        data.push({
+          zoneId,
+          corruptionTag,
+          characterIds,
+        });
+      }
+    }
+
+    return data;
+  }
+
+  /**
+   * Check if a character is currently "in community" for corruption purposes
+   * A character is in community if they are near other players (within radius, min count)
+   */
+  private isCharacterInCommunity(characterId: string, zoneId: string): boolean {
+    const config = getCorruptionConfig();
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return false;
+
+    const character = zoneManager.getEntity(characterId);
+    if (!character) return false;
+
+    const radiusMeters = config.community_detection.nearby_player_radius_meters;
+    const minCount = config.community_detection.nearby_player_min_count;
+
+    // Get nearby players
+    const nearbyPlayers = zoneManager.getNearbyEntities(
+      character.position,
+      radiusMeters / FEET_TO_METERS, // Convert to feet for internal spatial system
+      'player'
+    );
+
+    // Exclude self from count
+    const otherPlayers = nearbyPlayers.filter(e => e.id !== characterId);
+
+    return otherPlayers.length >= minCount;
+  }
+
+  /**
+   * Get party size for a character (for corruption field reduction)
+   * Returns 1 for solo players, up to 5 for full party
+   */
+  private async getCharacterPartySize(characterId: string): Promise<number> {
+    try {
+      const partyId = await this.partyService.getPartyIdForMember(characterId);
+      if (!partyId) {
+        return 1; // Solo player
+      }
+
+      const partyInfo = await this.partyService.getPartyInfo(partyId);
+      if (!partyInfo) {
+        return 1;
+      }
+
+      return partyInfo.members.length;
+    } catch (error) {
+      // Default to solo on error
+      return 1;
+    }
+  }
+
+  /**
+   * Broadcast corruption update to a specific character
+   */
+  private async broadcastCorruptionUpdate(
+    characterId: string,
+    corruption: number,
+    state: CorruptionState,
+    previousState: CorruptionState | null,
+    delta: number
+  ): Promise<void> {
+    const zoneId = this.characterToZone.get(characterId);
+    if (!zoneId) return;
+
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const socketId = zoneManager.getSocketIdForCharacter(characterId);
+    if (!socketId) return;
+
+    const message: any = {
+      type: 'corruption_update',
+      payload: {
+        corruption,
+        state,
+        delta,
+        timestamp: Date.now(),
+      },
+    };
+
+    // Include previous state only on state change
+    if (previousState !== null) {
+      message.payload.previousState = previousState;
+      message.payload.reason = `State changed from ${previousState} to ${state}`;
+
+      // Also send updated benefits on state change
+      const benefits = getCorruptionBenefits(state);
+      if (benefits) {
+        message.payload.benefits = {
+          cacheDetectionBonus: benefits.cache_detection_bonus_pct,
+          hazardResistBonus: benefits.hazard_resist_bonus_pct,
+          deadSystemInterface: benefits.dead_system_interface,
+        };
+      }
+    }
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'corruption_update',
+        data: message.payload,
+      },
+      timestamp: Date.now(),
+    });
+
+    // Log state changes
+    if (previousState !== null) {
+      logger.info(
+        { characterId, previousState, newState: state, corruption },
+        'Character corruption state changed'
+      );
+    }
+  }
+
+  /**
+   * Apply a forbidden action corruption spike to a character
+   * Call this from game logic when a forbidden action occurs
+   */
+  async applyForbiddenCorruption(
+    characterId: string,
+    eventType: string,
+    reason?: string
+  ): Promise<void> {
+    await this.corruptionSystem.applyForbiddenAction(characterId, eventType, reason);
+  }
+
+  /**
+   * Add contribution points to a character (from community actions)
+   */
+  async addCharacterContribution(
+    characterId: string,
+    points: number,
+    source: string
+  ): Promise<void> {
+    await this.corruptionSystem.addContribution(characterId, points, source);
+  }
+
+  /**
+   * Get corruption system reference for external access
+   */
+  getCorruptionSystem(): CorruptionSystem {
+    return this.corruptionSystem;
+  }
+
   /**
    * Cleanup on shutdown
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down distributed world manager');
+
+    // Clear corruption system
+    this.corruptionSystem.clear();
 
     // Clear all active movements (persists final positions)
     this.movementSystem.clearAll();
@@ -3483,5 +3697,6 @@ export class DistributedWorldManager {
     this.characterToZone.clear();
     this.companionToZone.clear();
     this.wildlifeManagers.clear();
+    this.zoneCorruptionTags.clear();
   }
 }
