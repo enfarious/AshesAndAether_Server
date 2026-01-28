@@ -38,6 +38,27 @@ src/
 └── utils/          # Shared utilities
 ```
 
+## Documentation
+
+### For Client Developers
+
+- **[CLIENT_PROTOCOL_REFERENCE.md](docs/CLIENT_PROTOCOL_REFERENCE.md)** ⭐ **START HERE** - Canonical protocol reference (chat, commands, movement, proximity)
+- [PROTOCOL.md](docs/PROTOCOL.md) - Detailed protocol specification
+- [SLASH_COMMAND_SYSTEM.md](docs/SLASH_COMMAND_SYSTEM.md) - Command system design
+
+### For Server Developers
+
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - System architecture overview
+- [DISTRIBUTED.md](docs/DISTRIBUTED.md) - Distributed server implementation
+- [COMBAT_SYSTEM.md](docs/COMBAT_SYSTEM.md) - Active time combat mechanics
+- [NPC_AI.md](docs/NPC_AI.md) - NPC behavior and AI systems
+- [NPC_MEMORY_SYSTEM.md](docs/NPC_MEMORY_SYSTEM.md) - NPC memory and context
+
+### Integration Guides
+
+- [AIRLOCK_INTEGRATION_GUIDE.md](docs/AIRLOCK_INTEGRATION_GUIDE.md) - External AI integration
+- [COMMUNICATION_SYSTEM.md](docs/COMMUNICATION_SYSTEM.md) - Range-based chat system
+
 ## Getting Started
 
 ### Prerequisites

@@ -4,6 +4,8 @@
 
 The communication system provides range-based interaction with nearby entities (players, NPCs, companions). All communication types share the same range mechanics across text, 2D, 3D, VR, and Discord-integrated clients.
 
+**Protocol Note**: The server uses the `chat` event for both inbound (client → server) and outbound (server → client) chat messages. Earlier documentation references to `communication` event are outdated.
+
 ## Communication Ranges
 
 ### Say - 20 feet
@@ -38,92 +40,75 @@ The communication system provides range-based interaction with nearby entities (
 
 ## Message Format
 
+### Client → Server (Inbound)
+
 ```typescript
-interface CommunicationMessage {
-  type: 'say' | 'shout' | 'emote' | 'cfh';
-  content: string;
-  timestamp: number;
+// Event: 'chat'
+interface ChatMessagePayload {
+  channel: 'say' | 'shout' | 'emote' | 'cfh';
+  message: string;
 }
 
-// Server sends to client
-interface CommunicationReceived {
-  type: 'say' | 'shout' | 'emote' | 'cfh';
-  senderId: string;
-  senderName: string;
-  senderType: 'player' | 'npc' | 'companion';
-  content: string;
-  distance: number;  // Actual distance from receiver
-  timestamp: number;
+// Example
+socket.emit('chat', {
+  channel: 'say',
+  message: 'Hello everyone!'
+});
+```
+
+**Note**: Messages starting with `/` are automatically routed to the command system.
+
+### Server → Client (Outbound)
+
+```typescript
+// Event: 'chat'
+interface ChatReceivedPayload {
+  channel: 'say' | 'shout' | 'emote' | 'cfh';
+  sender: string;      // Character name
+  senderId: string;    // Character ID
+  message: string;     // Formatted message content
+  timestamp: number;   // Unix timestamp
 }
+
+// Example received
+socket.on('chat', (data) => {
+  // data = {
+  //   channel: 'say',
+  //   sender: 'Aria',
+  //   senderId: 'char_123',
+  //   message: 'Hello everyone!',
+  //   timestamp: 1706400000000
+  // }
+});
 ```
 
 ## Nearby Entity List
 
-Before sending communication (especially for LLMs), clients can request a list of entities within communication range. This prevents talking to empty rooms and provides context for age-appropriate interaction.
+To request an updated proximity roster, use:
 
-### Request Format (Socket.io)
 ```typescript
-// Client → Gateway
-socket.emit('get_proximity', {
-  entityId: string,      // Your character/NPC ID
-  radius?: number        // Optional, defaults to proximity radius (50)
-});
-
-// Legacy format (still supported)
-interface NearbyEntitiesRequest {
-  type: 'get_nearby';
-  maxDistance?: number;  // Optional, defaults to 250 (CFH range)
-}
+// Request proximity roster refresh
+socket.emit('proximity_refresh');
 ```
 
-### Response Format (Socket.io)
+**Important**: The server sends proximity updates via `proximity_roster_delta` events automatically as entities move. The initial roster after entering a zone is built from delta updates starting from an empty state. Clients should maintain their own roster by applying deltas.
+
+Proximity delta structure:
+
 ```typescript
-// Gateway → Client
-socket.on('proximity_data', (data) => {
-  // {
-  //   entityId: 'char-123',
-  //   nearby: [
-  //     {id: 'char-456', name: 'Kael', type: 'character', distance: 20},
-  //     {id: 'npc-789', name: 'Merchant', type: 'companion', distance: 30}
-  //   ],
-  //   timestamp: 1705769600000
-  // }
+socket.on('proximity_roster_delta', (data) => {
+  // data.payload contains:
+  // - added: Entity[]    // New entities in range
+  // - removed: string[]  // Entity IDs that left range
+  // - updated: Entity[]  // Entities with changed bearing/range
 });
-
-// Legacy response format
-interface NearbyEntitiesResponse {
-  timestamp: number;
-  entities: {
-    say: EntityInfo[];      // Within 20 feet
-    shout: EntityInfo[];    // Within 150 feet (includes say)
-    cfh: EntityInfo[];      // Within 250 feet (includes all)
-  };
-}
-
-interface EntityInfo {
-  id: string;
-  name: string;
-  type: 'player' | 'npc' | 'companion';
-  distance: number;  // Actual distance in feet
-
-  // Metadata for context (players only)
-  contentAccessLevel?: 'T' | 'M' | 'AO';  // What content they can access
-  accountAge?: 'minor' | 'adult';         // Simplified age bracket
-
-  // For LLM/roleplay context
-  appearance?: string;
-  currentAction?: string;  // "standing", "sitting", "fighting", etc.
-
-  // Interaction flags
-  interactive: boolean;
-  inCombat: boolean;
-  afk: boolean;
-}
 ```
+
+**Note**: There is no full `proximity_roster` event in the distributed server path. Clients must build their roster by applying delta updates starting from an empty state when entering a zone.
 
 ### Privacy & Safety Notes
 
-**What's Exposed:**
+**What's Exposed via proximity roster:**
 - Content access level (T/M/AO) - for age-appropriate interaction
 - Account age bracket (minor/adult) - never exact age
 - Current visible state (appearance, action)
@@ -196,37 +181,44 @@ All communication types work identically in Discord:
 
 ### Text Client
 ```javascript
-// Display with range indicator
-socket.on('communication', (data) => {
-  const rangeTag = data.type.toUpperCase();
-  const distanceText = `(${Math.floor(data.distance)}ft)`;
+// Listen for incoming chat messages
+socket.on('chat', (data) => {
+  const channelTag = data.channel.toUpperCase();
 
-  if (data.type === 'emote') {
-    console.log(`[${rangeTag}] ${data.senderName} ${data.content}`);
+  if (data.channel === 'emote') {
+    console.log(`[${channelTag}] ${data.sender} ${data.message}`);
   } else {
-    console.log(`[${rangeTag}] ${data.senderName} ${distanceText}: "${data.content}"`);
+    console.log(`[${channelTag}] ${data.sender}: "${data.message}"`);
   }
 });
 
-// Send communication
+// Send chat message
 function say(message) {
-  socket.emit('chat', { type: 'say', content: message, timestamp: Date.now() });
+  socket.emit('chat', { channel: 'say', message });
+}
+
+function shout(message) {
+  socket.emit('chat', { channel: 'shout', message });
+}
+
+function emote(action) {
+  socket.emit('chat', { channel: 'emote', message: action });
 }
 ```
 
 ### 2D/3D Client
 ```javascript
 // Visual speech bubbles
-socket.on('communication', (data) => {
+socket.on('chat', (data) => {
   const entity = findEntityById(data.senderId);
 
-  // Different bubble styles by type
+  // Different bubble styles by channel
   const bubbleStyle = {
     say: { color: 'white', size: 'small', duration: 3000 },
     shout: { color: 'yellow', size: 'large', duration: 5000 },
     emote: { color: 'gray', size: 'medium', duration: 4000, italic: true },
     cfh: { color: 'red', size: 'large', duration: 7000, flash: true }
-  }[data.type];
+  }[data.channel];
 
   showSpeechBubble(entity, data.content, bubbleStyle);
 

@@ -15,12 +15,15 @@ import { logger } from '@/utils/logger';
  * Job types for tile building pipeline
  */
 export enum TileBuildJobType {
+  // Truth layer jobs
   ELEVATION_FETCH = 'ELEVATION_FETCH',
   WATER_FETCH = 'WATER_FETCH',
   POPULATION_FETCH = 'POPULATION_FETCH',
   BIOME_FETCH = 'BIOME_FETCH',
+  // Game layer jobs
   RUIN_GEN = 'RUIN_GEN',
   SPAWN_GEN = 'SPAWN_GEN',
+  POI_PLACEMENT = 'POI_PLACEMENT',
   NAV_BAKE = 'NAV_BAKE',
 }
 
@@ -39,13 +42,22 @@ export enum TileBuildJobStatus {
  */
 export interface TileData {
   state?: TileState;
+  // Truth layer hashes
   elevationHash?: string | null;
   waterHash?: string | null;
   populationHash?: string | null;
   biomeHash?: string | null;
+  // Game layer hashes
+  ruinLayoutHash?: string | null;
+  spawnTableHash?: string | null;
+  poiHash?: string | null;
+  navmeshHash?: string | null;
+  // Game layer versions (for invalidation tracking)
   ruinLayoutVersion?: number;
   spawnTableVersion?: number;
+  poiVersion?: number;
   navmeshVersion?: number;
+  // Scores from population pipeline
   ruinScore?: number;
   damageScore?: number;
   corruptionScore?: number;

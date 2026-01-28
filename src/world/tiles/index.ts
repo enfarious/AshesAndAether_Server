@@ -82,3 +82,6 @@ export {
   TileBuildJobStatus,
   type TileData,
 } from './TileService';
+
+// Pipelines (re-export from pipelines module)
+export * from './pipelines';

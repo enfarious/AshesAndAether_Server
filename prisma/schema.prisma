@@ -561,9 +561,14 @@ model WorldTile {
   populationHash  String?
   biomeHash       String?
 
-  // Game layer versions (incremented when regenerated)
+  // Game layer hashes and versions
+  ruinLayoutHash    String?
   ruinLayoutVersion Int @default(0)
+  spawnTableHash    String?
   spawnTableVersion Int @default(0)
+  poiHash           String?
+  poiVersion        Int @default(0)
+  navmeshHash       String?
   navmeshVersion    Int @default(0)
 
   // Computed scores from truth layers
@@ -591,7 +596,7 @@ model WorldTile {
 model TileBuildJob {
   id          String    @id @default(uuid())
   tileId      String // Reference to WorldTile.id
-  jobType     String // ELEVATION_FETCH, WATER_FETCH, POPULATION_FETCH, BIOME_FETCH, RUIN_GEN, SPAWN_GEN, NAV_BAKE
+  jobType     String // ELEVATION_FETCH, WATER_FETCH, POPULATION_FETCH, BIOME_FETCH, RUIN_GEN, SPAWN_GEN, POI_PLACEMENT, NAV_BAKE
   status      String    @default("PENDING") // PENDING, RUNNING, COMPLETED, FAILED
   priority    Int       @default(0) // Higher = more urgent
   attempts    Int       @default(0)
