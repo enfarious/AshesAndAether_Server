@@ -26,6 +26,7 @@ import {
   type CorruptionState,
   type ZoneCorruptionData,
 } from '@/corruption';
+import { MarketBridge } from '@/market/MarketBridge';
 
 const FEET_TO_METERS = 0.3048;
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
@@ -64,6 +65,9 @@ export class DistributedWorldManager {
   private corruptionSystem: CorruptionSystem;
   private zoneCorruptionTags: Map<string, string> = new Map(); // zoneId -> corruptionTag
 
+  // Market system
+  private marketBridge: MarketBridge;
+
   // Command system
   private commandRegistry: CommandRegistry;
   private commandParser: CommandParser;
@@ -89,6 +93,9 @@ export class DistributedWorldManager {
 
     // Initialize corruption system
     this.corruptionSystem = new CorruptionSystem();
+
+    // Initialize market bridge
+    this.marketBridge = new MarketBridge(this.messageBus);
     this.corruptionSystem.setBroadcastCallback(
       (characterId, corruption, state, previousState, delta) =>
         this.broadcastCorruptionUpdate(characterId, corruption, state, previousState, delta)
@@ -196,6 +203,9 @@ export class DistributedWorldManager {
       this.commandParser,
       this.messageBus.getRedisClient()
     );
+
+    // Start market bridge for market commands
+    await this.marketBridge.start();
 
     logger.info(
       {
@@ -757,6 +767,55 @@ export class DistributedWorldManager {
             return response;
           }
           overrideResponse = response;
+          break;
+        }
+        case 'market_order_create': {
+          const response = await this.marketBridge.createSellOrder(event.data as {
+            characterId: string;
+            regionId: string;
+            inventoryItemId: string;
+            quantity: number;
+            pricePerUnit: number;
+            orderScope: 'REGIONAL' | 'WORLD';
+            stallId?: string;
+            worldSlotIndex?: number;
+          });
+          if (!response.success) {
+            return { success: false, error: response.error ?? 'Failed to create order' };
+          }
+          overrideResponse = {
+            success: true,
+            message: `Order created successfully (ID: ${response.orderId?.slice(0, 8)})`,
+          };
+          break;
+        }
+        case 'market_order_fill': {
+          const response = await this.marketBridge.fillOrder(event.data as {
+            buyerId: string;
+            orderId: string;
+            quantity?: number;
+          });
+          if (!response.success) {
+            return { success: false, error: response.error ?? 'Failed to complete purchase' };
+          }
+          overrideResponse = {
+            success: true,
+            message: 'Purchase completed successfully!',
+          };
+          break;
+        }
+        case 'market_order_cancel': {
+          const response = await this.marketBridge.cancelOrder(event.data as {
+            characterId: string;
+            orderId: string;
+          });
+          if (!response.success) {
+            return { success: false, error: response.error ?? 'Failed to cancel order' };
+          }
+          overrideResponse = {
+            success: true,
+            message: 'Order cancelled. Items returned to inventory.',
+          };
           break;
         }
         case 'combat_action': {

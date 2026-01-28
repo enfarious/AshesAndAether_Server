@@ -29,6 +29,7 @@ import { inventoryCommand } from './system/inventory';
 import { moveCommand } from './movement/move';
 import { stopCommand } from './movement/stop';
 import { companionCommand } from './world/companion';
+import { marketCommand } from './market/market';
 
 /**
  * Register all Phase 1 commands
@@ -62,6 +63,9 @@ export function registerAllCommands(registry: CommandRegistry): void {
   // World commands
   registry.register(companionCommand);
 
+  // Market commands
+  registry.register(marketCommand);
+
   // Combat commands
   registry.register(attackCommand);
   registry.register(castCommand);
@@ -84,6 +88,8 @@ export function getAllCommandNames(): string[] {
     'move', 'stop',
     // World
     'companion',
+    // Market
+    'market',
     // Combat
     'attack', 'cast', 'disengage',
   ];

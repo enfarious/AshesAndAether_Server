@@ -77,6 +77,11 @@ model Character {
   factionReputations FactionReputation[]
   questProgress      QuestProgress[]
 
+  // Market system
+  wallet          CharacterWallet?
+  tradeReputation TradeReputation?
+  marketOrders    MarketOrder[]
+
   @@index([accountId])
   @@index([zoneId])
   @@map("characters")
@@ -344,4 +349,263 @@ model CorruptionEvent {
   @@index([eventType])
   @@index([createdAt])
   @@map("corruption_events")
+}
+
+// ============================================================================
+// MARKET SYSTEM
+// ============================================================================
+
+model CharacterWallet {
+  id          String   @id @default(uuid())
+  characterId String   @unique
+  gold        Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  character Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  @@map("character_wallets")
+}
+
+model Region {
+  id             String   @id @default(uuid())
+  name           String   @unique
+  biomeType      String // FOREST, MOUNTAIN, RIVERLANDS, COASTAL, URBAN, etc.
+  mamMultipliers Json     @default("{}") // Material Availability Multipliers: {"WOOD": 2.0, "CLAY": 1.0, "STONE": 0.6}
+  zoneIds        String[] // Zone IDs that belong to this region
+  baseTaxRate    Float    @default(0.05) // 5% base regional tax
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  orders MarketOrder[]
+  stalls MarketStall[]
+
+  @@map("regions")
+}
+
+model MarketStall {
+  id        String   @id @default(uuid())
+  ownerId   String // Character ID who owns the stall
+  regionId  String
+  plotId    String? // Future: links to plot system
+  name      String
+  stallType String   @default("GENERAL") // GENERAL, WEAPONS, ARMOR, MATERIALS, etc.
+  zoneId    String?
+  positionX Float?
+  positionY Float?
+  positionZ Float?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  region Region        @relation(fields: [regionId], references: [id])
+  orders MarketOrder[]
+
+  @@index([ownerId])
+  @@index([regionId])
+  @@map("market_stalls")
+}
+
+model WorldMarketSlot {
+  id          String   @id @default(uuid())
+  characterId String
+  slotIndex   Int // 0, 1, 2 are free; 3+ require unlock
+  unlockCost  Int      @default(0) // Gold paid to unlock this slot
+  unlockedAt  DateTime @default(now())
+
+  @@unique([characterId, slotIndex])
+  @@index([characterId])
+  @@map("world_market_slots")
+}
+
+model MarketOrder {
+  id              String    @id @default(uuid())
+  sellerId        String // Character ID
+  stallId         String? // Optional stall association
+  regionId        String // Region where order is listed
+  orderType       String // SELL or BUY
+  orderScope      String // REGIONAL or WORLD
+  itemTemplateId  String // What's being sold/bought
+  inventoryItemId String? // Specific item instance (for unique/modified items)
+  quantity        Int       @default(1)
+  filledQuantity  Int       @default(0)
+  pricePerUnit    Int
+  listingFee      Int       @default(0)
+  worldSlotIndex  Int? // For world orders: which slot is used
+  corruptionTag   String? // Item corruption state: CLEAN, STAINED, WARPED, POSSESSED
+  flavorText      String? // Corruption flavor: "This blade whispers..."
+  status          String    @default("ACTIVE") // ACTIVE, PENDING_DELIVERY, COMPLETED, CANCELLED, EXPIRED
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime?
+  completedAt     DateTime?
+
+  seller   Character    @relation(fields: [sellerId], references: [id])
+  region   Region       @relation(fields: [regionId], references: [id])
+  stall    MarketStall? @relation(fields: [stallId], references: [id])
+  shipment Shipment?
+
+  @@index([sellerId])
+  @@index([regionId, status])
+  @@index([itemTemplateId])
+  @@index([orderScope, status])
+  @@map("market_orders")
+}
+
+model Shipment {
+  id              String    @id @default(uuid())
+  orderId         String    @unique
+  sellerId        String
+  buyerId         String
+  originRegionId  String
+  destRegionId    String
+  courierType     String    @default("NPC") // NPC, PLAYER, SELLER
+  courierId       String? // Character ID if player courier
+  insuranceTier   String    @default("NONE") // NONE, STANDARD, EXPRESS
+  insuranceCost   Int       @default(0)
+  estimatedEta    DateTime
+  departedAt      DateTime?
+  deliveredAt     DateTime?
+  status          String    @default("PENDING") // PENDING, IN_TRANSIT, DELIVERED, FAILED
+  currentZoneId   String? // For tracking player courier position
+  progressPercent Float     @default(0)
+  createdAt       DateTime  @default(now())
+
+  order    MarketOrder      @relation(fields: [orderId], references: [id])
+  contract CourierContract?
+
+  @@index([courierId])
+  @@index([status])
+  @@map("shipments")
+}
+
+model CourierContract {
+  id               String    @id @default(uuid())
+  shipmentId       String    @unique
+  courierId        String? // Player who accepted the contract
+  fee              Int // Payment for delivery
+  bond             Int // Held until completion (anti-griefing)
+  status           String    @default("OFFERED") // OFFERED, ACCEPTED, COMPLETED, FAILED, EXPIRED
+  acceptDeadline   DateTime
+  deliveryDeadline DateTime
+  acceptedAt       DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime  @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@index([courierId])
+  @@index([status])
+  @@map("courier_contracts")
+}
+
+model TradeReputation {
+  id                  String   @id @default(uuid())
+  characterId         String   @unique
+  salesCompleted      Int      @default(0)
+  salesVolume         Int      @default(0) // Total gold earned from sales
+  purchasesCompleted  Int      @default(0)
+  purchasesVolume     Int      @default(0) // Total gold spent
+  deliveriesCompleted Int      @default(0)
+  deliveriesFailed    Int      @default(0)
+  buyerRating         Float    @default(5.0) // 1-5 stars
+  sellerRating        Float    @default(5.0)
+  courierRating       Float    @default(5.0)
+  trustedTrader       Boolean  @default(false) // Unlocks reduced fees
+  masterCourier       Boolean  @default(false) // Unlocks priority contracts
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  character Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  @@map("trade_reputations")
+}
+
+model MarketTransaction {
+  id              String   @id @default(uuid())
+  transactionType String // ORDER_CREATED, ORDER_FILLED, ORDER_CANCELLED, SHIPMENT_STARTED, SHIPMENT_DELIVERED, SLOT_UNLOCKED
+  orderId         String?
+  shipmentId      String?
+  sellerId        String?
+  buyerId         String?
+  courierId       String?
+  itemTemplateId  String?
+  quantity        Int      @default(0)
+  itemValue       Int      @default(0)
+  feesPaid        Int      @default(0) // Listing + transaction fees
+  taxesPaid       Int      @default(0) // Regional taxes
+  metadata        Json? // Additional context
+  createdAt       DateTime @default(now())
+
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([transactionType])
+  @@index([createdAt])
+  @@map("market_transactions")
+}
+
+// ============================================================================
+// WORLD BUILDING v2 - TILE SYSTEM
+// ============================================================================
+
+model WorldTile {
+  id            String   @id // Format: "z_x_y" (e.g., "14_4823_6127")
+  z             Int // Zoom level
+  x             Int // Tile X coordinate
+  y             Int // Tile Y coordinate
+  state         String   @default("COLD") // COLD, WARM, HOT
+  lastTouchedAt DateTime @default(now())
+
+  // Truth layer hashes (for cache invalidation)
+  elevationHash   String?
+  waterHash       String?
+  populationHash  String?
+  biomeHash       String?
+
+  // Game layer versions (incremented when regenerated)
+  ruinLayoutVersion Int @default(0)
+  spawnTableVersion Int @default(0)
+  navmeshVersion    Int @default(0)
+
+  // Computed scores from truth layers
+  ruinScore       Float @default(0) // 0-1, derived from population density
+  damageScore     Float @default(0) // 0-1, how destroyed/collapsed
+  corruptionScore Float @default(0) // 0-1, supernatural corruption level
+
+  // Manifest hash (for client caching)
+  manifestHash String?
+
+  // Parent macro tile reference (for micro tiles at z=14)
+  parentTileId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  buildJobs TileBuildJob[]
+
+  @@unique([z, x, y])
+  @@index([state])
+  @@index([parentTileId])
+  @@map("world_tiles")
+}
+
+model TileBuildJob {
+  id          String    @id @default(uuid())
+  tileId      String // Reference to WorldTile.id
+  jobType     String // ELEVATION_FETCH, WATER_FETCH, POPULATION_FETCH, BIOME_FETCH, RUIN_GEN, SPAWN_GEN, NAV_BAKE
+  status      String    @default("PENDING") // PENDING, RUNNING, COMPLETED, FAILED
+  priority    Int       @default(0) // Higher = more urgent
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  errorMsg    String?
+  outputHash  String? // Content-addressed hash of output
+  inputHash   String? // Hash of inputs (for cache key)
+  createdAt   DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  tile WorldTile @relation(fields: [tileId], references: [id], onDelete: Cascade)
+
+  @@index([status, priority])
+  @@index([tileId])
+  @@map("tile_build_jobs")
 }
