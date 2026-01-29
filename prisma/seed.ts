@@ -42,8 +42,9 @@ async function main() {
 
   // Create starter zone: Stephentown Town Hall
   console.log('Creating Stephentown Town Hall zone...');
-  const crossroads = await prisma.zone.create({
-    data: {
+  const crossroads = await prisma.zone.upsert({
+    where: { id: 'USA_NY_Stephentown' },
+    create: {
       id: 'USA_NY_Stephentown',
       name: 'Stephentown, NY',
       description:
@@ -57,10 +58,10 @@ async function main() {
       weatherEnabled: true,
       timeOfDayEnabled: true,
       contentRating: 'T', // Teen - public starting area
-      navmeshData: null, // TODO: Add navmesh data
     },
+    update: {},
   });
-  console.log(`Γ£ô Created zone: ${crossroads.name}`);
+  console.log(`✓ Zone ready: ${crossroads.name}`);
 
   // Create a test account
   console.log('Creating test account...');
@@ -237,13 +238,11 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
   const createRat = async (index: number) => {
     const angle = Math.random() * Math.PI * 2;
     const distance = 10 + Math.random() * 15;
-    return prisma.companion.create({
+    return prisma.mob.create({
       data: {
         name: `Rat ${index}`,
         description: 'A scrappy town rat, skittish but bold.',
         tag: `mob.rat.${index}`,
-        personalityType: 'wildlife_rat',
-        memoryData: { background: 'A scavenger outside the town hall.', relationships: [], recentEvents: [] },
         level: 1 + (index % 3),
         stats: {
           strength: 6,
@@ -260,10 +259,10 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
         positionX: townHall.x + Math.cos(angle) * distance,
         positionY: townHall.y,
         positionZ: townHall.z + Math.sin(angle) * distance,
-        llmProvider: 'anthropic',
-        llmModel: 'claude-3-5-sonnet-20241022',
-        systemPrompt: 'You are a rat. You do not speak. Respond ONLY with NONE.',
-        conversationHistory: [],
+        aiType: 'wildlife_rat',
+        aggroRadius: 10,
+        respawnTime: 120,
+        spawnedFromTable: false,
       },
     });
   };
@@ -271,13 +270,11 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
   const rats = await Promise.all([1, 2, 3, 4, 5].map(i => createRat(i)));
   console.log(`✓ Created ${rats.length} rats near the town hall`);
 
-  const rabidDog = await prisma.companion.create({
+  const rabidDog = await prisma.mob.create({
     data: {
       name: 'Rabid Dog',
       description: 'A gaunt dog with a wild stare, pacing near Four Fat Foul.',
       tag: 'mob.rabid_dog',
-      personalityType: 'wildlife_dog',
-      memoryData: { background: 'A dangerous stray near Four Fat Foul.', relationships: [], recentEvents: [] },
       level: 7,
       stats: {
         strength: 12,
@@ -294,20 +291,18 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
       positionX: fourFatFoulPos.x,
       positionY: fourFatFoulPos.y,
       positionZ: fourFatFoulPos.z,
-      llmProvider: 'anthropic',
-      llmModel: 'claude-3-5-sonnet-20241022',
-      systemPrompt: 'You are a rabid dog. You do not speak. Respond ONLY with NONE.',
-      conversationHistory: [],
+      aiType: 'wildlife_dog',
+      aggroRadius: 20,
+      respawnTime: 180,
+      spawnedFromTable: false,
     },
   });
 
-  const direToad = await prisma.companion.create({
+  const direToad = await prisma.mob.create({
     data: {
       name: 'Dire Toad',
       description: 'A massive toad lurking behind the post office.',
       tag: 'mob.dire_toad',
-      personalityType: 'wildlife_toad',
-      memoryData: { background: 'A toad nesting behind the post office.', relationships: [], recentEvents: [] },
       level: 6,
       stats: {
         strength: 11,
@@ -324,10 +319,10 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
       positionX: postOfficePos.x - 30,
       positionY: postOfficePos.y - 40,
       positionZ: postOfficePos.z,
-      llmProvider: 'anthropic',
-      llmModel: 'claude-3-5-sonnet-20241022',
-      systemPrompt: 'You are a dire toad. You do not speak. Respond ONLY with NONE.',
-      conversationHistory: [],
+      aiType: 'wildlife_toad',
+      aggroRadius: 15,
+      respawnTime: 150,
+      spawnedFromTable: false,
     },
   });
   console.log(`✓ Created mobs: ${rabidDog.name}, ${direToad.name}`);

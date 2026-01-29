@@ -210,6 +210,55 @@ model Companion {
   @@map("companions")
 }
 
+model Mob {
+  id          String  @id @default(uuid())
+  name        String
+  tag         String  @unique
+  description String?
+
+  // Mob template reference (for procedural spawning)
+  templateId String?
+
+  // Combat stats
+  level         Int     @default(1)
+  stats         Json
+  currentHealth Int
+  maxHealth     Int
+  isAlive       Boolean @default(true)
+
+  // Position
+  zoneId    String
+  positionX Float
+  positionY Float
+  positionZ Float
+
+  // AI behavior
+  aiType       String @default("passive") // passive, aggressive, defensive, patrol
+  aggroRadius  Float  @default(10.0)
+  patrolPath   Json? // Array of waypoints for patrol behavior
+  homePosition Json? // Return point after combat
+
+  // Loot
+  lootTableId String?
+
+  // Respawn
+  respawnTime Int       @default(120) // seconds
+  lastDeathAt DateTime?
+
+  // Spawn source
+  spawnedFromTable Boolean @default(false) // true if spawned from SpawnTablePipeline
+  spawnTileId      String? // Which tile spawned this mob
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tag])
+  @@index([zoneId])
+  @@index([templateId])
+  @@index([isAlive])
+  @@map("mobs")
+}
+
 model CompanionMemory {
   id          String    @id @default(uuid())
   companionId String    @unique
@@ -556,20 +605,20 @@ model WorldTile {
   lastTouchedAt DateTime @default(now())
 
   // Truth layer hashes (for cache invalidation)
-  elevationHash   String?
-  waterHash       String?
-  populationHash  String?
-  biomeHash       String?
+  elevationHash  String?
+  waterHash      String?
+  populationHash String?
+  biomeHash      String?
 
   // Game layer hashes and versions
   ruinLayoutHash    String?
-  ruinLayoutVersion Int @default(0)
+  ruinLayoutVersion Int     @default(0)
   spawnTableHash    String?
-  spawnTableVersion Int @default(0)
+  spawnTableVersion Int     @default(0)
   poiHash           String?
-  poiVersion        Int @default(0)
+  poiVersion        Int     @default(0)
   navmeshHash       String?
-  navmeshVersion    Int @default(0)
+  navmeshVersion    Int     @default(0)
 
   // Computed scores from truth layers
   ruinScore       Float @default(0) // 0-1, derived from population density

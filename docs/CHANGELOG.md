@@ -18,6 +18,15 @@ All notable changes and progress will be documented in this file.
 - Edge connection generation for cross-tile pathfinding
 - Deterministic output based on tile coordinates
 
+**Stephentown Area Navigation Ready**:
+- Generated navmesh for 3×3 area of tiles (9 tiles at zoom 9) around Stephentown
+- All spawn locations validated:
+  - Player start (Stephentown Town Hall): Tile 9_151_189, elevation 100ft
+  - 3x NPCs (Old Merchant, Swordsman, Bowman): All in tile 9_151_189, elevations -2 to 2ft
+  - 7x Mobs (5 rats, rabid dog, dire toad): All in tile 9_151_189, elevations -23 to 8ft
+- Created `generate-navmesh.ts` script for batch generation + runner
+- Created `validate-spawns.ts` script for spawn location validation
+
 **Test Coverage**:
 - NavmeshPipeline: 14 tests covering enums, generation, determinism, error handling
 - All tile system tests passing: 110 total (93 existing + 14 navmesh + 3 pipeline tests)

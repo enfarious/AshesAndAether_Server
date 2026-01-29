@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { CharacterService, CompanionService, ZoneService } from '@/database';
+import { CharacterService, CompanionService, MobService, ZoneService } from '@/database';
 import { ZoneManager } from './ZoneManager';
 import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
@@ -2657,27 +2657,27 @@ export class DistributedWorldManager {
     }
   }
 
-  private async scheduleMobRespawn(companionId: string, zoneId: string, maxHealth: number): Promise<void> {
-    if (this.respawnTimers.has(companionId)) return;
+  private async scheduleMobRespawn(mobId: string, zoneId: string, _maxHealth: number): Promise<void> {
+    if (this.respawnTimers.has(mobId)) return;
 
-    const companion = await CompanionService.findById(companionId);
-    if (!companion || !companion.tag?.startsWith('mob.')) return;
+    const mob = await MobService.findById(mobId);
+    if (!mob) return;
 
     const timer = setTimeout(async () => {
       try {
-        await CompanionService.updateStatus(companionId, { currentHealth: maxHealth, isAlive: true });
+        await MobService.respawn(mobId);
         const zoneManager = this.zones.get(zoneId);
         if (zoneManager) {
-          zoneManager.setEntityAlive(companionId, true);
-          zoneManager.setEntityCombatState(companionId, false);
+          zoneManager.setEntityAlive(mobId, true);
+          zoneManager.setEntityCombatState(mobId, false);
           await this.broadcastNearbyUpdate(zoneId);
         }
       } finally {
-        this.respawnTimers.delete(companionId);
+        this.respawnTimers.delete(mobId);
       }
-    }, 120000);
+    }, mob.respawnTime * 1000);
 
-    this.respawnTimers.set(companionId, timer);
+    this.respawnTimers.set(mobId, timer);
   }
 
   private async handleNpcInhabit(message: MessageEnvelope): Promise<void> {

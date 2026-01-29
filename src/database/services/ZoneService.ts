@@ -57,10 +57,19 @@ export class ZoneService {
   }
 
   /**
-   * Get companions in zone
+   * Get companions in zone (NPCs only, not mobs)
    */
   static async getCompanionsInZone(zoneId: string): Promise<Companion[]> {
     return prisma.companion.findMany({
+      where: { zoneId },
+    });
+  }
+
+  /**
+   * Get mobs in zone
+   */
+  static async getMobsInZone(zoneId: string) {
+    return prisma.mob.findMany({
       where: { zoneId },
     });
   }

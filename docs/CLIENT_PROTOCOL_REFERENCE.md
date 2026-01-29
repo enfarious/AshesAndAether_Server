@@ -19,6 +19,7 @@ This document answers common questions about the server protocol and clarifies d
 - **Outbound** (Server → Client): `socket.on('chat', (data) => { ... })`
 
 **Payload Schema (Inbound)**:
+
 ```typescript
 {
   channel: 'say' | 'shout' | 'emote' | 'cfh',
@@ -27,6 +28,7 @@ This document answers common questions about the server protocol and clarifies d
 ```
 
 **Payload Schema (Outbound)**:
+
 ```typescript
 {
   channel: 'say' | 'shout' | 'emote' | 'cfh',
@@ -48,6 +50,7 @@ This document answers common questions about the server protocol and clarifies d
 **Answer: Delta-only (`proximity_roster_delta`) is the official contract for distributed servers.**
 
 **Implementation**:
+
 - When a player enters a zone, they start with an **empty roster**
 - Server sends `proximity_roster_delta` events with:
   - `added`: New entities that entered range
@@ -79,6 +82,7 @@ socket.on('proximity_roster_delta', (data) => {
 ```
 
 **Why Delta-Only?**
+
 - More efficient for real-time spatial updates
 - Reduces bandwidth (only send changes)
 - Scales better with many entities
@@ -92,6 +96,7 @@ socket.on('proximity_roster_delta', (data) => {
 **Answer: `proximity_refresh` is the official event name.**
 
 **Usage**:
+
 ```javascript
 // Request a full roster recalculation
 socket.emit('proximity_refresh');
@@ -101,6 +106,7 @@ socket.emit('proximity_refresh');
 The server will send a `proximity_roster_delta` with the current state (may have `added` entries representing the full current roster).
 
 **Documentation Status**:
+
 - ✅ `proximity_refresh` - Correct, use this
 - ❌ `get_nearby` - Outdated, remove from docs
 - ❌ `get_proximity` - Outdated, remove from docs
@@ -140,6 +146,7 @@ function handleUserInput(text) {
 ```
 
 **Server Behavior**:
+
 - `chat` event with message starting with `/` → automatically routed to command system
 - `command` event → directly processed by command system
 
@@ -180,11 +187,13 @@ function stopPlayer() {
 ```
 
 **Why `move` events?**
+
 - Lower latency (no command parsing)
 - Designed for real-time input (joysticks, WASD)
 - More efficient for high-frequency updates
 
 **When to use commands?**
+
 - Text-only clients without continuous input
 - Scripting/macros
 - Accessibility (e.g., voice commands → text → slash command)
@@ -231,6 +240,7 @@ socket.on('command_response', (data) => {
 ```
 
 **Guarantees**:
+
 - `success` and `command` fields are always present
 - `message` OR `error` will be present (never both)
 - `data` is optional and command-specific

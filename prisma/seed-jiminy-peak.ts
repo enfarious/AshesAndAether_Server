@@ -202,13 +202,11 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
   for (let i = 1; i <= 4; i++) {
     const angle = (Math.PI * 2 * i) / 4 + Math.random() * 0.5;
     const distance = 200 + Math.random() * 300;
-    await prisma.companion.create({
+    await prisma.mob.create({
       data: {
         name: `Snow Hare`,
         description: 'A large white hare with too-knowing eyes. Its fur seems to shimmer.',
         tag: `mob.jiminy.hare.${i}`,
-        personalityType: 'wildlife_hare',
-        memoryData: { background: 'Wildlife adapted to the corrupted mountain.', relationships: [], recentEvents: [] },
         level: 1 + (i % 2),
         stats: {
           strength: 4,
@@ -225,15 +223,10 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
         positionX: jiminyPos.x + Math.cos(angle) * distance,
         positionY: baseElevation + Math.random() * 100,
         positionZ: jiminyPos.y + Math.sin(angle) * distance,
-        llmProvider: 'anthropic',
-        llmModel: 'claude-3-5-sonnet-20241022',
-        systemPrompt: 'You are a snow hare. You do not speak. Respond ONLY with NONE.',
-        conversationHistory: [],
-        traits: [],
-        goals: [],
-        relationships: {},
-        abilityIds: [],
-        questIds: [],
+        aiType: 'wildlife_hare',
+        aggroRadius: 12,
+        respawnTime: 120,
+        spawnedFromTable: false,
       },
     });
   }
@@ -243,13 +236,11 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
   for (let i = 1; i <= 3; i++) {
     const angle = Math.random() * Math.PI * 2;
     const distance = 400 + Math.random() * 400;
-    await prisma.companion.create({
+    await prisma.mob.create({
       data: {
         name: `Spiral Fox`,
         description: 'A fox with fur that seems to swirl in impossible patterns. Its movements are jerky, unnatural.',
         tag: `mob.jiminy.fox.${i}`,
-        personalityType: 'corrupted_predator',
-        memoryData: { background: 'A predator twisted by the mountain\'s corruption.', relationships: [], recentEvents: [] },
         level: 3 + (i % 2),
         stats: {
           strength: 8,
@@ -266,15 +257,10 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
         positionX: jiminyPos.x + Math.cos(angle) * distance,
         positionY: baseElevation + 200 + Math.random() * 200,
         positionZ: jiminyPos.y + Math.sin(angle) * distance,
-        llmProvider: 'anthropic',
-        llmModel: 'claude-3-5-sonnet-20241022',
-        systemPrompt: 'You are a corrupted fox. You do not speak. Respond ONLY with NONE.',
-        conversationHistory: [],
-        traits: [],
-        goals: [],
-        relationships: {},
-        abilityIds: [],
-        questIds: [],
+        aiType: 'corrupted_predator',
+        aggroRadius: 15,
+        respawnTime: 120,
+        spawnedFromTable: false,
       },
     });
   }
@@ -284,13 +270,11 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
   for (let i = 1; i <= 2; i++) {
     const angle = Math.random() * Math.PI * 2;
     const distance = 800 + Math.random() * 400;
-    await prisma.companion.create({
+    await prisma.mob.create({
       data: {
         name: `Twisted Elk`,
         description: 'A massive elk with antlers that branch in fractal patterns. Frost clings to its hide even in summer.',
         tag: `mob.jiminy.elk.${i}`,
-        personalityType: 'corrupted_beast',
-        memoryData: { background: 'An apex herbivore warped by deep corruption.', relationships: [], recentEvents: [] },
         level: 5 + (i % 2),
         stats: {
           strength: 14,
@@ -307,28 +291,21 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
         positionX: jiminyPos.x + Math.cos(angle) * distance,
         positionY: baseElevation + 500 + Math.random() * 300,
         positionZ: jiminyPos.y + Math.sin(angle) * distance,
-        llmProvider: 'anthropic',
-        llmModel: 'claude-3-5-sonnet-20241022',
-        systemPrompt: 'You are a corrupted elk. You do not speak. Respond ONLY with NONE.',
-        conversationHistory: [],
-        traits: [],
-        goals: [],
-        relationships: {},
-        abilityIds: [],
-        questIds: [],
+        aiType: 'corrupted_beast',
+        aggroRadius: 18,
+        respawnTime: 150,
+        spawnedFromTable: false,
       },
     });
   }
   console.log('✓ Created 2 Twisted Elk (level 5-6)');
 
   // Cave Guardian - hints at the Deep Roads entrance
-  const caveGuardian = await prisma.companion.create({
+  const caveGuardian = await prisma.mob.create({
     data: {
       name: 'Something in the Snow',
       description: 'A shape half-buried in snow near what might be a cave entrance. It watches you. It has always watched.',
       tag: 'mob.jiminy.cave_guardian',
-      personalityType: 'dungeon_guardian',
-      memoryData: { background: 'Guardian of the Deep Roads entrance.', relationships: [], recentEvents: [] },
       level: 10,
       stats: {
         strength: 16,
@@ -345,15 +322,10 @@ Example responses: "*points up the mountain*", "Not alone.", "Dawn is safer.", "
       positionX: jiminyPos.x + 1000,
       positionY: baseElevation + 800, // Near summit
       positionZ: jiminyPos.y + 800,
-      llmProvider: 'anthropic',
-      llmModel: 'claude-3-5-sonnet-20241022',
-      systemPrompt: 'You are the guardian of the Deep Roads entrance. You do not speak. Respond ONLY with NONE.',
-      conversationHistory: [],
-      traits: [],
-      goals: ['guard_entrance'],
-      relationships: {},
-      abilityIds: [],
-      questIds: [],
+      aiType: 'dungeon_guardian',
+      aggroRadius: 25,
+      respawnTime: 300,
+      spawnedFromTable: false,
     },
   });
   console.log(`✓ Created: ${caveGuardian.name} (level 10 - Deep Roads guardian)`);
