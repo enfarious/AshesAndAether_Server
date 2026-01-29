@@ -2,7 +2,7 @@
  * Tests for TileState machine
  */
 
-import { describe, it, expect } from 'vitest';
+// Jest globals (describe, it, expect) available automatically
 import {
   TileState,
   TransitionReason,

@@ -8,7 +8,6 @@
  */
 
 import { type TileAddress, tileAddressToId } from '../TileAddress';
-import { tileToLatLonBounds, getTileCenter } from '../TileUtils';
 import { TileBuildJobType, TileService } from '../TileService';
 import { BaseTilePipeline, type PipelineResult } from './TilePipeline';
 import { SettlementType, PopulationPipeline, type TilePopulationData } from './PopulationPipeline';

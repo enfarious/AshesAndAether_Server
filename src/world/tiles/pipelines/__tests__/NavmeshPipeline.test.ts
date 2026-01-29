@@ -8,9 +8,9 @@ import {
   NavmeshPipeline,
   WalkabilityFlag,
   MovementCost,
-} from './NavmeshPipeline';
-import { TileBuildJobType } from '../TileService';
-import { createTileAddress } from '../TileAddress';
+} from '../NavmeshPipeline';
+import { TileBuildJobType } from '../../TileService';
+import { createTileAddress } from '../../TileAddress';
 
 // Mock logger
 jest.mock('@/utils/logger', () => ({
@@ -37,7 +37,10 @@ describe('NavmeshPipeline', () => {
     it('should have valid config', () => {
       const config = (pipeline as any).config;
       expect(config).toBeDefined();
-      expect(config.gridSize).toBe(64);
+      expect(config.resolution).toBe(64);
+      expect(config.maxWalkableSlope).toBeDefined();
+      expect(config.blockWater).toBeDefined();
+      expect(config.corruptionBlockThreshold).toBeDefined();
     });
   });
 

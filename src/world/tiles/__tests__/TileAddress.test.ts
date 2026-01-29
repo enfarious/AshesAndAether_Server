@@ -2,7 +2,7 @@
  * Tests for TileAddress functions
  */
 
-import { describe, it, expect } from 'vitest';
+// Jest globals (describe, it, expect) available automatically
 import {
   createTileAddress,
   tileAddressFromId,

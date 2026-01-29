@@ -2,7 +2,7 @@
  * Tests for SpawnTablePipeline
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+// Jest globals (describe, it, expect, beforeEach) available automatically
 import { SpawnTablePipeline, SpawnEntryType } from '../SpawnTablePipeline';
 import { BiomeType } from '../BiomePipeline';
 import { SettlementType } from '../PopulationPipeline';
@@ -10,28 +10,28 @@ import { createTileAddress } from '../../TileAddress';
 import { ZoomLevels } from '../../TileConstants';
 
 // Mock dependencies
-vi.mock('@/utils/logger', () => ({
+jest.mock('@/utils/logger', () => ({
   logger: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
+    info: jest.fn(),
+    debug: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
   },
 }));
 
-vi.mock('../../TileService', () => ({
+jest.mock('../../TileService', () => ({
   TileService: {
-    getTile: vi.fn().mockResolvedValue(null),
+    getTile: jest.fn().mockResolvedValue(null),
   },
   TileBuildJobType: {
     SPAWN_GEN: 'SPAWN_GEN',
   },
 }));
 
-vi.mock('../BlobStorage', () => ({
-  getDefaultBlobStorage: vi.fn().mockReturnValue({
-    get: vi.fn().mockResolvedValue(null),
-    put: vi.fn().mockResolvedValue('mock-hash'),
+jest.mock('../BlobStorage', () => ({
+  getDefaultBlobStorage: jest.fn().mockReturnValue({
+    get: jest.fn().mockResolvedValue(null),
+    put: jest.fn().mockResolvedValue('mock-hash'),
   }),
 }));
 
@@ -40,7 +40,7 @@ describe('SpawnTablePipeline', () => {
 
   beforeEach(() => {
     pipeline = new SpawnTablePipeline();
-    vi.clearAllMocks();
+    jest.clearAllMocks();
   });
 
   describe('basic properties', () => {
@@ -117,8 +117,8 @@ describe('SpawnTablePipeline', () => {
   describe('configuration', () => {
     it('accepts custom configuration', () => {
       const customPipeline = new SpawnTablePipeline({
-        maxSpawnsPerTile: 100,
-        baseCorruptedChance: 0.2,
+        baseSpawnCapacity: 100,
+        corruptionSpawnThreshold: 0.2,
       });
       expect(customPipeline).toBeDefined();
     });

@@ -1,6 +1,6 @@
 import { prisma } from '../DatabaseService';
 import { StatCalculator } from '@/game/stats/StatCalculator';
-import type { Character, Zone } from '@prisma/client';
+import type { Character, Zone, Prisma } from '@prisma/client';
 
 export class CharacterService {
   /**
@@ -106,7 +106,7 @@ export class CharacterService {
         specialLoadout: [],
 
         // Cosmetics (stored in supernaturalData until a dedicated profile schema exists)
-        supernaturalData: data.cosmetics ? { cosmetics: data.cosmetics } : undefined,
+        supernaturalData: data.cosmetics ? ({ cosmetics: data.cosmetics } as any) : undefined,
       },
     });
   }
@@ -143,7 +143,7 @@ export class CharacterService {
       where: { id: characterId },
       data: {
         ...(data.name !== undefined && { name: data.name }),
-        ...(nextSupernaturalData !== undefined && { supernaturalData: nextSupernaturalData }),
+        ...(nextSupernaturalData !== undefined && { supernaturalData: nextSupernaturalData as Prisma.InputJsonObject }),
       },
     });
   }

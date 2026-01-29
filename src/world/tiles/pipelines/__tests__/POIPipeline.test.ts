@@ -2,7 +2,7 @@
  * Tests for POIPipeline
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+// Jest globals (describe, it, expect, beforeEach) available automatically
 import { POIPipeline, POIType, POITier } from '../POIPipeline';
 import { BiomeType } from '../BiomePipeline';
 import { SettlementType } from '../PopulationPipeline';
@@ -10,28 +10,28 @@ import { createTileAddress } from '../../TileAddress';
 import { ZoomLevels } from '../../TileConstants';
 
 // Mock dependencies
-vi.mock('@/utils/logger', () => ({
+jest.mock('@/utils/logger', () => ({
   logger: {
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
+    info: jest.fn(),
+    debug: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
   },
 }));
 
-vi.mock('../../TileService', () => ({
+jest.mock('../../TileService', () => ({
   TileService: {
-    getTile: vi.fn().mockResolvedValue(null),
+    getTile: jest.fn().mockResolvedValue(null),
   },
   TileBuildJobType: {
     POI_PLACEMENT: 'POI_PLACEMENT',
   },
 }));
 
-vi.mock('../BlobStorage', () => ({
-  getDefaultBlobStorage: vi.fn().mockReturnValue({
-    get: vi.fn().mockResolvedValue(null),
-    put: vi.fn().mockResolvedValue('mock-hash'),
+jest.mock('../BlobStorage', () => ({
+  getDefaultBlobStorage: jest.fn().mockReturnValue({
+    get: jest.fn().mockResolvedValue(null),
+    put: jest.fn().mockResolvedValue('mock-hash'),
   }),
 }));
 
@@ -40,7 +40,7 @@ describe('POIPipeline', () => {
 
   beforeEach(() => {
     pipeline = new POIPipeline();
-    vi.clearAllMocks();
+    jest.clearAllMocks();
   });
 
   describe('basic properties', () => {

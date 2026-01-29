@@ -2,7 +2,7 @@
  * Tests for TileUtils coordinate conversion functions
  */
 
-import { describe, it, expect } from 'vitest';
+// Jest globals (describe, it, expect) available automatically
 import {
   latLonToTile,
   tileToLatLonBounds,

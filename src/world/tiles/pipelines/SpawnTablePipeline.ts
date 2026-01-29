@@ -425,7 +425,7 @@ export class SpawnTablePipeline extends BaseTilePipeline {
    * Generate hostile spawn group
    */
   private generateHostileGroup(
-    biome: BiomeType,
+    _biome: BiomeType,
     settlementType: SettlementType,
     corruptionLevel: number
   ): SpawnGroup {

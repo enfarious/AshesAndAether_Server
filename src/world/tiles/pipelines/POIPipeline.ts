@@ -381,9 +381,9 @@ export class POIPipeline extends BaseTilePipeline {
     index: number,
     weights: Partial<Record<POIType, number>>,
     biome: BiomeType,
-    settlementType: SettlementType,
+    _settlementType: SettlementType,
     corruptionLevel: number,
-    meanElevation: number,
+    _meanElevation: number,
     rng: () => number
   ): PointOfInterest | null {
     const type = this.weightedChoice(weights, rng);
@@ -502,7 +502,7 @@ export class POIPipeline extends BaseTilePipeline {
   /**
    * Generate a name for the POI
    */
-  private generatePOIName(type: POIType, biome: BiomeType, rng: () => number): string {
+  private generatePOIName(type: POIType, _biome: BiomeType, rng: () => number): string {
     const prefixes = ['Old', 'Abandoned', 'Hidden', 'Dark', 'Lost', 'Forgotten'];
     const prefix = prefixes[Math.floor(rng() * prefixes.length)];
 
