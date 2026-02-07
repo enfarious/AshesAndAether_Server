@@ -10,6 +10,7 @@ import { db } from '@/database';
 import { MessageBus, MessageType, ZoneRegistry, type ClientMessagePayload, type MessageEnvelope } from '@/messaging';
 import { GatewayConnectionManager } from './GatewayConnectionManager';
 import { setupAuth, registerAuthRoutes } from '@/auth';
+import { SpawnPointService } from '@/world/SpawnPointService';
 
 interface GatewayConfig {
   port: number;
@@ -142,6 +143,10 @@ export class GatewayServer {
     // Connect to database
     logger.info('Connecting to database...');
     await db.connect();
+
+    // Initialize spawn point service
+    logger.info('Initializing spawn point service...');
+    SpawnPointService.initialize();
 
     // Setup authentication
     logger.info('Setting up Replit Auth...');

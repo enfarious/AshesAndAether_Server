@@ -13,8 +13,9 @@ import { logger } from '@/utils/logger';
 import { StatCalculator } from '@/game/stats/StatCalculator';
 import { CharacterService } from '@/database';
 import { SPEED_MULTIPLIERS } from '@/network/protocol/types';
-import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
+import type { MovementSpeed, Vector3, AnimationAction } from '@/network/protocol/types';
 import type { ZoneManager } from './ZoneManager';
+import { NavmeshService } from './navmesh/NavmeshService';
 
 // Conversion: 1 foot = 0.3048 meters
 const FEET_TO_METERS = 0.3048;
@@ -32,6 +33,9 @@ export interface MovementState {
   target?: string;              // entity ID to move toward
   targetPosition?: Vector3;     // fixed coordinates to move toward
   targetRange: number;          // stop when this close to target (feet)
+  path?: Vector3[];             // navmesh waypoints
+  pathIndex?: number;           // current waypoint index
+  pathTarget?: Vector3;         // final target for navmesh path
   startTime: number;
 }
 
@@ -54,14 +58,14 @@ export interface MovementStopEvent {
 
 type MovementStopReason = 'command' | 'distance_reached' | 'target_reached' | 'target_lost' | 'boundary';
 
-export interface MovementCompleteCallback {
-  (characterId: string, reason: MovementStopReason, finalPosition: Vector3): void;
-}
+export type MovementCompleteCallback = Function;
 
 export class MovementSystem {
   private activeMovements: Map<string, MovementState> = new Map();
   private zoneManagers: Map<string, ZoneManager> = new Map();
   private onMovementComplete?: MovementCompleteCallback;
+  private underwaterSeconds: Map<string, number> = new Map();
+  private navmeshService: NavmeshService = new NavmeshService();
 
   // How often to persist positions to DB (in seconds)
   private readonly DB_PERSIST_INTERVAL = 1.0;
@@ -90,6 +94,25 @@ export class MovementSystem {
    */
   async startMovement(event: MovementStartEvent): Promise<boolean> {
     const { characterId, zoneId, startPosition, heading, speed, distance, target, targetPosition, targetRange } = event;
+
+    // Check animation locks
+    const zoneManager = this.zoneManagers.get(zoneId);
+    if (zoneManager) {
+      const animationLockSystem = zoneManager.getAnimationLockSystem();
+      if (animationLockSystem) {
+        // Check if movement is allowed
+        if (!animationLockSystem.canMove(characterId)) {
+          logger.debug({ characterId }, 'Movement blocked by animation lock');
+          return false;
+        }
+
+        // If this is a soft lock (movement cancels), interrupt the action
+        const lockState = animationLockSystem.getState(characterId);
+        if (lockState && lockState.isInterruptible && lockState.currentAction !== 'idle') {
+          animationLockSystem.interruptAction(characterId, 'Movement started');
+        }
+      }
+    }
 
     // Cancel any existing movement
     if (this.activeMovements.has(characterId)) {
@@ -128,6 +151,7 @@ export class MovementSystem {
 
     // Resolve heading based on target priority: targetPosition > target entity > explicit heading
     let finalHeading = heading;
+    let targetEntityPosition: Vector3 | undefined;
 
     if (resolvedTargetPosition && finalHeading === undefined) {
       // Moving to coordinates
@@ -138,6 +162,7 @@ export class MovementSystem {
       if (zoneManager) {
         const targetEntity = zoneManager.findEntityByName(target) || zoneManager.getEntity(target);
         if (targetEntity) {
+          targetEntityPosition = targetEntity.position;
           finalHeading = this.calculateHeadingToTarget(startPosition, targetEntity.position);
         } else {
           logger.warn({ characterId, target }, 'Target entity not found for movement');
@@ -149,6 +174,17 @@ export class MovementSystem {
     if (finalHeading === undefined) {
       logger.warn({ characterId }, 'No heading or target specified for movement');
       return false;
+    }
+
+    const pathTarget = resolvedTargetPosition ?? targetEntityPosition;
+    let pathWaypoints: Vector3[] | undefined;
+
+    if (pathTarget) {
+      const navmeshPath = await this.navmeshService.findPath(startPosition, pathTarget);
+      if (navmeshPath?.waypoints?.length) {
+        pathWaypoints = navmeshPath.waypoints;
+        resolvedTargetPosition = pathWaypoints[0];
+      }
     }
 
     const state: MovementState = {
@@ -164,11 +200,29 @@ export class MovementSystem {
       target,
       targetPosition: resolvedTargetPosition,
       targetRange,
+      path: pathWaypoints,
+      pathIndex: pathWaypoints ? 0 : undefined,
+      pathTarget,
       startTime: Date.now(),
     };
 
     this.activeMovements.set(characterId, state);
     logger.debug({ characterId, heading: finalHeading, speed, distance, target, targetPosition: resolvedTargetPosition }, 'Movement started');
+
+    // Set animation state based on speed
+    if (zoneManager) {
+      const animationLockSystem = zoneManager.getAnimationLockSystem();
+      if (animationLockSystem) {
+        let animationAction: AnimationAction = 'idle';
+        if (speed === 'run') {
+          animationAction = 'running';
+        } else if (speed === 'walk' || speed === 'jog') {
+          animationAction = 'walking';
+        }
+        // No lock config - movement is always interruptible
+        animationLockSystem.setState(characterId, animationAction);
+      }
+    }
 
     return true;
   }
@@ -185,10 +239,27 @@ export class MovementSystem {
     // Persist final position immediately
     this.persistPosition(event.characterId, state.currentPosition);
 
+    // Set animation to idle
+    const zoneManager = this.zoneManagers.get(state.zoneId);
+    if (zoneManager) {
+      const animationLockSystem = zoneManager.getAnimationLockSystem();
+      if (animationLockSystem) {
+        const lockState = animationLockSystem.getState(event.characterId);
+        // Only set idle if not in a different action (like attacking)
+        if (!lockState || lockState.isInterruptible) {
+          animationLockSystem.setState(event.characterId, 'idle');
+        }
+      }
+    }
+
     logger.debug({ characterId: event.characterId, reason, position: state.currentPosition }, 'Movement stopped');
 
     if (this.onMovementComplete) {
-      this.onMovementComplete(event.characterId, reason, state.currentPosition);
+      this.onMovementComplete(
+        event.characterId,
+        reason,
+        state.currentPosition
+      );
     }
   }
 
@@ -246,6 +317,26 @@ export class MovementSystem {
     // This prevents rubberbanding where we overshoot and constantly reverse direction
     const stoppingTolerance = Math.max(0.5, distanceThisTick * 1.1);
 
+    // If following a navmesh path, advance waypoints
+    if (state.path && state.pathIndex !== undefined) {
+      const waypoint = state.path[state.pathIndex];
+      const distanceToWaypoint = this.calculateDistance(state.currentPosition, waypoint);
+
+      if (distanceToWaypoint <= stoppingTolerance) {
+        const nextIndex = state.pathIndex + 1;
+        if (nextIndex < state.path.length) {
+          state.pathIndex = nextIndex;
+          state.targetPosition = state.path[nextIndex];
+        } else {
+          state.path = undefined;
+          state.pathIndex = undefined;
+          state.targetPosition = state.target ? undefined : state.pathTarget;
+        }
+      } else {
+        state.targetPosition = waypoint;
+      }
+    }
+
     // If targeting a fixed position, check arrival and update heading
     if (state.targetPosition) {
       const distanceToTarget = this.calculateDistance(state.currentPosition, state.targetPosition);
@@ -297,28 +388,98 @@ export class MovementSystem {
 
     const newPosition: Vector3 = {
       x: state.currentPosition.x + dx,
-      y: state.currentPosition.y, // Y unchanged for now (no terrain elevation)
+      y: state.currentPosition.y, // Y will be adjusted by physics if needed
       z: state.currentPosition.z + dz,
     };
 
-    // Update distance traveled
-    state.distanceTraveled += distanceThisTick;
+    let finalPosition = newPosition;
+
+    const zoneManager = this.zoneManagers.get(state.zoneId);
+    const physicsSystem = zoneManager?.getPhysicsSystem?.();
+    const entity = zoneManager?.getEntity?.(state.characterId) as
+      | { movementProfile?: string; freediveMaxDepth?: number; freediveMaxSeconds?: number }
+      | null
+      | undefined;
+    const movementProfile = entity?.movementProfile;
+    const canFreedive = movementProfile === 'aquatic' || movementProfile === 'amphibious' || (entity?.freediveMaxSeconds ?? 0) > 0;
+    const currentUnderwaterSeconds = this.underwaterSeconds.get(state.characterId) ?? 0;
+
+    if (physicsSystem) {
+      // Validate movement with physics system
+      const validation = physicsSystem.validateMovement(
+        state.characterId,
+        state.currentPosition,
+        newPosition,
+        0.5,
+        {
+          allowUnderwater: canFreedive,
+          maxUnderwaterDepth: movementProfile === 'terrestrial' ? entity?.freediveMaxDepth : undefined,
+          maxUnderwaterSeconds: movementProfile === 'terrestrial' ? entity?.freediveMaxSeconds : undefined,
+          currentUnderwaterSeconds: movementProfile === 'terrestrial' ? currentUnderwaterSeconds : undefined,
+        }
+      );
+
+      if (!validation.valid) {
+        if (validation.adjustedPosition) {
+          // Physics adjusted the position (e.g., terrain collision)
+          finalPosition = validation.adjustedPosition;
+          logger.info({
+            characterId: state.characterId,
+            reason: validation.reason,
+            original: newPosition,
+            adjusted: finalPosition
+          }, 'Movement adjusted by physics');
+          console.log(`[PHYSICS] Movement adjusted: ${validation.reason}`, { original: newPosition.y, adjusted: finalPosition.y });
+        } else {
+          // Movement blocked by physics
+          logger.info({
+            characterId: state.characterId,
+            reason: validation.reason,
+            blockedPosition: newPosition
+          }, 'Movement blocked by physics');
+          console.log(`[PHYSICS] Movement blocked: ${validation.reason}`);
+          return null; // Don't update position
+        }
+      }
+
+      // Apply gravity - pull entities to ground level
+      finalPosition = physicsSystem.applyGravity(finalPosition);
+    }
+
+    // Update underwater timer
+    if (physicsSystem && canFreedive) {
+      const terrain = physicsSystem.getTerrainCollision(finalPosition);
+      const surface = terrain.isWater ? terrain.elevation : 0;
+      if (terrain.isWater && finalPosition.y < surface) {
+        this.underwaterSeconds.set(state.characterId, currentUnderwaterSeconds + deltaTime);
+      } else {
+        this.underwaterSeconds.set(state.characterId, 0);
+      }
+    }
+
+    // Update distance traveled (use actual distance moved, not intended)
+    const actualDistance = this.calculateDistance(state.currentPosition, finalPosition);
+    state.distanceTraveled += actualDistance;
 
     // Check distance limit
     if (state.distanceLimit !== undefined && state.distanceTraveled >= state.distanceLimit) {
       // Clamp to exact distance
       const overshoot = state.distanceTraveled - state.distanceLimit;
-      const ratio = 1 - (overshoot / distanceThisTick);
-      newPosition.x = state.currentPosition.x + dx * ratio;
-      newPosition.z = state.currentPosition.z + dz * ratio;
+      const ratio = 1 - (overshoot / actualDistance);
 
-      state.currentPosition = newPosition;
+      finalPosition = {
+        x: state.currentPosition.x + (finalPosition.x - state.currentPosition.x) * ratio,
+        y: finalPosition.y,
+        z: state.currentPosition.z + (finalPosition.z - state.currentPosition.z) * ratio,
+      };
+
+      state.currentPosition = finalPosition;
       this.stopMovement({ characterId: state.characterId, zoneId: state.zoneId }, 'distance_reached');
-      return newPosition;
+      return finalPosition;
     }
 
-    state.currentPosition = newPosition;
-    return newPosition;
+    state.currentPosition = finalPosition;
+    return finalPosition;
   }
 
   /**
@@ -356,6 +517,44 @@ export class MovementSystem {
       .catch(error => {
         logger.error({ error, characterId, position }, 'Failed to persist position to database');
       });
+  }
+
+  /**
+   * Calculate movement duration in milliseconds for client interpolation
+   */
+  getMovementDuration(characterId: string): number | undefined {
+    const state = this.activeMovements.get(characterId);
+    if (!state) return undefined;
+
+    // Calculate actual speed
+    const speedMultiplier = SPEED_MULTIPLIERS[state.speed] || 1.0;
+    const actualSpeed = state.baseSpeed * speedMultiplier;
+
+    // Estimate time to next position update (assume 100ms tick rate)
+    const tickInterval = 0.1; // 100ms
+    const distancePerTick = actualSpeed * tickInterval;
+    const durationMs = (distancePerTick / actualSpeed) * 1000;
+
+    return durationMs;
+  }
+
+  /**
+   * Get current movement speed in m/s
+   */
+  getMovementSpeed(characterId: string): number | undefined {
+    const state = this.activeMovements.get(characterId);
+    if (!state) return undefined;
+
+    const speedMultiplier = SPEED_MULTIPLIERS[state.speed] || 1.0;
+    return state.baseSpeed * speedMultiplier;
+  }
+
+  /**
+   * Get current heading (0-360 degrees)
+   */
+  getHeading(characterId: string): number | undefined {
+    const state = this.activeMovements.get(characterId);
+    return state?.heading;
   }
 
   /**

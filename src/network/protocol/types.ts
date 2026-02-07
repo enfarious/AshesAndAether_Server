@@ -57,6 +57,7 @@ export interface AuthMessage {
     method: AuthMethod;
     guestName?: string;
     username?: string;
+    email?: string;        // Alternative to username
     password?: string;
     token?: string;
     airlockKey?: string;
@@ -158,6 +159,8 @@ export interface CharacterCreateMessage {
     name: string;
     appearance: {
       description: string;
+      movementProfile?: 'terrestrial' | 'amphibious' | 'aquatic';
+      speciesId?: string;
     };
     // Additional character creation data can be added here
   };
@@ -326,6 +329,12 @@ export interface Entity {
   interactive?: boolean;
   hostile?: boolean;
   animation?: string;
+  
+  // For 3D client animation/interpolation
+  currentAction?: AnimationAction;                    // Current animation state
+  movementDuration?: number;                          // How long movement takes (milliseconds)
+  movementSpeed?: number;                             // Movement speed in m/s (for interpolation)
+  heading?: number;                                   // Direction facing (0-360 degrees)
 }
 
 export interface Exit {
@@ -395,6 +404,28 @@ export interface StateUpdateMessage {
 export type MoveMethod = 'heading' | 'position' | 'compass';
 export type MovementSpeed = 'walk' | 'jog' | 'run' | 'stop';
 export type CompassDirection = 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
+
+// Animation and action states for 3D client
+export type AnimationAction = 
+  // Idle states
+  | 'idle'
+  | 'sitting'
+  | 'emoting'
+  // Movement states
+  | 'walking'
+  | 'running'
+  | 'jumping'
+  // Combat states
+  | 'attacking'
+  | 'casting'
+  | 'channeling'
+  | 'hit'
+  | 'knockback'
+  | 'dying'
+  | 'dead'
+  // Social states
+  | 'talking'
+  | 'trading';
 
 export interface MoveMessage {
   type: 'move';
@@ -806,7 +837,7 @@ export interface PlayerPeekResponse {
     contentAccessLevel?: ContentRating;     // For age-appropriate interaction
 
     // State
-    currentAction?: string;     // "standing", "sitting", "fighting"
+    currentAction?: AnimationAction;     // idle, running, attacking, casting, etc.
     inCombat: boolean;
     afk: boolean;
 

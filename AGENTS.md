@@ -51,8 +51,11 @@ Don't suggest SQLite when PostgreSQL is better. Don't suggest in-memory caching 
 
 ## Development Server
 
-- **Server is usually already running** via `npm run dev` (tsx watch mode)
-- TSX auto-restarts on file changes
-- Don't try to start it in background - it's already watching
-- Check if it's running before attempting to start it
-- To restart: user will handle it manually or tsx will auto-restart on save
+- **Server should be running** via `npm run dev` (tsx watch mode)
+- TSX auto-restarts on .ts file changes ONLY
+- **CRITICAL**: After code changes, verify the server actually restarted:
+  - Check terminal for "Server restarted" message
+  - If test results don't match expectations, server likely needs manual restart
+  - Some changes (like spawn configs) may not trigger auto-restart
+- **For tests to pass**: Delete old test characters from DB or they'll spawn at old positions
+- To restart: `.\restart-servers.ps1` or `Ctrl+C` then `npm run dev`

@@ -9,6 +9,11 @@ type TerrainMetadata = {
   height: number;
   units: 'meters';
   nodata: number | null;
+  center?: {
+    lat: number;
+    lon: number;
+    radiusMeters: number;
+  };
 };
 
 export class ElevationService {
@@ -21,8 +26,8 @@ export class ElevationService {
   }
 
   static tryLoad(
-    metaPath: string = path.join('data', 'terrain', 'stephentown_dem.json'),
-    binPath: string = path.join('data', 'terrain', 'stephentown_dem.bin')
+    metaPath: string = path.join('data', 'terrain', 'usa_ny_stephentown_dem.json'),
+    binPath: string = path.join('data', 'terrain', 'usa_ny_stephentown_dem.bin')
   ): ElevationService | null {
     if (!fs.existsSync(metaPath) || !fs.existsSync(binPath)) {
       return null;
@@ -64,10 +69,11 @@ export class ElevationService {
     return r1 * (1 - y) + r2 * y;
   }
 
-  getElevationFeet(lat: number, lon: number): number | null {
-    const meters = this.getElevationMeters(lat, lon);
-    if (meters === null) return null;
-    return meters * 3.28084;
+  /**
+   * Get the terrain metadata for coordinate transformations
+   */
+  getMetadata(): TerrainMetadata {
+    return this.metadata;
   }
 
   private sample(row: number, col: number): number | null {

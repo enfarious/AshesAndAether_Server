@@ -158,11 +158,11 @@ export class CharacterService {
   }
 
   /**
-   * Update character position
+   * Update character position (both current and last position for respawn recovery)
    */
   static async updatePosition(
     characterId: string,
-    position: { x: number; y: number; z: number; heading?: number }
+    position: { x: number; y: number; z: number; heading?: number; saveLastPosition?: boolean }
   ): Promise<void> {
     await prisma.character.update({
       where: { id: characterId },
@@ -171,6 +171,12 @@ export class CharacterService {
         positionY: position.y,
         positionZ: position.z,
         ...(position.heading !== undefined && { heading: position.heading }),
+        // Save lastPosition fields if saveLastPosition flag is true (for respawn recovery)
+        ...(position.saveLastPosition && {
+          lastPositionX: position.x,
+          lastPositionY: position.y,
+          lastPositionZ: position.z,
+        }),
         lastSeenAt: new Date(),
       },
     });

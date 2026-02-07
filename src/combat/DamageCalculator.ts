@@ -1,5 +1,7 @@
 import { StatCalculator } from '@/game/stats/StatCalculator';
+import type { PhysicsSystem } from '@/physics/PhysicsSystem';
 import type { DamageType } from '@/game/abilities/AbilityTypes';
+import type { Vector3 } from '@/network/protocol/types';
 import { CombatAbilityDefinition, CombatStats, DamageProfileSegment, DamageResult } from './types';
 
 const BASE_CRIT_CHANCE = 5;
@@ -31,6 +33,9 @@ export class DamageCalculator {
       damageProfiles?: DamageProfileSegment[];
       baseDamageOverride?: number;
       qualityBiasMultipliers?: Record<string, number>;
+      attackerPosition?: Vector3;
+      defenderPosition?: Vector3;
+      physicsSystem?: PhysicsSystem;
     }
   ): DamageResult {
     const damageType = ability.damage?.type || 'physical';
@@ -58,6 +63,33 @@ export class DamageCalculator {
         baseDamage: Math.max(1, Math.floor(baseDamage)),
         mitigatedDamage: 0,
       };
+    }
+
+    // Check line-of-sight if physics system is available and positions are provided
+    if (options?.physicsSystem && options?.attackerPosition && options?.defenderPosition) {
+      const los = options.physicsSystem.checkLineOfSight(
+        options.attackerPosition,
+        options.defenderPosition,
+        [] // Could exclude attacker/defender IDs if available
+      );
+
+      if (!los.clear) {
+        // Line of sight blocked - treat as miss
+        const quality = { quality: 'normal' as const, multiplier: 1 };
+        return {
+          hit: false,
+          outcome: 'miss',
+          critical: false,
+          deflected: false,
+          penetrating: false,
+          glancing: false,
+          quality: quality.quality,
+          qualityMultiplier: quality.multiplier,
+          amount: 0,
+          baseDamage: Math.max(1, Math.floor(baseDamage)),
+          mitigatedDamage: 0,
+        };
+      }
     }
 
     const outcome = this.rollOutcome(attacker);

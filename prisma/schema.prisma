@@ -51,6 +51,12 @@ model Character {
   positionZ         Float
   heading           Float    @default(0)
   rotation          Float    @default(0)
+  
+  // Position persistence for respawn
+  lastPositionX     Float?   // Last position before logout (for respawn)
+  lastPositionY     Float?
+  lastPositionZ     Float?
+  
   unlockedFeats     Json     @default("[]")
   unlockedAbilities Json     @default("[]")
   activeLoadout     Json     @default("[]")

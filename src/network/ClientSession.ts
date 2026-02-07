@@ -1,7 +1,10 @@
 import { Socket } from 'socket.io';
+import bcrypt from 'bcryptjs';
 import { logger } from '@/utils/logger';
 import { AccountService, CharacterService, ZoneService } from '@/database';
 import { StatCalculator } from '@/game/stats/StatCalculator';
+import { PhysicsSystem } from '@/physics/PhysicsSystem';
+import { SpawnPointService } from '@/world/SpawnPointService';
 import { WorldManager } from '@/world/WorldManager';
 import {
   ClientType,
@@ -146,7 +149,12 @@ export class ClientSession {
           await this.authenticateGuest(data.guestName || 'Guest');
           break;
         case 'credentials':
-          await this.authenticateCredentials(data.username!, data.password!);
+          // Support both email and username
+          const identifier = data.email || data.username;
+          if (!identifier || !data.password) {
+            throw new Error('Email/username and password required');
+          }
+          await this.authenticateCredentials(identifier, data.password);
           break;
         case 'token':
           await this.authenticateToken(data.token!);
@@ -192,33 +200,47 @@ export class ClientSession {
     logger.info(`Guest authenticated: ${this.socket.id} as ${guestName} (Account: ${account.id})`);
   }
 
-  private async authenticateCredentials(_username: string, _password: string): Promise<void> {
-    // TODO: Implement proper credential authentication with database
-    // For now, mock authentication
-    logger.warn('Credential authentication not fully implemented, using mock data');
+  private async authenticateCredentials(identifier: string, password: string): Promise<void> {
+    // Find account by email or username
+    let account = await AccountService.findByEmail(identifier);
+    if (!account) {
+      account = await AccountService.findByUsername(identifier);
+    }
+
+    if (!account) {
+      throw new Error('Invalid credentials');
+    }
+
+    // Verify password
+    const passwordValid = await bcrypt.compare(password, account.passwordHash);
+    if (!passwordValid) {
+      throw new Error('Invalid credentials');
+    }
+
+    // Load characters
+    const characters = await CharacterService.findByAccountId(account.id);
+    const characterInfos: CharacterInfo[] = characters.map(char => ({
+      id: char.id,
+      name: char.name,
+      level: char.level,
+      lastPlayed: char.updatedAt.getTime(),
+      location: char.zoneId,
+    }));
 
     this.authenticated = true;
-    this.accountId = 'mock-account-id';
-    this.maxCharacters = 5;
+    this.accountId = account.id;
+    this.maxCharacters = 10; // TODO: Make configurable
 
     const response: AuthSuccessMessage['payload'] = {
       accountId: this.accountId,
-      token: 'mock-jwt-token',
-      characters: [
-        {
-          id: 'char-1',
-          name: 'Test Character',
-          level: 1,
-          lastPlayed: Date.now() - 86400000,
-          location: 'The Crossroads',
-        },
-      ],
-      canCreateCharacter: true,
+      token: 'jwt-token-todo', // TODO: Generate actual JWT
+      characters: characterInfos,
+      canCreateCharacter: characters.length < this.maxCharacters,
       maxCharacters: this.maxCharacters,
     };
 
     this.socket.emit('auth_success', response);
-    logger.info(`Credentials authenticated: ${this.socket.id} for account ${this.accountId}`);
+    logger.info(`Credentials authenticated: ${this.socket.id} for account ${this.accountId} (${account.email})`);
   }
 
   private async authenticateToken(_token: string): Promise<void> {
@@ -279,15 +301,23 @@ export class ClientSession {
     }
 
     const cosmetics = data.appearance ? { appearance: data.appearance } : undefined;
-    // Create character in starter zone (The Crossroads)
+    
+    // Create character in starter zone with proper spawn point
     const starterZoneId = 'USA_NY_Stephentown';
+    const spawn = SpawnPointService.getStarterSpawn(starterZoneId);
+    
+    if (!spawn) {
+      this.sendCharacterError('SERVER_ERROR', 'No spawn point available', 'create');
+      return;
+    }
+    
     const character = await CharacterService.createCharacter({
       accountId: this.accountId,
       name,
       zoneId: starterZoneId,
-      positionX: 0,    // Town Hall origin
-      positionY: 870,  // Elevation at Town Hall (~265m)
-      positionZ: 0,
+      positionX: spawn.position.x,
+      positionY: spawn.position.y,
+      positionZ: spawn.position.z,
       cosmetics,
     });
 
@@ -414,6 +444,32 @@ export class ClientSession {
 
     const zone = character.zone;
 
+    // Get respawn position (uses saved lastPosition if available, with collision avoidance)
+    const respawnPos = SpawnPointService.getRespawnPosition(
+      zone.id,
+      character.lastPositionX,
+      character.lastPositionY,
+      character.lastPositionZ
+    );
+
+    // Update character position to respawn position if different
+    if (
+      respawnPos.x !== character.positionX ||
+      respawnPos.y !== character.positionY ||
+      respawnPos.z !== character.positionZ
+    ) {
+      await CharacterService.updatePosition(this.characterId, {
+        x: respawnPos.x,
+        y: respawnPos.y,
+        z: respawnPos.z,
+      });
+      // Reload character with updated position
+      const updatedCharacter = await CharacterService.findByIdWithZone(this.characterId);
+      if (updatedCharacter) {
+        Object.assign(character, updatedCharacter);
+      }
+    }
+
     // Calculate derived stats
     const coreStats = {
       strength: character.strength,
@@ -426,11 +482,12 @@ export class ClientSession {
 
     const derivedStats = StatCalculator.calculateDerivedStats(coreStats, character.level);
 
-    // Get companions (NPCs) in the zone
+    // Get companions (NPCs) and mobs in the zone
     const companions = await ZoneService.getCompanionsInZone(zone.id);
+    const mobs = await ZoneService.getMobsInZone(zone.id);
 
-    // Build entity list
-    const entities = companions
+    // Build entity list (NPCs and mobs)
+    const npcEntities = companions
       .filter(companion => companion.isAlive ?? true)
       .map(companion => ({
       id: companion.id,
@@ -441,6 +498,30 @@ export class ClientSession {
       isAlive: companion.isAlive ?? true,
       interactive: true,
     }));
+
+    // Apply gravity to mobs (pull floating entities to ground)
+    const physicsSystem = new PhysicsSystem();
+    const mobEntities = mobs
+      .filter(mob => mob.isAlive)
+      .map(mob => {
+        const mobPos = { x: mob.positionX, y: mob.positionY, z: mob.positionZ };
+        const adjustedPos = physicsSystem.applyGravity(mobPos);
+        
+        return {
+          id: mob.id,
+          type: 'mob' as const,
+          tag: mob.tag,
+          name: mob.name,
+          position: { x: adjustedPos.x, y: adjustedPos.y, z: adjustedPos.z },
+          description: mob.description || '',
+          isAlive: mob.isAlive,
+          level: mob.level,
+          faction: mob.faction,
+          interactive: true,
+        };
+      });
+
+    const entities = [...npcEntities, ...mobEntities];
 
     const worldEntry: WorldEntryMessage['payload'] = {
       characterId: character.id,
@@ -638,6 +719,22 @@ export class ClientSession {
   }
 
   async cleanup(): Promise<void> {
+    // Give any pending database operations a chance to complete
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // Save character position before cleanup (for respawn on next login)
+    if (this.characterId) {
+      const character = await CharacterService.findById(this.characterId);
+      if (character) {
+        await CharacterService.updatePosition(this.characterId, {
+          x: character.positionX,
+          y: character.positionY,
+          z: character.positionZ,
+          saveLastPosition: true, // Save as lastPosition for respawn recovery
+        });
+      }
+    }
+
     // Remove player from world manager
     if (this.characterId && this.currentZoneId) {
       await this.worldManager.removePlayerFromZone(this.characterId, this.currentZoneId);

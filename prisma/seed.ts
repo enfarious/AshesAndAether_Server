@@ -10,34 +10,33 @@ async function main() {
   const townHallLon = -73.3792285;
 
   const METERS_PER_RADIAN = 6378137;
-  const FEET_PER_METER = 3.28084;
   const toRadians = (deg: number) => (deg * Math.PI) / 180;
 
-  const latLonToLocalFeet = (lat: number, lon: number) => {
+  const latLonToLocalMeters = (lat: number, lon: number) => {
     const latRad = toRadians(lat);
     const lonRad = toRadians(lon);
     const originLatRad = toRadians(townHallLat);
     const originLonRad = toRadians(townHallLon);
     const xMeters = (lonRad - originLonRad) * Math.cos((latRad + originLatRad) / 2) * METERS_PER_RADIAN;
-    const yMeters = (latRad - originLatRad) * METERS_PER_RADIAN;
-    return { x: xMeters * FEET_PER_METER, y: yMeters * FEET_PER_METER };
+    const zMeters = (latRad - originLatRad) * METERS_PER_RADIAN;
+    return { x: xMeters, z: zMeters };
   };
 
   const elevationService = ElevationService.tryLoad();
-  const townHallElevation = elevationService?.getElevationFeet(townHallLat, townHallLon) ?? 0;
-  const townHall = { x: 0, y: 0, z: townHallElevation };
+  const townHallElevation = elevationService?.getElevationMeters(townHallLat, townHallLon) ?? 265;
+  const townHall = { x: 0, y: townHallElevation, z: 0 };
   const postOfficeLat = 42.5486230;
   const postOfficeLon = -73.3739670;
   const fourFatFoulLat = 42.5501388;
   const fourFatFoulLon = -73.3814902;
 
   const postOfficePos = {
-    ...latLonToLocalFeet(postOfficeLat, postOfficeLon),
-    z: elevationService?.getElevationFeet(postOfficeLat, postOfficeLon) ?? townHallElevation,
+    ...latLonToLocalMeters(postOfficeLat, postOfficeLon),
+    y: elevationService?.getElevationMeters(postOfficeLat, postOfficeLon) ?? townHallElevation,
   };
   const fourFatFoulPos = {
-    ...latLonToLocalFeet(fourFatFoulLat, fourFatFoulLon),
-    z: elevationService?.getElevationFeet(fourFatFoulLat, fourFatFoulLon) ?? townHallElevation,
+    ...latLonToLocalMeters(fourFatFoulLat, fourFatFoulLon),
+    y: elevationService?.getElevationMeters(fourFatFoulLat, fourFatFoulLon) ?? townHallElevation,
   };
 
   // Create starter zone: Stephentown Town Hall

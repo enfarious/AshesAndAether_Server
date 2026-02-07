@@ -320,8 +320,9 @@ export class DistributedWorldManager {
       await this.sendPartyRosterToMember(partyId, character.id);
     }
 
-    // Calculate and send proximity roster
-    await this.sendProximityRosterToEntity(character.id);
+    // Clear any stale roster baseline and send a full proximity roster on entry
+    this.previousRosters.delete(character.id);
+    await this.sendFullProximityRosterToEntity(character.id);
 
     // Broadcast proximity updates to nearby players
     await this.broadcastNearbyUpdate(character.zoneId);
@@ -890,6 +891,27 @@ export class DistributedWorldManager {
             targetRange: number;
             startPosition: Vector3;
           };
+
+          // Physics validation: Check if movement is physically possible
+          const zoneManager = this.zones.get(context.zoneId);
+          if (zoneManager) {
+            // Get current entity position for physics validation
+            const entity = zoneManager.getEntity(context.characterId);
+            if (entity) {
+              // Simple physics check: prevent extreme movements that could be exploits
+              if (distance && distance > 1000) { // 1000m limit for any single movement
+                return {
+                  success: false,
+                  error: 'Movement distance too extreme.',
+                };
+              }
+
+              // Additional physics validation could be added here
+              // - Terrain collision checks
+              // - Entity collision prevention
+              // - Line-of-sight validation for targeted movement
+            }
+          }
 
           const movementEvent: MovementStartEvent = {
             characterId: context.characterId,
@@ -1880,6 +1902,18 @@ export class DistributedWorldManager {
     const targetId = targetEntity.id;
     const now = Date.now();
 
+    // Check animation locks - can character perform this action?
+    const animationLockSystem = zoneManager.getAnimationLockSystem();
+    if (animationLockSystem && !animationLockSystem.canPerformAction(characterId)) {
+      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+        eventType: 'combat_error',
+        timestamp: now,
+        narrative: `You can't do that yet.`,
+        eventTypeData: { reason: 'animation_locked', attackerId: characterId },
+      });
+      return null;
+    }
+
     const attackerSnapshot = await this.getCombatSnapshot(characterId, attackerEntity);
     const targetSnapshot = await this.getCombatSnapshot(targetId, targetEntity);
     if (!attackerSnapshot || !targetSnapshot) return null;
@@ -2048,6 +2082,21 @@ export class DistributedWorldManager {
       zoneManager.setEntityCombatState(targetId, true);
     }
 
+    // Set animation lock and state for the ability
+    if (animationLockSystem) {
+      const lockConfig = animationLockSystem.getAbilityLockConfig(ability.id);
+      let animationAction: AnimationAction = 'attacking';
+      
+      // Determine animation type from ability
+      if (ability.damage?.type === 'magic' || ability.manaCost > 0) {
+        animationAction = 'casting';
+      } else if (lockConfig?.lockDuration > 1000) {
+        animationAction = 'channeling';
+      }
+      
+      animationLockSystem.setState(characterId, animationAction, lockConfig);
+    }
+
     if (attackerStarted || targetStarted) {
       await this.broadcastNearbyUpdate(zoneManager.getZone().id);
       await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
@@ -2124,6 +2173,9 @@ export class DistributedWorldManager {
             damageProfiles: weaponProfiles ?? undefined,
             baseDamageOverride,
             qualityBiasMultipliers: targetData.armorQualityMultipliers,
+            attackerPosition: attackerEntity.position,
+            defenderPosition: target.position,
+            physicsSystem: zoneManager.getPhysicsSystem(),
           }
         );
 
@@ -2151,6 +2203,12 @@ export class DistributedWorldManager {
         anyHit = true;
         const newHp = Math.max(0, targetData.currentHealth - result.amount);
         await this.updateHealth(targetData, newHp);
+        
+        // Set target animation to 'hit'
+        if (animationLockSystem) {
+          animationLockSystem.setState(targetData.entityId, 'hit');
+        }
+        
         if (targetData.isPlayer) {
           await this.sendCharacterResourcesUpdate(zoneManager, targetData.entityId, {
             health: { current: newHp, max: targetData.maxHealth },
@@ -2199,6 +2257,19 @@ export class DistributedWorldManager {
         if (newHp <= 0) {
           zoneManager.setEntityAlive(targetData.entityId, false);
           zoneManager.setEntityCombatState(targetData.entityId, false);
+          
+          // Set dying → dead animation sequence
+          if (animationLockSystem) {
+            animationLockSystem.setState(targetData.entityId, 'dying', {
+              lockDuration: 2000,          // 2s death animation
+              lockType: 'hard',
+              allowMovementDuring: false,
+            });
+            // Transition to 'dead' after death animation
+            setTimeout(() => {
+              animationLockSystem.setState(targetData.entityId, 'dead');
+            }, 2000);
+          }
 
           // Clear auto-attack for the dying target and all entities targeting it
           this.combatManager.clearAutoAttackTarget(targetData.entityId);
@@ -2821,10 +2892,8 @@ export class DistributedWorldManager {
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
 
-    // Clear previous roster so next send includes full data as delta.
-    this.previousRosters.delete(characterId);
-
-    await this.sendProximityRosterToEntity(characterId);
+    // Send a full proximity roster snapshot on refresh.
+    await this.sendFullProximityRosterToEntity(characterId);
     logger.debug({ characterId, zoneId }, 'Proximity roster refresh sent');
   }
 
@@ -3037,6 +3106,45 @@ export class DistributedWorldManager {
   }
 
   /**
+   * Send a full proximity roster snapshot to a specific player
+   */
+  private async sendFullProximityRosterToEntity(entityId: string): Promise<void> {
+    const zoneId = this.characterToZone.get(entityId) || this.companionToZone.get(entityId);
+    if (!zoneId) return;
+
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const result = zoneManager.calculateProximityRoster(entityId);
+    if (!result) return;
+
+    const { roster } = result;
+
+    // Store roster as baseline for future deltas
+    this.previousRosters.set(entityId, roster);
+
+    const socketId = zoneManager.getSocketIdForEntity(entityId);
+    if (!socketId) return;
+
+    const clientMessage: ClientMessagePayload = {
+      socketId,
+      event: 'proximity_roster',
+      data: {
+        ...roster,
+        timestamp: Date.now(),
+      },
+    };
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId: entityId,
+      socketId,
+      payload: clientMessage,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
    * Broadcast proximity roster updates to all nearby players in a zone
    */
   private async broadcastNearbyUpdate(zoneId: string): Promise<void> {
@@ -3071,7 +3179,16 @@ export class DistributedWorldManager {
     const entity = zoneManager.getEntity(characterId);
     if (!entity) return;
 
-    // Build state_update message
+    // Get animation and movement data
+    const animationLockSystem = zoneManager.getAnimationLockSystem();
+    const movementSystem = this.movementSystem;
+    
+    const animationState = animationLockSystem?.getState(characterId);
+    const movementDuration = movementSystem.getMovementDuration(characterId);
+    const movementSpeed = movementSystem.getMovementSpeed(characterId);
+    const heading = movementSystem.getHeading(characterId);
+
+    // Build state_update message with animation data
     const stateUpdate = {
       timestamp: Date.now(),
       entities: {
@@ -3080,6 +3197,10 @@ export class DistributedWorldManager {
           name: entity.name,
           type: entity.type,
           position,
+          heading,
+          movementDuration,
+          movementSpeed,
+          currentAction: animationState?.currentAction,
         }],
       },
     };
@@ -3462,6 +3583,9 @@ export class DistributedWorldManager {
     // Update position one final time
     zoneManager.updatePlayerPosition(characterId, finalPosition);
 
+    // Broadcast final position update with idle animation state
+    await this.broadcastPositionUpdate(characterId, zoneId, finalPosition);
+
     // Get socket ID to notify player
     const socketId = zoneManager.getSocketIdForCharacter(characterId);
     if (socketId) {
@@ -3597,17 +3721,17 @@ export class DistributedWorldManager {
     const radiusMeters = config.community_detection.nearby_player_radius_meters;
     const minCount = config.community_detection.nearby_player_min_count;
 
-    // Get nearby players
-    const nearbyPlayers = zoneManager.getNearbyEntities(
+    // Get nearby entities (use getEntitiesInRange which excludes the character automatically)
+    const nearbyEntities = zoneManager.getEntitiesInRange(
       character.position,
       radiusMeters / FEET_TO_METERS, // Convert to feet for internal spatial system
-      'player'
+      characterId // Exclude self
     );
 
-    // Exclude self from count
-    const otherPlayers = nearbyPlayers.filter(e => e.id !== characterId);
+    // Filter for players only
+    const nearbyPlayers = nearbyEntities.filter(e => e.type === 'player');
 
-    return otherPlayers.length >= minCount;
+    return nearbyPlayers.length >= minCount;
   }
 
   /**

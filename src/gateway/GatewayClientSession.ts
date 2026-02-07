@@ -1,7 +1,9 @@
 import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
 import { AccountService, CharacterService, CompanionService, ZoneService } from '@/database';
+import { SpawnPointService } from '@/world/SpawnPointService';
 import { StatCalculator } from '@/game/stats/StatCalculator';
+import { PhysicsSystem } from '@/physics/PhysicsSystem';
 import { MessageBus, MessageType, ZoneRegistry } from '@/messaging';
 import { randomUUID } from 'crypto';
 import {
@@ -407,7 +409,12 @@ export class GatewayClientSession {
           await this.authenticateGuest(data.guestName || 'Guest');
           break;
         case 'credentials':
-          await this.authenticateCredentials(data.username!, data.password!);
+          // Support both email and username
+          const identifier = data.email || data.username;
+          if (!identifier || !data.password) {
+            throw new Error('Email/username and password required');
+          }
+          await this.authenticateCredentials(identifier, data.password);
           break;
         case 'token':
           await this.authenticateToken(data.token!);
@@ -444,13 +451,19 @@ export class GatewayClientSession {
 
     // Auto-create a guest character
     const starterZoneId = 'USA_NY_Stephentown';
+    const spawn = SpawnPointService.getStarterSpawn(starterZoneId);
+    
+    if (!spawn) {
+      throw new Error('No spawn point available for guest');
+    }
+    
     const character = await CharacterService.createCharacter({
       accountId: account.id,
       name: characterName,
       zoneId: starterZoneId,
-      positionX: 0,    // Town Hall origin
-      positionY: 870,  // Elevation at Town Hall (~265m)
-      positionZ: 0,
+      positionX: spawn.position.x,
+      positionY: spawn.position.y,
+      positionZ: spawn.position.z,
     });
 
     this.characterId = character.id;
@@ -475,46 +488,35 @@ export class GatewayClientSession {
     await this.enterWorld();
   }
 
-  private async authenticateCredentials(username: string, password: string): Promise<void> {
+  private async authenticateCredentials(identifier: string, password: string): Promise<void> {
     // Validate input
-    if (!username || !password) {
-      throw new Error('Username and password are required');
-    }
-
-    const trimmedUsername = username.trim();
-    if (trimmedUsername.length < 3 || trimmedUsername.length > 32) {
-      throw new Error('Username must be between 3 and 32 characters');
+    if (!identifier || !password) {
+      throw new Error('Email/username and password required');
     }
 
     if (password.length < 6) {
       throw new Error('Password must be at least 6 characters');
     }
 
-    // Check if account exists
-    const existingAccount = await AccountService.findByUsername(trimmedUsername);
-
-    if (existingAccount) {
-      // Account exists - verify password
-      const passwordValid = await AccountService.verifyPassword(existingAccount, password);
-
-      if (!passwordValid) {
-        throw new Error('Invalid username or password');
-      }
-
-      // Password correct - complete authentication
-      await this.completeCredentialAuth(existingAccount);
-    } else {
-      // Account doesn't exist - ask for confirmation to create
-      this.pendingRegistration = { username: trimmedUsername, password };
-
-      const confirmMessage: AuthConfirmNameMessage['payload'] = {
-        username: trimmedUsername,
-        message: `No account found for "${trimmedUsername}". Create a new account with this name?`,
-      };
-
-      this.socket.emit('auth_confirm_name', confirmMessage);
-      logger.info(`Registration confirmation requested for ${this.socket.id}: ${trimmedUsername}`);
+    // Find account by email or username
+    let account = await AccountService.findByEmail(identifier);
+    if (!account) {
+      account = await AccountService.findByUsername(identifier);
     }
+
+    if (!account) {
+      throw new Error('Invalid credentials');
+    }
+
+    // Verify password
+    const bcrypt = await import('bcryptjs');
+    const passwordValid = await bcrypt.compare(password, account.passwordHash);
+    if (!passwordValid) {
+      throw new Error('Invalid credentials');
+    }
+
+    // Password correct - complete authentication
+    await this.completeCredentialAuth(account);
   }
 
   private async handleNameConfirmation(data: AuthNameConfirmedMessage['payload']): Promise<void> {
@@ -758,13 +760,20 @@ export class GatewayClientSession {
         ? { appearance: this.pendingCharacterCreate.appearance }
         : undefined;
       const starterZoneId = 'USA_NY_Stephentown';
+      const spawn = SpawnPointService.getStarterSpawn(starterZoneId);
+      
+      if (!spawn) {
+        this.sendCharacterError('SERVER_ERROR', 'No spawn point available', 'create');
+        return;
+      }
+      
       const character = await CharacterService.createCharacter({
         accountId: this.accountId!,
         name: this.pendingCharacterCreate.name,
         zoneId: starterZoneId,
-        positionX: 0,    // Town Hall origin
-        positionY: 870,  // Elevation at Town Hall (~265m)
-        positionZ: 0,
+        positionX: spawn.position.x,
+        positionY: spawn.position.y,
+        positionZ: spawn.position.z,
         cosmetics,
       });
 
@@ -895,6 +904,32 @@ export class GatewayClientSession {
 
     const zone = character.zone;
 
+    // Get respawn position (uses saved lastPosition if available, with collision avoidance)
+    const respawnPos = SpawnPointService.getRespawnPosition(
+      zone.id,
+      character.lastPositionX,
+      character.lastPositionY,
+      character.lastPositionZ
+    );
+
+    // Update character position to respawn position if different
+    if (
+      respawnPos.x !== character.positionX ||
+      respawnPos.y !== character.positionY ||
+      respawnPos.z !== character.positionZ
+    ) {
+      await CharacterService.updatePosition(this.characterId, {
+        x: respawnPos.x,
+        y: respawnPos.y,
+        z: respawnPos.z,
+      });
+      // Reload character with updated position
+      const updatedCharacter = await CharacterService.findByIdWithZone(this.characterId);
+      if (updatedCharacter) {
+        Object.assign(character, updatedCharacter);
+      }
+    }
+
     const coreStats = {
       strength: character.strength,
       vitality: character.vitality,
@@ -906,9 +941,12 @@ export class GatewayClientSession {
 
     const derivedStats = StatCalculator.calculateDerivedStats(coreStats, character.level);
 
+    // Get companions (NPCs) and mobs in the zone
     const companions = await ZoneService.getCompanionsInZone(zone.id);
+    const mobs = await ZoneService.getMobsInZone(zone.id);
 
-    const entities = companions
+    // Build entity list (NPCs and mobs)
+    const npcEntities = companions
       .filter(companion => companion.isAlive ?? true)
       .map(companion => ({
       id: companion.id,
@@ -919,6 +957,30 @@ export class GatewayClientSession {
       isAlive: companion.isAlive ?? true,
       interactive: true,
     }));
+
+    // Apply gravity to mobs (pull floating entities to ground)
+    const physicsSystem = new PhysicsSystem();
+    const mobEntities = mobs
+      .filter(mob => mob.isAlive)
+      .map(mob => {
+        const mobPos = { x: mob.positionX, y: mob.positionY, z: mob.positionZ };
+        const adjustedPos = physicsSystem.applyGravity(mobPos);
+        
+        return {
+          id: mob.id,
+          type: 'mob' as const,
+          tag: mob.tag,
+          name: mob.name,
+          position: { x: adjustedPos.x, y: adjustedPos.y, z: adjustedPos.z },
+          description: mob.description || '',
+          isAlive: mob.isAlive,
+          level: mob.level,
+          faction: mob.faction,
+          interactive: true,
+        };
+      });
+
+    const entities = [...npcEntities, ...mobEntities];
 
     const worldEntry: WorldEntryMessage['payload'] = {
       characterId: character.id,

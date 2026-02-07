@@ -1,6 +1,9 @@
 import { logger } from '@/utils/logger';
 import { ZoneService } from '@/database';
 import { COMMUNICATION_RANGES } from '@/network/protocol/types';
+import { PhysicsSystem } from '@/physics/PhysicsSystem';
+import { CollisionLayer } from '@/physics/types';
+import { AnimationLockSystem } from './AnimationLockSystem';
 import type {
   ProximityRosterMessage,
   ProximityChannel,
@@ -17,6 +20,8 @@ interface Vector3 {
   z: number;
 }
 
+type MovementProfile = 'terrestrial' | 'amphibious' | 'aquatic';
+
 interface Entity {
   id: string;
   name: string;
@@ -26,6 +31,10 @@ interface Entity {
   inCombat?: boolean;
   isMachine: boolean;
   isAlive: boolean;
+  movementProfile?: MovementProfile;
+  freediveSkill?: number;
+  freediveMaxDepth?: number;
+  freediveMaxSeconds?: number;
   // Wildlife-specific fields
   speciesId?: string;
   sprite?: string;
@@ -49,9 +58,134 @@ export class ZoneManager {
   private zone: Zone;
   private entities: Map<string, Entity> = new Map();
   private lastSpeaker: Map<string, { speaker: string; timestamp: number }> = new Map(); // entityId -> lastSpeaker info
+  private physicsSystem: PhysicsSystem;
+  private animationLockSystem: AnimationLockSystem;
+  private underwaterSeconds: Map<string, { seconds: number; lastUpdate: number }> = new Map();
 
   constructor(zone: Zone) {
     this.zone = zone;
+    this.physicsSystem = new PhysicsSystem();
+    this.animationLockSystem = new AnimationLockSystem();
+  }
+
+  getPhysicsSystem(): PhysicsSystem {
+    return this.physicsSystem;
+  }
+
+  getAnimationLockSystem(): AnimationLockSystem {
+    return this.animationLockSystem;
+  }
+
+  private resolveNumberField(input: unknown): number | null {
+    if (typeof input === 'number' && Number.isFinite(input)) return input;
+    if (typeof input === 'string') {
+      const parsed = Number(input);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+  }
+
+  private resolveMovementProfile(raw?: string | null): MovementProfile | null {
+    if (!raw) return null;
+    const normalized = raw.toLowerCase();
+    if (normalized.includes('aquatic') || normalized.includes('underwater') || normalized.includes('ocean') || normalized.includes('sea') || normalized.includes('crustacean')) {
+      return 'aquatic';
+    }
+    if (normalized.includes('amphib')) {
+      return 'amphibious';
+    }
+    return null;
+  }
+
+  private resolveMovementProfileFromCharacter(character: Character): MovementProfile {
+    const direct = this.resolveMovementProfile(character.supernaturalType);
+    if (direct) return direct;
+
+    const data = character.supernaturalData;
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      const dataRecord = data as Record<string, unknown>;
+      const movementProfile = typeof dataRecord.movementProfile === 'string'
+        ? this.resolveMovementProfile(dataRecord.movementProfile)
+        : null;
+      if (movementProfile) return movementProfile;
+
+      const cosmetics = dataRecord.cosmetics;
+      if (cosmetics && typeof cosmetics === 'object' && !Array.isArray(cosmetics)) {
+        const appearance = (cosmetics as Record<string, unknown>).appearance;
+        if (appearance && typeof appearance === 'object' && !Array.isArray(appearance)) {
+          const appearanceProfile = typeof (appearance as Record<string, unknown>).movementProfile === 'string'
+            ? this.resolveMovementProfile((appearance as Record<string, unknown>).movementProfile as string)
+            : null;
+          if (appearanceProfile) return appearanceProfile;
+          const appearanceSpecies = typeof (appearance as Record<string, unknown>).speciesId === 'string'
+            ? this.resolveMovementProfile((appearance as Record<string, unknown>).speciesId as string)
+            : null;
+          if (appearanceSpecies) return appearanceSpecies;
+        }
+      }
+    }
+
+    return 'terrestrial';
+  }
+
+  private resolveFreediveProfileFromCharacter(character: Character): { skill: number; maxDepth: number; maxSeconds: number } {
+    const data = character.supernaturalData && typeof character.supernaturalData === 'object' && !Array.isArray(character.supernaturalData)
+      ? (character.supernaturalData as Record<string, unknown>)
+      : null;
+
+    const cosmetics = data && typeof data.cosmetics === 'object' && data.cosmetics !== null && !Array.isArray(data.cosmetics)
+      ? (data.cosmetics as Record<string, unknown>)
+      : null;
+
+    const appearance = cosmetics && typeof cosmetics.appearance === 'object' && cosmetics.appearance !== null && !Array.isArray(cosmetics.appearance)
+      ? (cosmetics.appearance as Record<string, unknown>)
+      : null;
+
+    const skill =
+      this.resolveNumberField(appearance?.freediveSkill) ??
+      this.resolveNumberField(data?.freediveSkill) ??
+      0;
+
+    const clampedSkill = Math.max(0, Math.min(100, skill));
+
+    const maxDepthOverride = this.resolveNumberField(appearance?.freediveMaxDepth) ?? this.resolveNumberField(data?.freediveMaxDepth);
+    const maxSecondsOverride = this.resolveNumberField(appearance?.freediveMaxSeconds) ?? this.resolveNumberField(data?.freediveMaxSeconds);
+
+    if (maxDepthOverride !== null || maxSecondsOverride !== null) {
+      return {
+        skill: clampedSkill,
+        maxDepth: maxDepthOverride ?? 10,
+        maxSeconds: maxSecondsOverride ?? 60,
+      };
+    }
+
+    // Scale: skill 0 -> 5m/30s, skill 100 -> 100m/600s
+    const maxDepth = 5 + (95 * (clampedSkill / 100));
+    const maxSeconds = 30 + (570 * (clampedSkill / 100));
+    return { skill: clampedSkill, maxDepth, maxSeconds };
+  }
+
+  private updateUnderwaterSeconds(entityId: string, position: Vector3, allowUnderwater: boolean): number {
+    const terrain = this.physicsSystem.getTerrainCollision(position);
+    const surface = terrain.isWater ? terrain.elevation : 0;
+    const now = Date.now();
+    const existing = this.underwaterSeconds.get(entityId);
+    const deltaSeconds = existing ? Math.max(0, (now - existing.lastUpdate) / 1000) : 0;
+
+    const isUnderwater = allowUnderwater && terrain.isWater && position.y < surface;
+    const nextSeconds = isUnderwater ? (existing?.seconds ?? 0) + deltaSeconds : 0;
+    this.underwaterSeconds.set(entityId, { seconds: nextSeconds, lastUpdate: now });
+    return nextSeconds;
+  }
+
+  private resolveMovementProfileFromTag(tag?: string | null): MovementProfile {
+    const profile = this.resolveMovementProfile(tag ?? undefined);
+    return profile ?? 'terrestrial';
+  }
+
+  private resolveMovementProfileFromSpeciesId(speciesId?: string | null): MovementProfile {
+    const profile = this.resolveMovementProfile(speciesId ?? undefined);
+    return profile ?? 'terrestrial';
   }
 
   /**
@@ -65,7 +199,7 @@ export class ZoneManager {
 
     for (const companion of companions) {
       const isMob = companion.tag?.startsWith('mob.') === true;
-      this.entities.set(companion.id, {
+      const entity = {
         id: companion.id,
         name: companion.name,
         type: isMob ? 'mob' : 'companion',
@@ -77,6 +211,18 @@ export class ZoneManager {
         inCombat: false,
         isMachine: true,
         isAlive: companion.isAlive ?? true,
+        movementProfile: this.resolveMovementProfileFromTag(companion.tag),
+      };
+
+      this.entities.set(companion.id, entity);
+
+      // Register with physics system
+      this.physicsSystem.registerEntity({
+        id: companion.id,
+        position: entity.position,
+        boundingVolume: PhysicsSystem.createBoundingSphere(entity.position, 0.5),
+        type: 'dynamic',
+        collisionLayer: CollisionLayer.ENTITIES,
       });
     }
 
@@ -103,9 +249,25 @@ export class ZoneManager {
       inCombat: false,
       isMachine,
       isAlive: character.isAlive ?? true,
+      movementProfile: this.resolveMovementProfileFromCharacter(character),
     };
 
+    const freedive = this.resolveFreediveProfileFromCharacter(character);
+    entity.freediveSkill = freedive.skill;
+    entity.freediveMaxDepth = freedive.maxDepth;
+    entity.freediveMaxSeconds = freedive.maxSeconds;
+
     this.entities.set(character.id, entity);
+
+    // Register with physics system
+    this.physicsSystem.registerEntity({
+      id: character.id,
+      position: entity.position,
+      boundingVolume: PhysicsSystem.createBoundingSphere(entity.position, 0.5),
+      type: 'dynamic',
+      collisionLayer: CollisionLayer.ENTITIES,
+    });
+
     logger.info({ characterId: character.id, characterName: character.name, zoneId: this.zone.id }, 'Player entered zone');
   }
 
@@ -116,6 +278,7 @@ export class ZoneManager {
     const entity = this.entities.get(characterId);
     if (entity) {
       this.entities.delete(characterId);
+      this.physicsSystem.unregisterEntity(characterId);
       logger.info({ characterId, characterName: entity.name, zoneId: this.zone.id }, 'Player left zone');
     }
   }
@@ -126,7 +289,47 @@ export class ZoneManager {
   updatePlayerPosition(characterId: string, position: Vector3): void {
     const entity = this.entities.get(characterId);
     if (entity) {
+      const canFreedive = entity.movementProfile === 'aquatic' || entity.movementProfile === 'amphibious' || (entity.freediveMaxSeconds ?? 0) > 0;
+      const underwaterSeconds = this.updateUnderwaterSeconds(characterId, entity.position, canFreedive);
+
+      // Validate movement with physics before updating
+      const validation = this.physicsSystem.validateMovement(
+        characterId,
+        entity.position,
+        position,
+        0.5,
+        {
+          allowUnderwater: canFreedive,
+          maxUnderwaterDepth: entity.movementProfile === 'terrestrial' ? entity.freediveMaxDepth : undefined,
+          maxUnderwaterSeconds: entity.movementProfile === 'terrestrial' ? entity.freediveMaxSeconds : undefined,
+          currentUnderwaterSeconds: entity.movementProfile === 'terrestrial' ? underwaterSeconds : undefined,
+        }
+      );
+
+      if (!validation.valid) {
+        if (validation.adjustedPosition) {
+          // Physics adjusted the position (e.g., terrain collision)
+          position = validation.adjustedPosition;
+          logger.debug({
+            characterId,
+            reason: validation.reason,
+            original: entity.position,
+            adjusted: position
+          }, 'Movement adjusted by physics');
+        } else {
+          // Movement blocked by physics
+          logger.debug({
+            characterId,
+            reason: validation.reason,
+            blockedPosition: position
+          }, 'Movement blocked by physics');
+          return; // Don't update position
+        }
+      }
+
       entity.position = position;
+      // Update physics system with validated position
+      this.physicsSystem.updateEntity(characterId, position);
     }
   }
 
@@ -278,6 +481,9 @@ export class ZoneManager {
       const bearing = this.calculateBearing(listenerPosition, entity.position);
       const elevation = this.calculateElevation(listenerPosition, entity.position);
 
+      // Get animation state
+      const animationState = this.animationLockSystem.getState(entity.id);
+
       return {
         id: entity.id,
         name: entity.name,
@@ -287,6 +493,7 @@ export class ZoneManager {
         bearing,
         elevation,
         range: Math.round(range * 100) / 100, // Round to 2 decimal places
+        currentAction: animationState.currentAction,
       };
     });
 
@@ -672,6 +879,14 @@ export class ZoneManager {
     };
 
     this.entities.set(data.id, entity);
+    this.physicsSystem.registerEntity({
+      id: data.id,
+      position: entity.position,
+      boundingVolume: PhysicsSystem.createBoundingSphere(entity.position, 0.5),
+      type: 'dynamic',
+      collisionLayer: CollisionLayer.ENTITIES,
+    });
+    entity.movementProfile = this.resolveMovementProfileFromSpeciesId(data.speciesId);
     logger.debug({ entityId: data.id, species: data.speciesId, zoneId: this.zone.id }, 'Wildlife spawned');
   }
 
@@ -682,6 +897,7 @@ export class ZoneManager {
     const entity = this.entities.get(entityId);
     if (entity && entity.type === 'wildlife') {
       this.entities.delete(entityId);
+      this.physicsSystem.unregisterEntity(entityId);
       logger.debug({ entityId, zoneId: this.zone.id }, 'Wildlife removed');
     }
   }
@@ -697,6 +913,7 @@ export class ZoneManager {
       if (behavior !== undefined) {
         entity.behavior = behavior;
       }
+      this.physicsSystem.updateEntity(entityId, position);
     }
   }
 

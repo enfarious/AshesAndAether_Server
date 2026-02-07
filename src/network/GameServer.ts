@@ -106,6 +106,10 @@ export class GameServer {
     logger.info('Connecting to database...');
     await db.connect();
 
+    // Initialize spawn point service
+    logger.info('Initializing spawn point service...');
+    SpawnPointService.initialize();
+
     // Start HTTP server (shared with WebSocket)
     this.httpServer = createServer(this.app);
     this.httpServer.listen(this.config.port, '0.0.0.0', () => {
