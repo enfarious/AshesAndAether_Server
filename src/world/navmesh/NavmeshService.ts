@@ -7,6 +7,8 @@ import { NavmeshPipeline, WalkabilityFlag, type TileNavmesh } from '@/world/tile
 import type { Vector3 } from '@/network/protocol/types';
 
 const METERS_PER_DEGREE = 111320;
+const MAX_PATH_DISTANCE_METERS = 500;
+const MAX_PATH_NODES = 4096;
 
 interface NavmeshPathResult {
   waypoints: Vector3[];
@@ -31,6 +33,11 @@ export class NavmeshService {
   async findPath(start: Vector3, end: Vector3): Promise<NavmeshPathResult | null> {
     const meta = this.elevationService?.getMetadata();
     if (!meta) return null;
+
+    const dx = end.x - start.x;
+    const dz = end.z - start.z;
+    const planarDistance = Math.sqrt(dx * dx + dz * dz);
+    if (planarDistance > MAX_PATH_DISTANCE_METERS) return null;
 
     const startLatLon = this.worldToLatLon(start.x, start.z, meta);
     const endLatLon = this.worldToLatLon(end.x, end.z, meta);
@@ -63,6 +70,7 @@ export class NavmeshService {
 
     const path = this.findPathInGrid(navmesh, startCell, endCell);
     if (!path || path.length === 0) return null;
+    if (path.length > MAX_PATH_NODES) return null;
 
     const waypoints = this.cellsToWaypoints(path, bounds, resolution, meta, start.y);
     if (waypoints.length === 0) return null;

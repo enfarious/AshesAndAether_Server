@@ -164,7 +164,7 @@ export class CharacterService {
     characterId: string,
     position: { x: number; y: number; z: number; heading?: number; saveLastPosition?: boolean }
   ): Promise<void> {
-    await prisma.character.update({
+    const result = await prisma.character.updateMany({
       where: { id: characterId },
       data: {
         positionX: position.x,
@@ -180,6 +180,11 @@ export class CharacterService {
         lastSeenAt: new Date(),
       },
     });
+
+    // Ignore missing records (e.g., ephemeral guest character already deleted)
+    if (result.count === 0) {
+      return;
+    }
   }
 
   /**

@@ -883,13 +883,14 @@ export class DistributedWorldManager {
           break;
         }
         case 'movement_start': {
-          const { heading, speed, distance, target, targetRange, startPosition } = event.data as {
+          const { heading, speed, distance, target, targetRange, startPosition, targetPosition } = event.data as {
             heading?: number;
             speed: MovementSpeed;
             distance?: number;
             target?: string;
             targetRange: number;
             startPosition: Vector3;
+            targetPosition?: { x: number; y?: number; z: number };
           };
 
           // Physics validation: Check if movement is physically possible
@@ -921,6 +922,7 @@ export class DistributedWorldManager {
             speed,
             distance,
             target,
+            targetPosition,
             targetRange,
           };
 

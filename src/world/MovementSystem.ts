@@ -19,6 +19,7 @@ import { NavmeshService } from './navmesh/NavmeshService';
 
 // Conversion: 1 foot = 0.3048 meters
 const FEET_TO_METERS = 0.3048;
+const MAX_TARGET_DISTANCE_METERS = 500;
 
 export interface MovementState {
   characterId: string;
@@ -180,6 +181,13 @@ export class MovementSystem {
     let pathWaypoints: Vector3[] | undefined;
 
     if (pathTarget) {
+      const dx = pathTarget.x - startPosition.x;
+      const dz = pathTarget.z - startPosition.z;
+      const planarDistance = Math.sqrt(dx * dx + dz * dz);
+      if (planarDistance > MAX_TARGET_DISTANCE_METERS) {
+        logger.warn({ characterId, distance: planarDistance }, 'Movement target too far');
+        return false;
+      }
       const navmeshPath = await this.navmeshService.findPath(startPosition, pathTarget);
       if (navmeshPath?.waypoints?.length) {
         pathWaypoints = navmeshPath.waypoints;
