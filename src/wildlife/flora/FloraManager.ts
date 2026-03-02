@@ -424,6 +424,33 @@ export class FloraManager {
     return count;
   }
 
+  // ========== Seeding ============================================================
+
+  /**
+   * Pre-populate the zone with mature plants so the world isn't empty on startup.
+   * Spawns 30–50 % of max capacity for each biome-appropriate species.
+   */
+  seedInitialPlants(): void {
+    const now = Date.now();
+    const spawnConfigs = getAllPlantSpawnConfigs();
+
+    for (const config of spawnConfigs) {
+      if (!config.biomes.includes(this.zoneBiome)) continue;
+
+      const targetCount = Math.floor(config.maxPerZone * (0.3 + Math.random() * 0.2));
+      let attempts = 0;
+      let spawned = 0;
+
+      while (spawned < targetCount && attempts < targetCount * 3) {
+        attempts++;
+        const position = this.findSpawnPosition(config);
+        if (!position) break;
+        const plant = this.spawnPlant(config.speciesId, position, now, true);
+        if (plant) spawned++;
+      }
+    }
+  }
+
   // ========== Public API ==========
 
   getPlant(plantId: string): PlantEntity | undefined {

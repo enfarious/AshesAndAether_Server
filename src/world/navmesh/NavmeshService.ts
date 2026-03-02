@@ -272,10 +272,11 @@ export class NavmeshService {
     const centerLon = meta.center?.lon ?? meta.originLon;
 
     const x = (lon - centerLon) * METERS_PER_DEGREE * Math.cos((centerLat * Math.PI) / 180);
-    const z = (lat - centerLat) * METERS_PER_DEGREE;
+    // lat > centerLat means north of centre = negative Z (Z+ = south)
+    const z = -(lat - centerLat) * METERS_PER_DEGREE;
 
     const elevation = this.elevationService?.getElevationMeters(lat, lon);
-    const y = elevation !== null && elevation !== undefined ? elevation + 1.7 : fallbackY;
+    const y = elevation ?? fallbackY;
 
     return { x, y, z };
   }
@@ -284,7 +285,8 @@ export class NavmeshService {
     const centerLat = meta.center?.lat ?? meta.originLat;
     const centerLon = meta.center?.lon ?? meta.originLon;
 
-    const lat = centerLat + z / METERS_PER_DEGREE;
+    // Z+ = south = latitude decreases (matches PhysicsSystem convention)
+    const lat = centerLat - z / METERS_PER_DEGREE;
     const lon = centerLon + x / (METERS_PER_DEGREE * Math.cos((centerLat * Math.PI) / 180));
 
     return { lat, lon };

@@ -12,3 +12,6 @@ export { CharacterService } from './services/CharacterService';
 export { CompanionService } from './services/CompanionService';
 export { MobService } from './services/MobService';
 export { ZoneService } from './services/ZoneService';
+export { InventoryService } from './services/InventoryService';
+export { LootService } from './services/LootService';
+export { WalletService } from './services/WalletService';

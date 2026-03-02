@@ -9,6 +9,7 @@ import { logger } from '@/utils/logger';
 import { db } from '@/database';
 import { ConnectionManager } from './ConnectionManager';
 import { WorldManager } from '@/world/WorldManager';
+import { createTileDataRouter } from '@/world/tiles/TileDataRouter';
 
 interface GameServerConfig {
   port: number;
@@ -90,6 +91,9 @@ export class GameServer {
         uptime: process.uptime(),
       });
     });
+
+    // Tile terrain data API (for wildlife sim and other external consumers)
+    this.app.use('/api/tiles', createTileDataRouter());
 
     // API routes placeholder
     this.app.get('/api/info', (_req, res) => {

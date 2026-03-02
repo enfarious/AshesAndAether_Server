@@ -25,10 +25,13 @@ import { senseCommand } from './perception/sense';
 import { helpCommand } from './system/help';
 import { statsCommand } from './system/stats';
 import { inventoryCommand } from './system/inventory';
+import { abilitiesCommand } from './system/abilities';
 
 import { moveCommand } from './movement/move';
 import { stopCommand } from './movement/stop';
 import { companionCommand } from './world/companion';
+import { harvestCommand } from './world/harvest';
+import { unstuckCommand } from './world/unstuck';
 import { marketCommand } from './market/market';
 
 /**
@@ -52,6 +55,7 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(helpCommand);
   registry.register(statsCommand);
   registry.register(inventoryCommand);
+  registry.register(abilitiesCommand);
   registry.register(useCommand);
   registry.register(equipCommand);
   registry.register(unequipCommand);
@@ -62,6 +66,8 @@ export function registerAllCommands(registry: CommandRegistry): void {
 
   // World commands
   registry.register(companionCommand);
+  registry.register(harvestCommand);
+  registry.register(unstuckCommand);
 
   // Market commands
   registry.register(marketCommand);

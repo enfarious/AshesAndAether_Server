@@ -11,6 +11,7 @@ import { MessageBus, MessageType, ZoneRegistry, type ClientMessagePayload, type 
 import { GatewayConnectionManager } from './GatewayConnectionManager';
 import { setupAuth, registerAuthRoutes } from '@/auth';
 import { SpawnPointService } from '@/world/SpawnPointService';
+import { createTileDataRouter } from '@/world/tiles/TileDataRouter';
 
 interface GatewayConfig {
   port: number;
@@ -127,6 +128,9 @@ export class GatewayServer {
       res.json({ zones });
     });
 
+    // Tile terrain data API (for wildlife sim and other external consumers)
+    this.app.use('/api/tiles', createTileDataRouter());
+
     this.app.get('/api/servers', async (_req, res) => {
       const servers = await this.zoneRegistry.getActiveServers();
       const serverStatus = await Promise.all(
@@ -220,7 +224,7 @@ export class GatewayServer {
     // Send message to specific client
     this.io.to(socketId).emit(event, data);
 
-    logger.debug({ socketId, event }, 'Sent message to client');
+    logger.info({ socketId, event }, '[Gateway] Sent message to client');
   }
 
   async shutdown(): Promise<void> {

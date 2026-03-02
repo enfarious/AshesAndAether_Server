@@ -1,5 +1,7 @@
 import { logger } from '@/utils/logger';
-import { CharacterService, CompanionService, MobService, ZoneService } from '@/database';
+import { CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService } from '@/database';
+import { randomUUID } from 'crypto';
+import type { LootSessionStartPayload, LootItemResultPayload, LootSessionEndPayload, LootSessionItem } from '@/network/protocol/types';
 import { ZoneManager } from './ZoneManager';
 import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
@@ -8,6 +10,14 @@ import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands } 
 import type { CommandContext, CommandEvent } from '@/commands/types';
 import type { Character, Companion } from '@prisma/client';
 import { StatCalculator } from '@/game/stats/StatCalculator';
+import {
+  unlockAbility,
+  slotActiveAbility,
+  slotPassiveAbility,
+  getAbilitySummary,
+  getNodeInfo,
+  listWebNodes,
+} from '@/game/abilities/tree';
 import { CombatManager } from '@/combat/CombatManager';
 import { AbilitySystem } from '@/combat/AbilitySystem';
 import { DamageCalculator } from '@/combat/DamageCalculator';
@@ -15,9 +25,15 @@ import { buildCombatNarrative } from '@/combat/CombatNarratives';
 import type { CombatAbilityDefinition, CombatStats, DamageProfileSegment, PhysicalDamageType } from '@/combat/types';
 import type { DamageType } from '@/game/abilities/AbilityTypes';
 import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
-import { WildlifeManager, type BiomeType } from '@/wildlife';
+import { WildlifeManager, getSpecies, type BiomeType } from '@/wildlife';
+import { WildlifeBridge, type IWildlifeWorld, type PlayerPositionMessage } from '@/wildlife/WildlifeBridge';
+import { FloraManager } from '@/wildlife/flora/FloraManager';
+import { getPlantSpecies } from '@/wildlife/flora/species';
+import { MobWanderSystem } from './MobWanderSystem';
+import { WeatherBridge } from './WeatherBridge';
+import { ClimateBridge } from './ClimateBridge';
 import { PartyService } from '@/party/PartyService';
-import { buildDamageProfiles, getPrimaryDamageType, getPrimaryPhysicalType, getWeaponDefinition } from '@/items/WeaponData';
+import { buildDamageProfiles, getPrimaryDamageType, getPrimaryPhysicalType, getWeaponDefinition, getWeaponRange, UNARMED_RANGE } from '@/items/WeaponData';
 import { buildQualityBiasMultipliers, type QualityBiasMultipliers } from '@/items/ArmorData';
 import {
   CorruptionSystem,
@@ -27,13 +43,42 @@ import {
   type ZoneCorruptionData,
 } from '@/corruption';
 import { MarketBridge } from '@/market/MarketBridge';
+import { SpawnPointService } from '@/world/SpawnPointService';
 
 const FEET_TO_METERS = 0.3048;
+const PHYSICS_DEBUG = process.env.PHYSICS_DEBUG === 'true';
 const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
+
+// ── Range-check geometry ───────────────────────────────────────────────────
+// Every entity is registered with a 0.5 m bounding sphere.
+// Effective melee reach = arm reach past the sphere edge + both radii + weapon.
+const ENTITY_RADIUS = 0.5; // metres — matches PhysicsSystem bounding sphere
+const BASE_REACH    = 1.0; // metres — arm reach beyond sphere edge (H2H baseline)
 
 const BIOME_FALLBACK: BiomeType = 'forest';
 const PARTY_MAX_MEMBERS = 5;
 const PARTY_STATUS_INTERVAL_MS = 1000;
+
+/** Map WildlifeManager behavior strings to client animation action names. */
+function _wildlifeBehaviorToAnimation(behavior: string): string {
+  switch (behavior) {
+    case 'fleeing':
+    case 'hunting':
+      return 'running';
+    case 'wandering':
+    case 'foraging':
+    case 'stalking':
+    case 'seeking_mate':
+    case 'migrating':
+      return 'walking';
+    case 'dead':
+    case 'dying':
+      return 'dead';
+    default:
+      // idle, resting, eating, drinking, mating, defending, attacking
+      return 'idle';
+  }
+}
 
 /**
  * Distributed World Manager - manages zones across multiple servers
@@ -41,12 +86,14 @@ const PARTY_STATUS_INTERVAL_MS = 1000;
  * This version uses Redis pub/sub for inter-server communication
  * instead of direct Socket.IO access
  */
-export class DistributedWorldManager {
+export class DistributedWorldManager implements IWildlifeWorld {
   private zones: Map<string, ZoneManager> = new Map();
+  private zoneBiomes: Map<string, BiomeType> = new Map();
   private characterToZone: Map<string, string> = new Map();
   private companionToZone: Map<string, string> = new Map();
   private npcControllers: Map<string, NPCAIController> = new Map(); // companionId -> controller
   private llmService: LLMService;
+  private wildlifeBridge: WildlifeBridge | null = null;
   private recentChatMessages: Map<string, { sender: string; channel: string; message: string; timestamp: number }[]> = new Map(); // zoneId -> messages
   private proximityRosterHashes: Map<string, string> = new Map(); // characterId -> roster hash (for dirty checking - legacy)
   private previousRosters: Map<string, any> = new Map(); // characterId -> previous roster (for delta calculation)
@@ -54,12 +101,25 @@ export class DistributedWorldManager {
   private abilitySystem: AbilitySystem;
   private damageCalculator: DamageCalculator;
   private respawnTimers: Map<string, NodeJS.Timeout> = new Map();
+  /** Timestamps (ms) of the last /unstuck use per characterId — enforces cooldown. */
+  private readonly unstuckCooldowns = new Map<string, number>();
   private movementSystem: MovementSystem;
   private attackSpeedBonusCache: Map<string, number> = new Map();
   private wildlifeManagers: Map<string, WildlifeManager> = new Map();
+  private floraManagers:   Map<string, FloraManager>    = new Map();
+  private mobWanderSystems: Map<string, MobWanderSystem> = new Map();
+  private weatherBridges:  Map<string, WeatherBridge>  = new Map();
+  private climateBridges:  Map<string, ClimateBridge>  = new Map();
   private partyService: PartyService;
   private partyResourceCache: Map<string, { currentStamina: number; maxStamina: number; currentMana: number; maxMana: number }> = new Map();
   private lastPartyStatusBroadcastAt: number = 0;
+  private physicsLogAccumulator: number = 0;
+  /** Last broadcast environment key per zone — used to suppress no-op broadcasts. */
+  private lastEnvKeys: Map<string, string> = new Map();
+  /** Accumulated seconds since the ZoneRegistry env value was last refreshed (even without a bucket change). */
+  private envRegistryRefreshAccum: number = 0;
+  /** Refresh ZoneRegistry env every 60 s so stale mid-bucket values don't persist. */
+  private static readonly ENV_REGISTRY_REFRESH_SECS = 60;
 
   // Corruption system
   private corruptionSystem: CorruptionSystem;
@@ -72,6 +132,55 @@ export class DistributedWorldManager {
   private commandRegistry: CommandRegistry;
   private commandParser: CommandParser;
   private commandExecutor: CommandExecutor | null = null;
+
+  // ── Loot system ────────────────────────────────────────────────────────────
+  /** characterId → socketId for targeted loot messages */
+  private _charToSocket: Map<string, string> = new Map();
+  /** characterId → character level cache for XP scaling */
+  private _charLevel: Map<string, number> = new Map();
+
+  // ── Wildlife position broadcast ─────────────────────────────────────────
+  /**
+   * Per-zone queue of wildlife entity updates collected during the current
+   * tick.  Flushed once per tick as a single batched state_update so we
+   * don't spam clients with one packet per animal per 500 ms.
+   */
+  private _pendingWildlifeUpdates: Map<string, Array<{
+    id: string; name: string; type: 'wildlife';
+    position: { x: number; y: number; z: number };
+    heading: number; currentAction: string;
+    movementDuration: number; movementSpeed: number;
+  }>> = new Map();
+
+  /** per-mob damage log: mobId → { firstAttackerId, damages, killerId, zoneId } */
+  private _damageLog: Map<string, {
+    firstAttackerId: string;
+    damages:         Map<string, number>;
+    killerId:        string;
+    zoneId:          string;
+  }> = new Map();
+
+  /** Active NWP loot sessions: sessionId → session state */
+  private _lootSessions: Map<string, {
+    sessionId:       string;
+    zoneId:          string;
+    mobName:         string;
+    memberCharIds:   string[];
+    items: {
+      id:          string;
+      templateId:  string;
+      name:        string;
+      itemType:    string;
+      description: string;
+      iconUrl?:    string;
+      quantity:    number;
+      rolls:       Map<string, 'need' | 'want' | 'pass' | null>;
+      resolved:    boolean;
+    }[];
+    gold:      number;
+    expiresAt: number;
+    timer:     NodeJS.Timeout;
+  }> = new Map();
 
   constructor(
     private messageBus: MessageBus,
@@ -88,7 +197,7 @@ export class DistributedWorldManager {
 
     // Set up movement completion callback
     this.movementSystem.setMovementCompleteCallback(
-      (characterId, reason, finalPosition) => this.onMovementComplete(characterId, reason, finalPosition)
+      (characterId, reason, finalPosition, source) => this.onMovementComplete(characterId, reason, finalPosition, source)
     );
 
     // Initialize corruption system
@@ -96,6 +205,10 @@ export class DistributedWorldManager {
 
     // Initialize market bridge
     this.marketBridge = new MarketBridge(this.messageBus);
+
+    // Start the Rust wildlife-sim bridge (connects to wildlife:events Redis channel)
+    this.wildlifeBridge = new WildlifeBridge(this.messageBus, this);
+    void this.wildlifeBridge.start();
     this.corruptionSystem.setBroadcastCallback(
       (characterId, corruption, state, previousState, delta) =>
         this.broadcastCorruptionUpdate(characterId, corruption, state, previousState, delta)
@@ -148,6 +261,7 @@ export class DistributedWorldManager {
 
       // Initialize wildlife manager for this zone
       const biomeType = this.resolveBiomeType(zone.terrainType);
+      this.zoneBiomes.set(zone.id, biomeType);
       const wildlifeManager = new WildlifeManager(zone.id, biomeType);
       wildlifeManager.setCallbacks({
         onEntitySpawn: (entity) => {
@@ -168,7 +282,25 @@ export class DistributedWorldManager {
             entity.heading,
             entity.currentBehavior
           );
-          void this.broadcastNearbyUpdate(zone.id);
+          // Queue position update for batched broadcast this tick
+          if (!this._pendingWildlifeUpdates.has(zone.id)) {
+            this._pendingWildlifeUpdates.set(zone.id, []);
+          }
+          const species = getSpecies(entity.speciesId);
+          const isFleeing = entity.currentBehavior === 'fleeing' || entity.currentBehavior === 'hunting';
+          const entitySpeed = species
+            ? (isFleeing ? species.baseSpeed * species.fleeSpeedMultiplier : species.baseSpeed)
+            : 2.0;
+          this._pendingWildlifeUpdates.get(zone.id)!.push({
+            id: entity.id,
+            name: entity.name,
+            type: 'wildlife',
+            position: entity.position,
+            heading: entity.heading,
+            currentAction: _wildlifeBehaviorToAnimation(entity.currentBehavior),
+            movementDuration: 520,   // slightly longer than tick interval for smooth lerp
+            movementSpeed: entitySpeed,
+          });
         },
         onEntityDeath: (entity) => {
           zoneManager.removeWildlife(entity.id);
@@ -187,11 +319,73 @@ export class DistributedWorldManager {
       });
       this.wildlifeManagers.set(zone.id, wildlifeManager);
 
+      // Initialize flora manager for this zone
+      const floraManager = new FloraManager(zone.id, biomeType);
+      floraManager.setCallbacks({
+        onPlantSpawn: (plant) => {
+          // Notify clients of the new plant entity
+          void this._broadcastPlantToZone(zone.id, plant.id, plant.speciesId, plant.position, plant.currentStage, 'added');
+        },
+        onPlantUpdate: (plant) => {
+          void this._broadcastPlantToZone(zone.id, plant.id, plant.speciesId, plant.position, plant.currentStage, 'updated');
+        },
+        onPlantHarvest: (plant, harvesterId, items) => {
+          // Award items to the harvester
+          void this._awardHarvestItems(harvesterId, items);
+          if (!plant.isAlive) {
+            void this._broadcastPlantRemoved(zone.id, plant.id);
+          } else {
+            void this._broadcastPlantToZone(zone.id, plant.id, plant.speciesId, plant.position, plant.currentStage, 'updated');
+          }
+          // Notify Rust sim
+          void this.wildlifeBridge?.reportPlantHarvest(plant.id, harvesterId);
+        },
+      });
+      // Seed some plants immediately so the zone isn't bare at startup
+      floraManager.seedInitialPlants();
+      this.floraManagers.set(zone.id, floraManager);
+
+      // Register all living mobs with the wander system
+      const wanderSystem = new MobWanderSystem();
+      for (const entity of zoneManager.getAllEntities()) {
+        if (entity.type === 'mob' && entity.isAlive) {
+          wanderSystem.register(entity.id, entity.position);
+        }
+      }
+      this.mobWanderSystems.set(zone.id, wanderSystem);
+
+      // Initialize weather & climate bridges for this zone
+      {
+        const halfX = zone.sizeX / 2;
+        const halfZ = zone.sizeZ / 2;
+        const boundsMin = { x: zone.worldX - halfX, z: zone.worldY - halfZ };
+        const boundsMax = { x: zone.worldX + halfX, z: zone.worldY + halfZ };
+
+        const redisClient = this.messageBus.getClient();
+        const weatherBridge = new WeatherBridge(zone.id, redisClient, boundsMin, boundsMax);
+        this.weatherBridges.set(zone.id, weatherBridge);
+
+        const climateBridge = new ClimateBridge(zone.id, redisClient);
+        this.climateBridges.set(zone.id, climateBridge);
+      }
+
       // Initialize NPC AI controllers for this zone
       await this.initializeNPCsForZone(zoneId);
 
       // Register zone in registry
       await this.zoneRegistry.assignZone(zoneId, this.serverId);
+
+      // Write live environment immediately so the gateway has a fresh timeOfDayValue
+      // for any world_entry packets sent before the first bucket transition fires.
+      await this.zoneRegistry.setZoneEnvironment(zoneId, {
+        timeOfDay:      zoneManager.getTimeOfDayString(),
+        timeOfDayValue: zoneManager.getTimeOfDayNormalized(),
+        weather:        zoneManager.getWeather(),
+        lighting:       zoneManager.getLighting(),
+      });
+
+      // Publish authoritative entity positions so the gateway can use them at world_entry
+      await this.publishZoneEntities(zone.id, zoneManager);
     }
 
     // Subscribe to zone input messages
@@ -240,13 +434,14 @@ export class DistributedWorldManager {
       await this.messageBus.subscribe(channel, (message) => this.handleZoneMessage(message));
     }
 
-    logger.info({ zones: Array.from(this.zones.keys()) }, 'Subscribed to zone input channels');
+    logger.info({ zones: Array.from(this.zones.keys()) }, '[DWM] Subscribed to zone input channels');
   }
 
   /**
    * Handle incoming zone message from Redis
    */
   private handleZoneMessage(message: MessageEnvelope): void {
+    logger.info({ type: message.type, characterId: (message as any).characterId }, '[DWM] handleZoneMessage received');
     switch (message.type) {
       case MessageType.PLAYER_JOIN_ZONE:
         this.handlePlayerJoinZone(message);
@@ -278,6 +473,14 @@ export class DistributedWorldManager {
       case MessageType.NPC_CHAT:
         this.handleNpcChat(message);
         break;
+      case MessageType.PLAYER_RESPAWN:
+        void this.handlePlayerRespawn(message);
+        break;
+      case MessageType.PLAYER_ACTION:
+        if ((message.payload as { action?: string }).action === 'loot_roll') {
+          void this._handleLootRoll(message);
+        }
+        break;
       default:
         logger.warn({ type: message.type }, 'Unhandled message type');
     }
@@ -301,6 +504,8 @@ export class DistributedWorldManager {
 
     zoneManager.addPlayer(character, socketId, isMachine ?? false);
     this.characterToZone.set(character.id, character.zoneId);
+    this._charToSocket.set(character.id, socketId);
+    this._charLevel.set(character.id, character.level);
     this.partyResourceCache.set(character.id, {
       currentStamina: character.currentStamina,
       maxStamina: character.maxStamina,
@@ -327,6 +532,19 @@ export class DistributedWorldManager {
     // Broadcast proximity updates to nearby players
     await this.broadcastNearbyUpdate(character.zoneId);
 
+    // Send current plant entities so the client can render flora
+    await this._sendPlantsToPlayer(character.id, character.zoneId);
+
+    // Correct the player's clock — world_entry may carry a stale timeOfDayValue from
+    // ZoneRegistry (which only updates on bucket transitions, up to ~12 min intervals).
+    // Sending the live value now overwrites it via applyZonePartial on the client.
+    await this._sendEnvToPlayer(character.id, character.zoneId);
+
+    // ── Entity exchange: make joining player and existing players see each other ──
+    // The world_entry Redis snapshot intentionally excludes players (they move too
+    // frequently), so we need to send them explicitly via state_update.
+    await this._exchangePlayerEntities(character, zoneManager);
+
     logger.info({ characterId: character.id, zoneId: character.zoneId }, 'Player joined zone');
   }
 
@@ -346,6 +564,8 @@ export class DistributedWorldManager {
 
     zoneManager.removePlayer(characterId);
     this.characterToZone.delete(characterId);
+    this._charToSocket.delete(characterId);
+    this._charLevel.delete(characterId);
 
     // Clean up proximity roster data
     this.proximityRosterHashes.delete(characterId);
@@ -358,6 +578,24 @@ export class DistributedWorldManager {
 
     // Remove from registry
     await this.zoneRegistry.removePlayer(characterId);
+
+    // Tell remaining clients to remove this player's entity from their scene
+    const removePayload = {
+      timestamp: Date.now(),
+      entities: { removed: [characterId] },
+    };
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const socketId = zoneManager.getSocketIdForCharacter(charId);
+      if (!socketId) continue;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: charId,
+        socketId,
+        payload: { socketId, event: 'state_update', data: removePayload },
+        timestamp: Date.now(),
+      });
+    }
 
     // Broadcast proximity updates
     await this.broadcastNearbyUpdate(zoneId);
@@ -372,7 +610,7 @@ export class DistributedWorldManager {
     const { characterId, zoneId, method, position, heading, speed } = message.payload as {
       characterId: string;
       zoneId: string;
-      method?: 'position' | 'heading' | 'compass';
+      method?: 'position' | 'heading' | 'compass' | 'continuous';
       position?: { x: number; y: number; z: number };
       heading?: number;
       speed?: MovementSpeed;
@@ -408,6 +646,7 @@ export class DistributedWorldManager {
         speed: movementSpeed,
         targetPosition: { x: position.x, y: position.y, z: position.z },
         targetRange: 0.5, // Stop within 0.5m of target
+        source: 'direct', // Real-time socket move — no narrative on completion
       });
 
       if (started) {
@@ -421,11 +660,34 @@ export class DistributedWorldManager {
         startPosition,
         heading,
         speed: movementSpeed,
-        targetRange: 5,
+        targetRange: 500, // large range — client sends explicit stop on key release
+        source: 'direct', // Real-time socket move — no narrative on completion
       });
 
       if (started) {
         logger.debug({ characterId, heading, speed: movementSpeed }, 'Player movement started (heading)');
+      }
+    } else if (method === 'continuous' && heading !== undefined) {
+      // Continuous movement: if already moving, just update heading + heartbeat.
+      // Otherwise start fresh.  Client sends updates at ~10 Hz as a keepalive;
+      // server auto-stops if heartbeat expires (see MovementSystem).
+      if (this.movementSystem.isMoving(characterId)) {
+        this.movementSystem.updateHeading(characterId, heading);
+      } else {
+        const started = await this.movementSystem.startMovement({
+          characterId,
+          zoneId,
+          startPosition,
+          heading,
+          speed: movementSpeed,
+          targetRange: 0,   // no target — runs until explicit stop or heartbeat timeout
+          source: 'direct',
+        });
+        if (started) {
+          // Enable heartbeat tracking for this movement
+          this.movementSystem.refreshHeartbeat(characterId);
+          logger.debug({ characterId, heading, speed: movementSpeed }, 'Continuous movement started');
+        }
       }
     } else if (position) {
       // Legacy: direct position update (teleport) - for backwards compatibility
@@ -460,7 +722,7 @@ export class DistributedWorldManager {
     const { characterId, zoneId, channel, text } = message.payload as {
       characterId: string;
       zoneId: string;
-      channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch';
+      channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch' | 'party';
       text: string;
     };
 
@@ -473,6 +735,38 @@ export class DistributedWorldManager {
     if (!sender) {
       logger.warn({ characterId }, 'Sender character not found for chat');
       return null;
+    }
+
+    // ── Party chat: broadcast to all party members regardless of zone ────
+    if (channel === 'party') {
+      const partyId = await this.partyService.getPartyIdForMember(characterId);
+      if (!partyId) {
+        logger.warn({ characterId }, '[handlePlayerChat] Party chat but player has no party');
+        return;
+      }
+      const party = await this.partyService.getPartyInfo(partyId);
+      if (!party) return;
+
+      const chatData = {
+        channel: 'party',
+        sender: sender.name,
+        senderId: characterId,
+        message: text,
+        timestamp: Date.now(),
+      };
+
+      for (const memberId of party.members) {
+        const location = await this.zoneRegistry.getPlayerLocation(memberId);
+        if (!location) continue;
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: memberId,
+          socketId: location.socketId,
+          payload: { socketId: location.socketId, event: 'chat', data: chatData },
+          timestamp: Date.now(),
+        });
+      }
+      return;
     }
 
     // Determine range based on channel
@@ -546,13 +840,35 @@ export class DistributedWorldManager {
       });
     }
 
+    // Echo the message back to the sender so they see their own chat
+    const senderSocketId = this._charToSocket.get(characterId);
+    if (senderSocketId) {
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId: senderSocketId,
+        payload: {
+          socketId: senderSocketId,
+          event: 'chat',
+          data: {
+            channel,
+            sender: sender.name,
+            senderId: characterId,
+            message: formattedMessage,
+            timestamp: Date.now(),
+          },
+        },
+        timestamp: Date.now(),
+      });
+    }
+
     // Track message for NPC AI context
     this.trackChatMessage(zoneId, sender.name, channel, formattedMessage);
 
     // Trigger NPC responses
     await this.triggerNPCResponses(zoneId, senderPosition, range);
 
-    logger.debug({ characterId, channel, recipientCount: nearbySocketIds.length }, 'Chat message broadcast');
+    logger.debug({ characterId, channel, recipientCount: nearbySocketIds.length + 1 }, 'Chat message broadcast');
   }
 
   private async handlePlayerCombatAction(message: MessageEnvelope): Promise<void> {
@@ -563,14 +879,23 @@ export class DistributedWorldManager {
       targetId: string;
     };
 
+    logger.info({ characterId, zoneId, abilityId, targetId }, '[DWM] handlePlayerCombatAction received');
+
     const zoneManager = this.zones.get(zoneId);
-    if (!zoneManager) return;
+    if (!zoneManager) {
+      logger.warn({ zoneId, knownZones: Array.from(this.zones.keys()) }, '[DWM] combat_action: zoneManager not found');
+      return;
+    }
 
     const attackerEntity = zoneManager.getEntity(characterId);
-    if (!attackerEntity || !attackerEntity.isAlive) return;
+    if (!attackerEntity || !attackerEntity.isAlive) {
+      logger.warn({ characterId, found: !!attackerEntity, isAlive: attackerEntity?.isAlive }, '[DWM] combat_action: attacker not found or dead');
+      return;
+    }
 
     const targetEntity = zoneManager.getEntity(targetId);
     if (!targetEntity || !targetEntity.isAlive) {
+      logger.warn({ targetId, found: !!targetEntity, isAlive: targetEntity?.isAlive }, '[DWM] combat_action: target not found or dead');
       await this.broadcastCombatEvent(zoneId, attackerEntity.position, {
         eventType: 'combat_error',
         timestamp: Date.now(),
@@ -580,10 +905,63 @@ export class DistributedWorldManager {
       return null;
     }
 
+    // basic_attack = enter combat / set auto-attack target.
+    // The auto-attack loop (processAutoAttacks) fires swings on weapon speed timer.
+    // ATB charges in parallel while inCombat = true, based on character speed stats.
+    if (abilityId === 'basic_attack') {
+      const now = Date.now();
+
+      // Resolve the ability first so we can use its range in the pre-combat gate.
+      const basicAttack = this.abilitySystem.getDefaultAbility();
+
+      // Populate attackSpeedBonusCache for this character so ATB charges correctly.
+      // Also gives us the equipped weapon range for the pre-combat range gate below.
+      const attackerSnapshot = await this.getCombatSnapshot(characterId, attackerEntity);
+
+      // Range check before entering combat — use the same logic as validateRange so the
+      // pre-combat gate is never stricter than the in-combat check.
+      // (weapon range takes priority; ability range is the fallback for unarmed.)
+      if (!this.validateRange(attackerEntity.position, targetEntity.position, basicAttack, attackerSnapshot?.weapon?.range)) {
+        await this.broadcastCombatEvent(zoneId, attackerEntity.position, {
+          eventType: 'combat_error',
+          timestamp: now,
+          narrative: 'Target out of range.',
+          eventTypeData: { reason: 'out_of_range', attackerId: characterId },
+        });
+        return;
+      }
+
+      // Start combat state (enables ATB charging)
+      this.combatManager.startCombat(characterId, now);
+
+      // Set auto-attack target (enables weapon timer)
+      this.combatManager.setAutoAttackTarget(characterId, targetId);
+
+      // Mark both combatants as in combat in the zone (visibility / proximity effects)
+      zoneManager.setEntityCombatState(characterId, true);
+      zoneManager.setEntityCombatState(targetId, true);
+
+      logger.info({ characterId, targetId }, '[DWM] basic_attack: entered combat, auto-attack target set');
+
+      // Fire an immediate first swing — don't make the player wait a full weapon cycle
+      await this.executeCombatAction(
+        zoneManager,
+        { id: attackerEntity.id, position: attackerEntity.position, type: attackerEntity.type },
+        { id: targetEntity.id,   position: targetEntity.position,   type: targetEntity.type },
+        basicAttack,
+        { isAutoAttack: true }
+      );
+
+      // Reset the timer so the *next* auto-attack waits a full weapon-speed cycle
+      this.combatManager.resetAutoAttackTimer(characterId);
+      return;
+    }
+
+    // All other abilities: direct execution path
     const ability =
       (await this.abilitySystem.getAbility(abilityId)) || this.abilitySystem.getDefaultAbility();
 
-    logger.debug({ characterId, targetId, abilityId: ability.id }, 'Combat action received');
+    logger.info({ characterId, targetId, abilityId: ability.id }, '[DWM] combat_action: executing');
 
     await this.executeCombatAction(
       zoneManager,
@@ -656,11 +1034,12 @@ export class DistributedWorldManager {
     for (const event of result.events) {
       switch (event.type) {
         case 'speech': {
-          const { channel, message, range, position } = event.data as {
+          const { channel, message, range, position, npcId } = event.data as {
             channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch';
             message: string;
             range: number;
             position: { x: number; y: number; z: number };
+            npcId?: string;
           };
 
           const rangeMeters = range * FEET_TO_METERS;
@@ -671,7 +1050,8 @@ export class DistributedWorldManager {
             position,
             channel,
             message,
-            rangeMeters
+            rangeMeters,
+            npcId,
           );
           break;
         }
@@ -701,6 +1081,7 @@ export class DistributedWorldManager {
             targetName: string;
             message: string;
           };
+          logger.info(`[processCommandResult] private_message from ${context.characterName} → ${targetName}: "${message}"`);
 
           const sent = await this.sendPrivateMessage(
             context.characterId,
@@ -710,6 +1091,7 @@ export class DistributedWorldManager {
           );
 
           if (!sent) {
+            logger.warn(`[processCommandResult] private_message delivery failed — ${targetName} not available`);
             return {
               success: false,
               error: `Player '${targetName}' is not available.`,
@@ -968,6 +1350,110 @@ export class DistributedWorldManager {
           // Companion cycling is handled client-side or by airlock control.
           break;
         }
+        case 'harvest': {
+          const { plantId } = event.data as { plantId?: string };
+          const harvestResult = await this.processHarvestCommand(
+            context.characterId,
+            context.zoneId,
+            context.position,
+            plantId,
+          );
+          overrideResponse = { success: harvestResult.success, message: harvestResult.message };
+          break;
+        }
+        case 'unstuck': {
+          const unstuckResult = await this.processUnstuckCommand(
+            context.characterId,
+            context.zoneId,
+            context.position,
+          );
+          overrideResponse = { success: unstuckResult.success, message: unstuckResult.message };
+          break;
+        }
+        case 'ability_unlock': {
+          const { nodeId } = event.data as { nodeId: string };
+          const unlockResult = await unlockAbility(context.characterId, nodeId);
+          overrideResponse = {
+            success: unlockResult.success,
+            message: unlockResult.message,
+            ...(unlockResult.remainingAp !== undefined && {
+              data: { remainingAp: unlockResult.remainingAp },
+            }),
+          };
+          break;
+        }
+        case 'ability_slot': {
+          const { web, slotNumber, nodeId } = event.data as {
+            web: 'active' | 'passive';
+            slotNumber: number;
+            nodeId: string;
+          };
+          const slotResult = web === 'active'
+            ? await slotActiveAbility(context.characterId, slotNumber, nodeId)
+            : await slotPassiveAbility(context.characterId, slotNumber, nodeId);
+          overrideResponse = { success: slotResult.success, message: slotResult.message };
+          break;
+        }
+        case 'ability_view': {
+          const { view, web, nodeId } = event.data as {
+            view: 'summary' | 'list' | 'info';
+            web?: 'active' | 'passive';
+            nodeId?: string;
+          };
+          if (view === 'summary') {
+            const summary = await getAbilitySummary(context.characterId);
+            if (!summary) {
+              overrideResponse = { success: false, error: 'Character not found.' };
+            } else {
+              const activeSlots = summary.activeLoadout
+                .map((n, i) => `  Slot ${i + 1}: ${n ?? '—'}`)
+                .join('\n');
+              const passiveSlots = summary.passiveLoadout
+                .map((n, i) => `  Slot ${i + 1}: ${n ?? '—'}`)
+                .join('\n');
+              overrideResponse = {
+                success: true,
+                message: [
+                  `Ability Points: ${summary.availableAp} available / ${summary.apSpent} spent`,
+                  `Unlocked: ${summary.unlockedActive} active, ${summary.unlockedPassive} passive`,
+                  `Active Loadout:\n${activeSlots}`,
+                  `Passive Loadout:\n${passiveSlots}`,
+                ].join('\n'),
+              };
+            }
+          } else if (view === 'list') {
+            const webName = web ?? 'active';
+            const nodes = await listWebNodes(context.characterId, webName);
+            const lines = nodes.map(n => {
+              const unlocked = n.unlocked ? '[✓]' : '[ ]';
+              return `${unlocked} T${n.tier} ${n.sector.padEnd(8)} ${n.name.padEnd(22)} (${n.cost} AP) — ${n.id}`;
+            });
+            overrideResponse = {
+              success: true,
+              message: `${webName.toUpperCase()} WEB:\n${lines.join('\n')}`,
+            };
+          } else if (view === 'info' && nodeId) {
+            const info = await getNodeInfo(context.characterId, nodeId);
+            if (!info) {
+              overrideResponse = { success: false, error: `Node '${nodeId}' not found.` };
+            } else {
+              const statusTag = info.unlocked ? '[UNLOCKED]' : `[${info.cost} AP to unlock]`;
+              const parts = [
+                `${info.name} ${statusTag}`,
+                `Web: ${info.web} | Sector: ${info.sector} | Tier: ${info.tier}`,
+                `${info.description}`,
+                ...(info.effect ? [`Effect: ${info.effect}`] : []),
+                ...(info.questGate ? [`Quest required: ${info.questGate}`] : []),
+                `Adjacent to: ${info.adjacentTo.join(', ')}`,
+                `ID: ${info.id}`,
+              ];
+              overrideResponse = { success: true, message: parts.join('\n') };
+            }
+          } else {
+            overrideResponse = { success: false, error: 'Invalid ability_view event.' };
+          }
+          break;
+        }
         default:
           return {
             success: false,
@@ -995,7 +1481,8 @@ export class DistributedWorldManager {
     position: { x: number; y: number; z: number },
     channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch',
     message: string,
-    rangeMeters: number
+    rangeMeters: number,
+    targetedNpcId?: string,
   ): Promise<void> {
     const nearbySocketIds = zoneManager.getPlayerSocketIdsInRange(position, rangeMeters, characterId);
     const nearbyCompanionSocketIds = zoneManager.getCompanionSocketIdsInRange(position, rangeMeters, characterId);
@@ -1041,7 +1528,17 @@ export class DistributedWorldManager {
     }
 
     this.trackChatMessage(zoneManager.getZone().id, characterName, channel, message);
-    await this.triggerNPCResponses(zoneManager.getZone().id, position, rangeMeters);
+
+    if (targetedNpcId) {
+      // Directed /talk — only the addressed NPC should respond.  Check airlock
+      // inhabit first; if the NPC is being puppeted by an external AI the
+      // airlock service will react naturally via its own chat listener.
+      await this.triggerTargetedNPCResponse(
+        zoneManager.getZone().id, targetedNpcId, position, rangeMeters,
+      );
+    } else {
+      await this.triggerNPCResponses(zoneManager.getZone().id, position, rangeMeters);
+    }
   }
 
   private async sendPrivateMessage(
@@ -1051,11 +1548,18 @@ export class DistributedWorldManager {
     message: string
   ): Promise<boolean> {
     const target = await CharacterService.findByName(targetName);
-    if (!target) return false;
+    if (!target) {
+      logger.warn(`[sendPrivateMessage] Target "${targetName}" not found in DB`);
+      return false;
+    }
 
     const location = await this.zoneRegistry.getPlayerLocation(target.id);
-    if (!location) return false;
+    if (!location) {
+      logger.warn(`[sendPrivateMessage] Target "${targetName}" (${target.id}) has no active location — offline?`);
+      return false;
+    }
 
+    logger.info(`[sendPrivateMessage] ${senderName} → ${targetName} (socket=${location.socketId}): "${message}"`);
     await this.messageBus.publish('gateway:output', {
       type: MessageType.CLIENT_MESSAGE,
       characterId: target.id,
@@ -1148,6 +1652,7 @@ export class DistributedWorldManager {
       health?: { current: number; max: number };
       stamina?: { current: number; max: number };
       mana?: { current: number; max: number };
+      isAlive?: boolean;
     }
   ): Promise<void> {
     const socketId = zoneManager.getSocketIdForCharacter(characterId);
@@ -1307,11 +1812,15 @@ export class DistributedWorldManager {
   }
 
   private maybeRetaliate(
-    targetEntity: { id: string; type: 'player' | 'npc' | 'companion' },
-    attackerEntity: { id: string; type: 'player' | 'npc' | 'companion' }
+    targetEntity: { id: string; type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' },
+    attackerEntity: { id: string; type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' }
   ): void {
     if (targetEntity.id === attackerEntity.id) return;
+    // Players retaliate manually; only NPCs/mobs/wildlife auto-retaliate.
+    if (targetEntity.type === 'player' || targetEntity.type === 'companion') return;
     if (this.combatManager.hasAutoAttackTarget(targetEntity.id)) return;
+    const now = Date.now();
+    this.combatManager.startCombat(targetEntity.id, now);
     this.combatManager.setAutoAttackTarget(targetEntity.id, attackerEntity.id);
   }
 
@@ -1861,19 +2370,28 @@ export class DistributedWorldManager {
     const entity = zoneManager.getEntity(target) || zoneManager.findEntityByName(target);
     if (!entity) return null;
 
+    // Use horizontal distance — consistent with melee range checks and avoids
+    // Y-axis drift from differing terrain datasets inflating the displayed range.
     const dx = entity.position.x - context.position.x;
-    const dy = entity.position.y - context.position.y;
     const dz = entity.position.z - context.position.z;
-    const range = Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz) * 100) / 100;
+    const range = Math.round(Math.sqrt(dx * dx + dz * dz) * 100) / 100;
 
     const statusParts: string[] = [];
-    statusParts.push(entity.isAlive ? 'alive' : 'dead');
+    if (!entity.isAlive) {
+      statusParts.push('dead');
+    }
     if (entity.inCombat) {
       statusParts.push('in combat');
     }
 
-    const statusText = statusParts.length > 0 ? ` and ${statusParts.join(', ')}` : '';
-    const message = `${entity.name} (${entity.type}) is ${range}m away${statusText}.`;
+    const statusSuffix = statusParts.length > 0 ? ` [${statusParts.join(', ')}]` : '';
+    const header = `${entity.name} is ${range}m away${statusSuffix}.`;
+
+    // Description — stored on the entity at spawn time from the database record.
+    const description = (entity as any).description as string | undefined;
+    const message = description
+      ? `${header}\n${description}`
+      : header;
 
     return {
       message,
@@ -1886,6 +2404,7 @@ export class DistributedWorldManager {
           isAlive: entity.isAlive,
           inCombat: entity.inCombat ?? false,
           range,
+          description: description ?? null,
         },
       },
     };
@@ -1893,8 +2412,8 @@ export class DistributedWorldManager {
 
   private async executeCombatAction(
     zoneManager: ZoneManager,
-    attackerEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
-    targetEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' },
+    attackerEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' },
+    targetEntity: { id: string; position: { x: number; y: number; z: number }; type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' },
     ability: CombatAbilityDefinition,
     options?: { isAutoAttack?: boolean; isQueued?: boolean }
   ): Promise<{ hit: boolean } | null> {
@@ -1903,6 +2422,8 @@ export class DistributedWorldManager {
     const characterId = attackerEntity.id;
     const targetId = targetEntity.id;
     const now = Date.now();
+    // Resolve names once — attackerEntity only carries {id, position, type}.
+    const attackerName = zoneManager.getEntity(characterId)?.name ?? 'Unknown';
 
     // Check animation locks - can character perform this action?
     const animationLockSystem = zoneManager.getAnimationLockSystem();
@@ -1918,9 +2439,15 @@ export class DistributedWorldManager {
 
     const attackerSnapshot = await this.getCombatSnapshot(characterId, attackerEntity);
     const targetSnapshot = await this.getCombatSnapshot(targetId, targetEntity);
-    if (!attackerSnapshot || !targetSnapshot) return null;
+    if (!attackerSnapshot || !targetSnapshot) {
+      logger.warn(
+        { characterId, targetId, attackerSnapshotNull: !attackerSnapshot, targetSnapshotNull: !targetSnapshot },
+        '[DWM] executeCombatAction: snapshot null — aborting'
+      );
+      return null;
+    }
 
-    if (!this.validateRange(attackerEntity.position, targetEntity.position, ability)) {
+    if (!this.validateRange(attackerEntity.position, targetEntity.position, ability, attackerSnapshot.weapon?.range)) {
       await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
         eventType: 'combat_error',
         timestamp: now,
@@ -1982,7 +2509,7 @@ export class DistributedWorldManager {
       }
     }
 
-    if (!this.canPayCosts(attackerSnapshot, ability)) {
+    if (!this.canPayCosts(attackerSnapshot, ability, isAutoAttack)) {
       await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
         eventType: 'combat_error',
         timestamp: now,
@@ -2032,10 +2559,10 @@ export class DistributedWorldManager {
       return null;
     }
 
-    await this.applyCosts(attackerSnapshot, ability);
+    await this.applyCosts(attackerSnapshot, ability, isAutoAttack);
     if (attackerSnapshot.isPlayer) {
       const healthCost = ability.healthCost || 0;
-      const staminaCost = ability.staminaCost || 0;
+      const staminaCost = isAutoAttack ? 0 : (ability.staminaCost || 0);
       const manaCost = ability.manaCost || 0;
       const nextHealth = Math.max(1, attackerSnapshot.currentHealth - healthCost);
       const nextStamina = Math.max(0, attackerSnapshot.currentStamina - staminaCost);
@@ -2108,9 +2635,8 @@ export class DistributedWorldManager {
       });
     }
 
-    if (!isAutoAttack) {
-      this.maybeRetaliate(targetEntity, attackerEntity);
-    }
+    // Always give non-player targets a chance to retaliate, even on auto-attacks.
+    this.maybeRetaliate(targetEntity, attackerEntity);
 
     await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
       eventType: 'combat_action',
@@ -2175,16 +2701,18 @@ export class DistributedWorldManager {
             damageProfiles: weaponProfiles ?? undefined,
             baseDamageOverride,
             qualityBiasMultipliers: targetData.armorQualityMultipliers,
-            attackerPosition: attackerEntity.position,
-            defenderPosition: target.position,
+            // Offset to eye-height (entities are positioned at floor level).
+            attackerPosition: { ...attackerEntity.position, y: attackerEntity.position.y + 1.5 },
+            defenderPosition: { ...target.position, y: target.position.y + 1.5 },
             physicsSystem: zoneManager.getPhysicsSystem(),
+            excludeEntityIds: [characterId, target.id],
           }
         );
 
         if (!result.hit) {
           const missTarget = zoneManager.getEntity(targetData.entityId);
           const missNarrative = buildCombatNarrative('miss', {
-            attackerName: attackerEntity.name,
+            attackerName: attackerName,
             targetName: missTarget?.name ?? 'target',
             ability: resolvedAbility,
           });
@@ -2205,7 +2733,18 @@ export class DistributedWorldManager {
         anyHit = true;
         const newHp = Math.max(0, targetData.currentHealth - result.amount);
         await this.updateHealth(targetData, newHp);
-        
+
+        // Mirror health into ZoneManager so publishZoneEntities stays current
+        if (!targetData.isPlayer) {
+          zoneManager.setEntityHealth(targetData.entityId, newHp, targetData.maxHealth);
+        }
+
+        // Record damage for loot resolution (mobs only)
+        if (!targetData.isPlayer && !targetData.isWildlife) {
+          this._recordMobDamage(targetData.entityId, characterId, result.amount, zoneManager.getZone().id);
+          if (newHp <= 0) this._setKiller(targetData.entityId, characterId);
+        }
+
         // Set target animation to 'hit'
         if (animationLockSystem) {
           animationLockSystem.setState(targetData.entityId, 'hit');
@@ -2225,7 +2764,7 @@ export class DistributedWorldManager {
 
         const hitTarget = zoneManager.getEntity(targetData.entityId);
         const hitNarrative = buildCombatNarrative('hit', {
-          attackerName: attackerEntity.name,
+          attackerName: attackerName,
           targetName: hitTarget?.name ?? 'target',
           ability: resolvedAbility,
           result,
@@ -2279,9 +2818,11 @@ export class DistributedWorldManager {
 
           await this.broadcastNearbyUpdate(zoneManager.getZone().id);
 
+          const slainName = hitTarget?.name ?? 'the target';
           await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
             eventType: 'combat_death',
             timestamp: now,
+            narrative: `${attackerName} has slain ${slainName}!`,
             eventTypeData: { targetId: targetData.entityId },
           });
 
@@ -2303,8 +2844,77 @@ export class DistributedWorldManager {
             },
           });
 
-          if (!targetData.isPlayer) {
+          // ── Eldritch tendril effect ─────────────────────────────────────────
+          // Broadcast to all nearby observers so they see the corpse consumed.
+          // Players / companions: slow 60-min dissolve (can be raised).
+          // Mobs / wildlife: quick ~4-second dissolve.
+          // Companions go through a separate damage path; here we only see players, mobs, wildlife.
+          const isPlayerOrCompanion = targetData.isPlayer;
+          const dissolveDurationSeconds = isPlayerOrCompanion ? 3600 : 4;
+          const targetEntityPos = zoneManager.getEntity(targetData.entityId)?.position
+            ?? attackerEntity.position;
+          await this.broadcastCombatEvent(zoneManager.getZone().id, targetEntityPos, {
+            eventType:      'entity_death',
+            timestamp:      now,
+            eventTypeData: {
+              entityId:                targetData.entityId,
+              entityType:              isPlayerOrCompanion ? 'player' : (targetData.isWildlife ? 'wildlife' : 'mob'),
+              dissolveDurationSeconds,
+              canBeRaised:             isPlayerOrCompanion,
+              x:                       targetEntityPos.x,
+              y:                       targetEntityPos.y,
+              z:                       targetEntityPos.z,
+            },
+          });
+
+          if (targetData.isWildlife) {
+            // Wildlife lives in-memory only. Despawn after death animation;
+            // WildlifeManager's killEntity fires its own respawn timer.
+            const wildlifeId = targetData.entityId;
+            const deadZoneId = zoneManager.getZone().id;
+            setTimeout(async () => {
+              for (const wm of this.wildlifeManagers.values()) {
+                if (wm.getEntity(wildlifeId)) {
+                  wm.killEntity(wildlifeId, characterId, 'combat');
+                  break;
+                }
+              }
+              const zm = this.zones.get(deadZoneId);
+              if (zm) {
+                zm.removeWildlife(wildlifeId);
+                await this.broadcastEntityRemoved(deadZoneId, wildlifeId);
+                await this.broadcastNearbyUpdate(deadZoneId);
+              }
+            }, 2500);
+          } else if (!targetData.isPlayer) {
+            // Resolve and distribute loot before despawning
+            void this._resolveMobLoot(targetData.entityId, zoneManager.getZone().id);
             await this.scheduleMobRespawn(targetData.entityId, zoneManager.getZone().id, targetData.maxHealth);
+          } else {
+            // Player died — push isAlive:false so the client shows the death overlay.
+            await this.sendCharacterResourcesUpdate(zoneManager, targetData.entityId, {
+              health: { current: 0, max: targetData.maxHealth },
+              isAlive: false,
+            });
+
+            // Auto-release to homepoint after 60 minutes if not raised.
+            // The client timer is authoritative for the countdown display;
+            // this is a server-side safety net only.
+            const deadPlayerId = targetData.entityId;
+            const deadZoneId   = zoneManager.getZone().id;
+            if (!this.respawnTimers.has(deadPlayerId)) {
+              const autoRelease = setTimeout(async () => {
+                const zm2 = this.zones.get(deadZoneId);
+                if (!zm2) return;
+                const deadEntity = zm2.getEntity(deadPlayerId);
+                if (!deadEntity || deadEntity.isAlive) return; // Already raised
+                // Reuse handlePlayerRespawn via a synthetic envelope
+                await this.handlePlayerRespawn({
+                  characterId: deadPlayerId,
+                } as import('@/messaging').MessageEnvelope);
+              }, 60 * 60 * 1000);
+              this.respawnTimers.set(deadPlayerId, autoRelease);
+            }
           }
         }
       }
@@ -2337,6 +2947,11 @@ export class DistributedWorldManager {
       COMBAT_EVENT_RANGE_METERS
     );
 
+    logger.info(
+      { eventType: event.eventType, narrative: event.narrative, nearbyPlayers, nearbyCompanions, origin },
+      '[DWM] broadcastCombatEvent'
+    );
+
     const payload = {
       eventType: event.eventType,
       timestamp: event.timestamp,
@@ -2360,10 +2975,12 @@ export class DistributedWorldManager {
 
   private async getCombatSnapshot(
     entityId: string,
-    entity: { type: 'player' | 'npc' | 'companion' }
+    entity: { type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' | string }
   ): Promise<{
     entityId: string;
     isPlayer: boolean;
+    isMob?: boolean;
+    isWildlife?: boolean;
     currentHealth: number;
     maxHealth: number;
     maxStamina: number;
@@ -2383,6 +3000,7 @@ export class DistributedWorldManager {
     weapon?: {
       baseDamage?: number;
       speed?: number;
+      range?: number;
       damageProfiles?: DamageProfileSegment[] | null;
       primaryPhysicalType?: PhysicalDamageType;
       primaryDamageType?: DamageType;
@@ -2425,33 +3043,114 @@ export class DistributedWorldManager {
       };
     }
 
-    const companion = await CompanionService.findById(entityId);
-    if (!companion) return null;
+    if (entity.type === 'companion') {
+      const companion = await CompanionService.findById(entityId);
+      if (!companion) return null;
 
-    const stats = (companion.stats as Record<string, number>) || {};
-    const coreStats = {
-      strength: stats.strength ?? 10,
-      vitality: stats.vitality ?? 10,
-      dexterity: stats.dexterity ?? 10,
-      agility: stats.agility ?? 10,
-      intelligence: stats.intelligence ?? 10,
-      wisdom: stats.wisdom ?? 10,
-    };
-    const derived = StatCalculator.calculateDerivedStats(coreStats, companion.level);
-    this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
+      const stats = (companion.stats as Record<string, number>) || {};
+      const coreStats = {
+        strength: stats.strength ?? 10,
+        vitality: stats.vitality ?? 10,
+        dexterity: stats.dexterity ?? 10,
+        agility: stats.agility ?? 10,
+        intelligence: stats.intelligence ?? 10,
+        wisdom: stats.wisdom ?? 10,
+      };
+      const derived = StatCalculator.calculateDerivedStats(coreStats, companion.level);
+      this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
 
-    return {
-      entityId,
-      isPlayer: false,
-      currentHealth: companion.currentHealth,
-      maxHealth: companion.maxHealth,
-      currentStamina: 0,
-      currentMana: 0,
-      maxStamina: 0,
-      maxMana: 0,
-      coreStats,
-      stats: this.buildCombatStats(derived),
-    };
+      return {
+        entityId,
+        isPlayer: false,
+        currentHealth: companion.currentHealth,
+        maxHealth: companion.maxHealth,
+        currentStamina: 0,
+        currentMana: 0,
+        maxStamina: 0,
+        maxMana: 0,
+        coreStats,
+        stats: this.buildCombatStats(derived),
+      };
+    }
+
+    // mob — database-persisted entity, look up via MobService
+    if (entity.type === 'mob') {
+      const mob = await MobService.findById(entityId);
+      if (!mob) {
+        logger.warn({ entityId }, '[DWM] getCombatSnapshot: mob not found in database');
+        return null;
+      }
+
+      const stats = (mob.stats as Record<string, number>) || {};
+      const coreStats = {
+        strength:     stats.strength     ?? 10,
+        vitality:     stats.vitality     ?? 10,
+        dexterity:    stats.dexterity    ?? 10,
+        agility:      stats.agility      ?? 10,
+        intelligence: stats.intelligence ?? 5,
+        wisdom:       stats.wisdom       ?? 5,
+      };
+      const derived = StatCalculator.calculateDerivedStats(coreStats, mob.level);
+      this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
+
+      return {
+        entityId,
+        isPlayer: false,
+        isMob: true,
+        currentHealth: mob.currentHealth,
+        maxHealth: mob.maxHealth,
+        currentStamina: 0,
+        currentMana: 0,
+        maxStamina: 0,
+        maxMana: 0,
+        coreStats,
+        stats: this.buildCombatStats(derived),
+      };
+    }
+
+    // wildlife / npc — look up live state from WildlifeManager
+    for (const wm of this.wildlifeManagers.values()) {
+      const we = wm.getEntity(entityId);
+      if (!we) continue;
+
+      const species = getSpecies(we.speciesId);
+      if (!species) {
+        logger.warn({ entityId, speciesId: we.speciesId }, '[DWM] getCombatSnapshot: species not found for wildlife entity');
+        return null;
+      }
+
+      // Map species data to core stats so StatCalculator can derive combat ratings.
+      // strength  → attack damage proxy (attackDamage * 0.8)
+      // vitality  → health proxy (maxHealth / 5, minimum 1)
+      // dex/agi   → level-scaled mobility/evasion
+      const coreStats = {
+        strength:     Math.max(1, Math.round(species.attackDamage * 0.8)),
+        vitality:     Math.max(1, Math.round(species.maxHealth / 5)),
+        dexterity:    Math.max(1, we.level + 8),
+        agility:      Math.max(1, we.level + 8),
+        intelligence: 5,
+        wisdom:       5,
+      };
+      const derived = StatCalculator.calculateDerivedStats(coreStats, we.level);
+      this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
+
+      return {
+        entityId,
+        isPlayer: false,
+        isWildlife: true,
+        currentHealth: we.currentHealth,
+        maxHealth: we.maxHealth,
+        currentStamina: 0,
+        currentMana: 0,
+        maxStamina: 0,
+        maxMana: 0,
+        coreStats,
+        stats: this.buildCombatStats(derived),
+      };
+    }
+
+    logger.warn({ entityId, entityType: entity.type }, '[DWM] getCombatSnapshot: entity not found in any lookup');
+    return null;
   }
 
   private async getEquippedWeaponData(
@@ -2459,6 +3158,7 @@ export class DistributedWorldManager {
   ): Promise<{
     baseDamage?: number;
     speed?: number;
+    range: number;
     damageProfiles?: DamageProfileSegment[] | null;
     primaryPhysicalType?: PhysicalDamageType;
     primaryDamageType?: DamageType;
@@ -2467,19 +3167,21 @@ export class DistributedWorldManager {
     if (equipped.length === 0) return null;
 
     const right = equipped.find(item => item.equipSlot === 'right_hand');
-    const left = equipped.find(item => item.equipSlot === 'left_hand');
+    const left  = equipped.find(item => item.equipSlot === 'left_hand');
     const weaponItem = right || left;
     if (!weaponItem) return null;
 
     const weapon = getWeaponDefinition(weaponItem.template.properties);
     if (!weapon) return null;
 
+    const tags    = weaponItem.template.tags.map(t => t.tag.name);
     const profiles = buildDamageProfiles(weapon);
     const primaryPhysicalType = getPrimaryPhysicalType(profiles);
 
     return {
       baseDamage: weapon.baseDamage,
-      speed: weapon.speed,
+      speed:      weapon.speed,
+      range:      getWeaponRange(weapon, tags),
       damageProfiles: profiles,
       primaryPhysicalType,
       primaryDamageType: getPrimaryDamageType(profiles),
@@ -2538,14 +3240,40 @@ export class DistributedWorldManager {
   private validateRange(
     source: { x: number; y: number; z: number },
     target: { x: number; y: number; z: number },
-    ability: CombatAbilityDefinition
+    ability: CombatAbilityDefinition,
+    weaponRange?: number,
   ): boolean {
     if (ability.targetType === 'self') return true;
+
+    const weaponReach    = weaponRange ?? UNARMED_RANGE;
+    const effectiveRange = BASE_REACH + ENTITY_RADIUS + ENTITY_RADIUS + weaponReach;
+
+    // Use horizontal (XZ) distance for range validation.
+    //
+    // Why not 3D? Player Y comes from the client heightmap; mob Y is snapped to
+    // the server's elevation service (a different terrain dataset).  Even a 1–2 m
+    // discrepancy on any slope pushes the 3D distance over the melee threshold
+    // while the player is visually standing right next to the target.  Horizontal
+    // distance is the semantically correct metric for "can I reach this target?"
+    // in a ground-based combat system.
+    //
+    // Vertical tolerance: prevent attacking through completely separate floors
+    // (e.g. someone on a cliff 10 m above should not hit someone below).
+    // The tolerance is generous (effectiveRange + 3 m) to absorb terrain slope.
     const dx = target.x - source.x;
-    const dy = target.y - source.y;
     const dz = target.z - source.z;
-    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    return distance <= ability.range;
+    const dy = Math.abs(target.y - source.y);
+    const horizontalDist  = Math.sqrt(dx * dx + dz * dz);
+    const verticalAllowed = effectiveRange + 3.0; // metres
+
+    if (PHYSICS_DEBUG) {
+      logger.debug(
+        { horizontalDist: horizontalDist.toFixed(2), dy: dy.toFixed(2), effectiveRange, verticalAllowed },
+        '[validateRange] range check',
+      );
+    }
+
+    return horizontalDist <= effectiveRange && dy <= verticalAllowed;
   }
 
   private getMultiTargetScale(targetCount: number): number {
@@ -2681,20 +3409,26 @@ export class DistributedWorldManager {
 
   private canPayCosts(
     snapshot: { currentHealth: number; currentStamina: number; currentMana: number; isPlayer: boolean },
-    ability: CombatAbilityDefinition
+    ability: CombatAbilityDefinition,
+    isAutoAttack = false,
   ): boolean {
     if (ability.healthCost && snapshot.currentHealth <= ability.healthCost) return false;
-    if (ability.staminaCost && snapshot.isPlayer && snapshot.currentStamina < ability.staminaCost) return false;
+    // Auto-attacks never cost stamina — skip the stamina gate entirely so low
+    // stamina never blocks the weapon timer from firing.
+    if (!isAutoAttack && ability.staminaCost && snapshot.isPlayer && snapshot.currentStamina < ability.staminaCost) return false;
     if (ability.manaCost && snapshot.isPlayer && snapshot.currentMana < ability.manaCost) return false;
     return true;
   }
 
   private async applyCosts(
     snapshot: { entityId: string; isPlayer: boolean; currentHealth: number; currentStamina: number; currentMana: number },
-    ability: CombatAbilityDefinition
+    ability: CombatAbilityDefinition,
+    isAutoAttack = false,
   ): Promise<void> {
     const healthCost = ability.healthCost || 0;
-    const staminaCost = ability.staminaCost || 0;
+    // Auto-attacks don't drain stamina — force cost to 0 so the DB write is
+    // consistent with the value we send to the client below.
+    const staminaCost = isAutoAttack ? 0 : (ability.staminaCost || 0);
     const manaCost = ability.manaCost || 0;
 
     const newHealth = Math.max(1, snapshot.currentHealth - healthCost);
@@ -2717,16 +3451,732 @@ export class DistributedWorldManager {
   }
 
   private async updateHealth(
-    snapshot: { entityId: string; isPlayer: boolean },
+    snapshot: { entityId: string; isPlayer: boolean; isMob?: boolean; isWildlife?: boolean },
     newHealth: number
   ): Promise<void> {
     if (snapshot.isPlayer) {
       await CharacterService.updateResources(snapshot.entityId, { currentHp: newHealth, isAlive: newHealth > 0 });
+    } else if (snapshot.isMob) {
+      await MobService.updateStatus(snapshot.entityId, {
+        currentHealth: newHealth,
+        isAlive: newHealth > 0,
+      });
+    } else if (snapshot.isWildlife) {
+      // Wildlife is in-memory only — update directly in WildlifeManager, no DB write
+      for (const wm of this.wildlifeManagers.values()) {
+        const we = wm.getEntity(snapshot.entityId);
+        if (we) {
+          we.currentHealth = newHealth;
+          we.isAlive = newHealth > 0;
+          break;
+        }
+      }
     } else {
       await CompanionService.updateStatus(snapshot.entityId, {
         currentHealth: newHealth,
         isAlive: newHealth > 0,
       });
+    }
+  }
+
+  // ── Loot helpers ────────────────────────────────────────────────────────────
+
+  private _recordMobDamage(mobId: string, attackerId: string, amount: number, zoneId: string): void {
+    let entry = this._damageLog.get(mobId);
+    if (!entry) {
+      entry = { firstAttackerId: attackerId, damages: new Map(), killerId: attackerId, zoneId };
+      this._damageLog.set(mobId, entry);
+    }
+    entry.damages.set(attackerId, (entry.damages.get(attackerId) ?? 0) + amount);
+  }
+
+  private _setKiller(mobId: string, attackerId: string): void {
+    const entry = this._damageLog.get(mobId);
+    if (entry) entry.killerId = attackerId;
+  }
+
+  /** Determine which characterId (or partyId) wins the loot. */
+  private async _resolveLootWinner(mobId: string): Promise<{ winnerId: string; partyId: string | null }> {
+    const entry = this._damageLog.get(mobId);
+    if (!entry) return { winnerId: '', partyId: null };
+
+    const isPresent = (id: string) => this.characterToZone.get(id) === entry.zoneId;
+
+    // 1. First attacker still present
+    let winnerId = isPresent(entry.firstAttackerId) ? entry.firstAttackerId : '';
+
+    // 2. Highest damage dealer
+    if (!winnerId) {
+      const sorted = [...entry.damages.entries()].sort((a, b) => b[1] - a[1]);
+      for (const [id] of sorted) {
+        if (isPresent(id)) { winnerId = id; break; }
+      }
+    }
+
+    // 3. Kill credit fallback
+    if (!winnerId) winnerId = entry.killerId;
+
+    const partyId = winnerId ? await this.partyService.getPartyIdForMember(winnerId) : null;
+    return { winnerId, partyId };
+  }
+
+  /** Send a socket event directly to a connected player. */
+  private async _sendToSocket(characterId: string, event: string, data: unknown): Promise<void> {
+    const socketId = this._charToSocket.get(characterId);
+    if (!socketId) return;
+    await this.messageBus.publish('gateway:output', {
+      type:      MessageType.CLIENT_MESSAGE,
+      timestamp: Date.now(),
+      payload:   { socketId, event, data } as ClientMessagePayload,
+    });
+  }
+
+  // ── IWildlifeWorld facade — used by WildlifeBridge (Rust sim) ────────────
+
+  addWildlifeToZone(
+    zoneId: string,
+    data: { id: string; name: string; speciesId: string; position: { x: number; y: number; z: number }; sprite: string; heading?: number },
+  ): void {
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+    zm.addWildlife(data);
+    void this.broadcastNearbyUpdate(zoneId);
+  }
+
+  updateWildlifeInZone(
+    zoneId: string,
+    entityId: string,
+    position: { x: number; y: number; z: number },
+    heading: number,
+    behavior: string,
+    _speed: number,
+  ): void {
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+    zm.updateWildlife(entityId, position, heading, behavior);
+  }
+
+  removeWildlifeFromZone(zoneId: string, entityId: string): void {
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+    zm.removeWildlife(entityId);
+    void this.broadcastNearbyUpdate(zoneId);
+  }
+
+  getAllActiveZoneIds(): string[] {
+    return [...this.zones.keys()];
+  }
+
+  getZoneBiome(zoneId: string): string {
+    return this.zoneBiomes.get(zoneId) ?? BIOME_FALLBACK;
+  }
+
+  getZoneTimeOfDayNormalized(zoneId: string): number {
+    return this.zones.get(zoneId)?.getTimeOfDayNormalized() ?? 0.5;
+  }
+
+  getZonePlayerPositions(zoneId: string): PlayerPositionMessage[] {
+    const results: PlayerPositionMessage[] = [];
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const zm = this.zones.get(zoneId);
+      const entity = zm?.getEntity(charId);
+      if (!entity) continue;
+      results.push({ id: charId, zone_id: zoneId, position: entity.position });
+    }
+    return results;
+  }
+
+  async broadcastWildlifeMoveToClients(
+    zoneId: string,
+    entityId: string,
+    name: string,
+    position: { x: number; y: number; z: number },
+    heading: number,
+    animation: string,
+    speed: number,
+  ): Promise<void> {
+    const stateUpdate = {
+      timestamp: Date.now(),
+      entities: {
+        updated: [{ id: entityId, name, type: 'wildlife', position, heading, currentAction: animation, movementDuration: 520, movementSpeed: speed }],
+      },
+    };
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const zm = this.zones.get(zoneId);
+      const socketId = zm?.getSocketIdForCharacter(charId);
+      if (!socketId) continue;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: charId,
+        socketId,
+        payload: { socketId, event: 'state_update', data: stateUpdate } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  // ── IWildlifeWorld — plant notification stubs ─────────────────────────────
+
+  notifyPlantStageChange(plantId: string, newStage: string): void {
+    // Find which zone this plant belongs to and update its FloraManager
+    for (const [zoneId, flora] of this.floraManagers) {
+      const plant = flora.getPlant(plantId);
+      if (plant) {
+        // Reflect stage change driven by Rust sim
+        (plant as any).currentStage = newStage;
+        void this._broadcastPlantToZone(zoneId, plant.id, plant.speciesId, plant.position, newStage, 'updated');
+        return;
+      }
+    }
+  }
+
+  notifyPlantEaten(plantId: string, wildlifeId: string, foodValue: number): void {
+    for (const [zoneId, flora] of this.floraManagers) {
+      const plant = flora.getPlant(plantId);
+      if (plant) {
+        flora.eatPlant(plantId, wildlifeId);
+        if (!plant.isAlive) {
+          void this._broadcastPlantRemoved(zoneId, plantId);
+        } else {
+          void this._broadcastPlantToZone(zoneId, plant.id, plant.speciesId, plant.position, plant.currentStage, 'updated');
+        }
+        return;
+      }
+    }
+  }
+
+  // ── Flora broadcast helpers ────────────────────────────────────────────────
+
+  /**
+   * Send a plant entity add/update to all players in the zone.
+   * mode 'added'   → entities.added   (new plant, client creates object)
+   * mode 'updated' → entities.updated (stage change, client swaps model)
+   */
+  private async _broadcastPlantToZone(
+    zoneId: string,
+    plantId: string,
+    speciesId: string,
+    position: Vector3,
+    stage: string,
+    mode: 'added' | 'updated',
+  ): Promise<void> {
+    const speciesData = getPlantSpecies(speciesId);
+    const entity = {
+      id:          plantId,
+      type:        'plant',
+      name:        speciesData?.name ?? speciesId,
+      position,
+      description: speciesData?.description ?? '',
+      isAlive:     true,
+      interactive: true,
+      currentAction: stage, // growth stage — used by client to select visual
+    };
+    const stateUpdate = {
+      timestamp: Date.now(),
+      entities: mode === 'added' ? { added: [entity] } : { updated: [entity] },
+    };
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const zm = this.zones.get(zoneId);
+      const socketId = zm?.getSocketIdForCharacter(charId);
+      if (!socketId) continue;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: charId,
+        socketId,
+        payload: { socketId, event: 'state_update', data: stateUpdate } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  private async _broadcastPlantRemoved(zoneId: string, plantId: string): Promise<void> {
+    const stateUpdate = {
+      timestamp: Date.now(),
+      entities: { removed: [plantId] },
+    };
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const zm = this.zones.get(zoneId);
+      const socketId = zm?.getSocketIdForCharacter(charId);
+      if (!socketId) continue;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: charId,
+        socketId,
+        payload: { socketId, event: 'state_update', data: stateUpdate } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Push the live time-of-day + weather to a single player as a state_update.
+   *
+   * Called during handlePlayerJoinZone to correct the potentially stale timeOfDayValue
+   * that the gateway wrote into the world_entry packet from ZoneRegistry.
+   * ZoneRegistry is only updated on bucket transitions (up to ~12 min intervals), so
+   * without this step the client's interpolated clock can be several minutes off.
+   */
+  private async _sendEnvToPlayer(characterId: string, zoneId: string): Promise<void> {
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+    const socketId = this._charToSocket.get(characterId);
+    if (!socketId) return;
+
+    const zonePartial = {
+      timeOfDay:      zm.getTimeOfDayString(),
+      timeOfDayValue: zm.getTimeOfDayNormalized(),
+      weather:        zm.getWeather(),
+      lighting:       zm.getLighting(),
+    };
+
+    await this.messageBus.publish('gateway:output', {
+      type:        MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'state_update',
+        data:  { timestamp: Date.now(), zone: zonePartial },
+      } as ClientMessagePayload,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Send all alive plants in a zone to a newly-joined player.
+   * Called from handlePlayerJoinZone.
+   */
+  private async _sendPlantsToPlayer(characterId: string, zoneId: string): Promise<void> {
+    const flora = this.floraManagers.get(zoneId);
+    if (!flora) return;
+    const plants = flora.getAlivePlants();
+    if (plants.length === 0) return;
+
+    const zm = this.zones.get(zoneId);
+    const socketId = zm?.getSocketIdForCharacter(characterId);
+    if (!socketId) return;
+
+    const added = plants.map(p => {
+      const sd = getPlantSpecies(p.speciesId);
+      return {
+        id:            p.id,
+        type:          'plant',
+        name:          sd?.name ?? p.speciesId,
+        position:      p.position,
+        description:   sd?.description ?? '',
+        isAlive:       true,
+        interactive:   true,
+        currentAction: p.currentStage, // growth stage
+      };
+    });
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'state_update',
+        data: { timestamp: Date.now(), entities: { added } },
+      } as ClientMessagePayload,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Process a /harvest command event.
+   * Finds the nearest harvestable plant within 3 m and calls FloraManager.harvest().
+   */
+  /**
+   * /unstuck — nudge a player clear of building geometry.
+   *
+   * Uses PhysicsSystem.nudgeToUnstuck() (multi-pass resolveAgainstStructures +
+   * 1 m Y lift) so the entity lands cleanly on terrain after the nudge.
+   * Enforces a 5-minute cooldown so it can't be abused for travel.
+   */
+  private async processUnstuckCommand(
+    characterId: string,
+    zoneId: string,
+    position: Vector3,
+  ): Promise<{ success: boolean; message: string }> {
+    const COOLDOWN_MS = 5 * 60 * 1_000; // 5 minutes
+    const now  = Date.now();
+    const last = this.unstuckCooldowns.get(characterId) ?? 0;
+
+    if (now - last < COOLDOWN_MS) {
+      const remaining = Math.ceil((COOLDOWN_MS - (now - last)) / 1_000);
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      const label = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      return { success: false, message: `You can't use /unstuck yet — wait ${label}.` };
+    }
+
+    const zm = this.zones.get(zoneId);
+    if (!zm) return { success: false, message: 'Zone not available.' };
+
+    const physics = zm.getPhysicsSystem();
+    const nudged  = physics.nudgeToUnstuck(position, 0.5);
+
+    // Update in-memory position and persist to DB
+    zm.updatePlayerPosition(characterId, nudged);
+    await CharacterService.updatePosition(characterId, nudged);
+
+    // Broadcast new position to nearby players and refresh proximity roster
+    await this.broadcastPositionUpdate(characterId, zoneId, nudged);
+    await this.broadcastNearbyUpdate(zoneId);
+
+    this.unstuckCooldowns.set(characterId, now);
+    logger.info({ characterId, zoneId, nudged }, '[DWM] /unstuck applied');
+
+    return { success: true, message: 'Nudging you to a nearby clear spot…' };
+  }
+
+  async processHarvestCommand(
+    characterId: string,
+    zoneId: string,
+    position: Vector3,
+    plantId?: string,
+  ): Promise<{ success: boolean; message: string }> {
+    const flora = this.floraManagers.get(zoneId);
+    if (!flora) return { success: false, message: 'No flora in this zone.' };
+
+    let targetId = plantId;
+    if (!targetId) {
+      // Find nearest harvestable plant within 3 m
+      const nearby = flora.getHarvestablePlantsNear(position, 3);
+      if (nearby.length === 0) return { success: false, message: 'Nothing harvestable nearby.' };
+      nearby.sort((a, b) => {
+        const da = Math.hypot(a.position.x - position.x, a.position.z - position.z);
+        const db = Math.hypot(b.position.x - position.x, b.position.z - position.z);
+        return da - db;
+      });
+      targetId = nearby[0]!.id;
+    }
+
+    const items = flora.harvest(targetId, characterId);
+    if (!items) return { success: false, message: 'That cannot be harvested right now.' };
+
+    // Award items
+    await this._awardHarvestItems(characterId, items);
+
+    return {
+      success: true,
+      message: items.length > 0
+        ? `You harvest: ${items.map(i => `${i.itemId} ×${i.quantity}`).join(', ')}.`
+        : 'You harvest the plant but find nothing useful.',
+    };
+  }
+
+  private async _awardHarvestItems(
+    characterId: string,
+    items: Array<{ itemId: string; quantity: number }>,
+  ): Promise<void> {
+    for (const item of items) {
+      try {
+        await InventoryService.addItemByTemplateTag(characterId, item.itemId, item.quantity);
+      } catch (err) {
+        logger.warn({ characterId, itemId: item.itemId, err }, '[Flora] Failed to award harvest item');
+      }
+    }
+    // Send updated inventory
+    const socketId = this._charToSocket.get(characterId);
+    if (!socketId) return;
+    try {
+      const zm = this.zones.get(this.characterToZone.get(characterId) ?? '');
+      const char = zm?.getEntity(characterId);
+      if (!char) return;
+      const activeWeaponSet = (char as any).activeWeaponSet ?? 0;
+      const inventoryPayload = await InventoryService.buildPayload(characterId, activeWeaponSet);
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: { socketId, event: 'inventory_update', data: inventoryPayload } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      logger.warn({ characterId, err }, '[Flora] Failed to send inventory update after harvest');
+    }
+  }
+
+  // ── Wildlife position broadcast helpers ──────────────────────────────────
+
+  /**
+   * Flush all queued wildlife position updates as one batched state_update
+   * per player per zone.  Called once per server tick after wildlife.update().
+   */
+  private async _flushWildlifePositionUpdates(): Promise<void> {
+    for (const [zoneId, updates] of this._pendingWildlifeUpdates) {
+      if (updates.length === 0) continue;
+
+      const stateUpdate = {
+        timestamp: Date.now(),
+        entities: { updated: [...updates] },
+      };
+
+      for (const [charId, charZoneId] of this.characterToZone.entries()) {
+        if (charZoneId !== zoneId) continue;
+        const zoneManager = this.zones.get(zoneId);
+        const socketId = zoneManager?.getSocketIdForCharacter(charId);
+        if (!socketId) continue;
+
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId,
+          payload: { socketId, event: 'state_update', data: stateUpdate } as ClientMessagePayload,
+          timestamp: Date.now(),
+        });
+      }
+
+      // Clear after flush
+      updates.length = 0;
+    }
+  }
+
+  private async _resolveMobLoot(mobId: string, zoneId: string): Promise<void> {
+    try {
+      const mob = await MobService.findById(mobId);
+      if (!mob) return;
+
+      const rolledItems = mob.lootTableId ? await LootService.rollLoot(mob.lootTableId) : [];
+      const gold        = (mob as unknown as { goldDrop?: number }).goldDrop ?? 0;
+
+      const { winnerId, partyId } = await this._resolveLootWinner(mobId);
+
+      // Capture damage participants for XP before clearing the log
+      const damageLog     = this._damageLog.get(mobId);
+      const allParticipants = damageLog ? [...damageLog.damages.keys()] : (winnerId ? [winnerId] : []);
+      this._damageLog.delete(mobId);
+
+      if (!winnerId) return; // No valid winner (everyone disconnected)
+
+      const partyInfo   = partyId ? await this.partyService.getPartyInfo(partyId) : null;
+      const memberIds   = partyInfo?.members ?? [winnerId];
+      const isSolo      = memberIds.length <= 1;
+
+      // ── XP award ───────────────────────────────────────────────────────────
+      // Reference level = highest-level player among all damage participants.
+      // Using the highest level as the reference penalises PL: a high-level
+      // companion/player in the group pushes the ref level up, reducing XP for
+      // everyone (exactly as intended).
+      const mobLvl = mob.level ?? 1;
+      let refLevel = mobLvl;
+      for (const pid of allParticipants) {
+        const charLvl = this._charLevel.get(pid);
+        if (charLvl !== undefined && charLvl > refLevel) refLevel = charLvl;
+      }
+
+      const xpBase = mobLvl * 100;
+      const diff   = refLevel - mobLvl;
+      let xpMult: number;
+      if (diff >= 10)     xpMult = 0;
+      else if (diff > 0)  xpMult = Math.max(0,   1 - diff * 0.1);
+      else                xpMult = Math.min(2.0,  1 + Math.abs(diff) * 0.15);
+      const xpGrant = Math.round(xpBase * xpMult);
+
+      if (xpGrant > 0) {
+        for (const memberId of memberIds) {
+          try {
+            const xpResult = await CharacterService.awardXp(memberId, xpGrant);
+            this._charLevel.set(memberId, xpResult.newLevel);
+            await this._sendToSocket(memberId, 'state_update', {
+              timestamp: Date.now(),
+              character: {
+                experience:    xpResult.newExperience,
+                level:         xpResult.newLevel,
+                abilityPoints: xpResult.abilityPoints,
+                statPoints:    xpResult.statPoints,
+              },
+            });
+            if (xpResult.levelsGained > 0) {
+              await this._sendToSocket(memberId, 'event', {
+                eventType: 'level_up',
+                level:     xpResult.newLevel,
+                message:   `You have reached level ${xpResult.newLevel}! You gain 1 ability point and 1 stat point.`,
+              });
+            } else {
+              await this._sendToSocket(memberId, 'event', {
+                eventType: 'xp_gain',
+                xp:        xpGrant,
+                message:   `${xpGrant} XP (${mob.name})`,
+              });
+            }
+          } catch (err) {
+            logger.warn({ err, memberId }, '[XP] Failed to award XP to character');
+          }
+        }
+      }
+
+      // Split gold — floor division, remainder sinks
+      const goldEach = memberIds.length > 0 ? Math.floor(gold / memberIds.length) : 0;
+      if (goldEach > 0) {
+        await Promise.all(memberIds.map(id => LootService.awardGold(id, goldEach)));
+      }
+
+      const sessionItems: LootSessionItem[] = rolledItems.map(r => ({
+        id:          randomUUID(),
+        templateId:  r.templateId,
+        name:        r.name,
+        itemType:    r.itemType,
+        description: r.description,
+        iconUrl:     r.iconUrl ?? undefined,
+        quantity:    r.quantity,
+      }));
+
+      if (isSolo) {
+        // Award items immediately
+        for (const ri of rolledItems) {
+          await LootService.awardItemToCharacter(winnerId, ri);
+        }
+        // Rebuild inventory and push update
+        const activeSet = 1; // TODO: pull from session registry if needed
+        const invPayload = await InventoryService.buildPayload(winnerId, activeSet);
+        await this._sendToSocket(winnerId, 'inventory_update', invPayload);
+
+        const startPayload: LootSessionStartPayload = {
+          sessionId: randomUUID(), mobName: mob.name, mode: 'solo',
+          items: sessionItems, gold, goldPerMember: gold, expiresAt: 0,
+        };
+        await this._sendToSocket(winnerId, 'loot_session_start', startPayload);
+        // End immediately for solo (client auto-dismisses)
+        await this._sendToSocket(winnerId, 'loot_session_end', { sessionId: startPayload.sessionId } as LootSessionEndPayload);
+        return;
+      }
+
+      // Party NWP session
+      if (sessionItems.length === 0) {
+        // No items to roll on — just send a gold-only notification and end
+        const soloNotif: LootSessionStartPayload = {
+          sessionId: randomUUID(), mobName: mob.name, mode: 'party',
+          items: [], gold, goldPerMember: goldEach, expiresAt: 0,
+        };
+        for (const id of memberIds) {
+          await this._sendToSocket(id, 'loot_session_start', soloNotif);
+          await this._sendToSocket(id, 'loot_session_end', { sessionId: soloNotif.sessionId });
+        }
+        return;
+      }
+
+      const sessionId = randomUUID();
+      const LOOT_TIMEOUT_MS = 60_000;
+      const expiresAt = Date.now() + LOOT_TIMEOUT_MS;
+
+      const sessionData = {
+        sessionId, zoneId, mobName: mob.name, memberCharIds: memberIds,
+        items: sessionItems.map(si => ({
+          ...si,
+          rolls:    new Map<string, 'need' | 'want' | 'pass' | null>(memberIds.map(id => [id, null])),
+          resolved: false,
+        })),
+        gold, expiresAt,
+        timer: setTimeout(() => this._expireLootSession(sessionId), LOOT_TIMEOUT_MS),
+      };
+      this._lootSessions.set(sessionId, sessionData);
+
+      const startPayload: LootSessionStartPayload = {
+        sessionId, mobName: mob.name, mode: 'party',
+        items: sessionItems, gold, goldPerMember: goldEach, expiresAt,
+      };
+      for (const id of memberIds) {
+        await this._sendToSocket(id, 'loot_session_start', startPayload);
+      }
+    } catch (err) {
+      logger.error({ err, mobId }, '[Loot] Failed to resolve mob loot');
+    }
+  }
+
+  private async _handleLootRoll(message: MessageEnvelope): Promise<void> {
+    const { characterId, sessionId, itemId, roll } = message.payload as {
+      characterId: string; sessionId: string; itemId: string; roll: 'need' | 'want' | 'pass';
+    };
+
+    const session = this._lootSessions.get(sessionId);
+    if (!session) return;
+    if (!session.memberCharIds.includes(characterId)) return;
+
+    const item = session.items.find(i => i.id === itemId);
+    if (!item || item.resolved) return;
+
+    item.rolls.set(characterId, roll);
+
+    // Check if all members have voted
+    const allVoted = [...item.rolls.values()].every(r => r !== null);
+    if (allVoted) await this._resolveSessionItem(session, item);
+  }
+
+  private async _resolveSessionItem(
+    session: ReturnType<typeof this._lootSessions['get']> & object,
+    item: { id: string; templateId: string; name: string; quantity: number; iconUrl?: string;
+             description: string; itemType: string;
+             rolls: Map<string, 'need' | 'want' | 'pass' | null>; resolved: boolean; }
+  ): Promise<void> {
+    item.resolved = true;
+
+    // Group rolls by tier; highest tier wins (need > want, pass = skip)
+    const byTier: { roll: 'need' | 'want'; charId: string; dice: number }[] = [];
+    for (const [charId, r] of item.rolls.entries()) {
+      if (r === 'need' || r === 'want') {
+        byTier.push({ roll: r, charId, dice: Math.floor(Math.random() * 100) + 1 });
+      }
+    }
+
+    let winnerId: string | null = null;
+    let winnerName: string | null = null;
+    let winRoll: 'need' | 'want' | null = null;
+    let rollValue = 0;
+
+    if (byTier.length > 0) {
+      // Prefer 'need' tier, break ties by dice
+      const needs  = byTier.filter(e => e.roll === 'need');
+      const wants  = byTier.filter(e => e.roll === 'want');
+      const pool   = needs.length > 0 ? needs : wants;
+      const winner = pool.reduce((best, cur) => cur.dice > best.dice ? cur : best);
+      winnerId   = winner.charId;
+      winRoll    = winner.roll;
+      rollValue  = winner.dice;
+
+      const ri = { templateId: item.templateId, name: item.name, itemType: item.itemType,
+                   description: item.description, iconUrl: item.iconUrl ?? null, quantity: item.quantity };
+      await LootService.awardItemToCharacter(winnerId, ri);
+      const invPayload = await InventoryService.buildPayload(winnerId, 1);
+      await this._sendToSocket(winnerId, 'inventory_update', invPayload);
+    }
+
+    const result: LootItemResultPayload = {
+      sessionId: session!.sessionId, itemId: item.id, itemName: item.name,
+      winnerId, winnerName, winRoll, rollValue,
+    };
+    for (const id of session!.memberCharIds) {
+      await this._sendToSocket(id, 'loot_item_result', result);
+    }
+
+    // Check if all items resolved
+    if (session!.items.every(i => i.resolved)) {
+      clearTimeout(session!.timer);
+      this._lootSessions.delete(session!.sessionId);
+      const end: LootSessionEndPayload = { sessionId: session!.sessionId };
+      for (const id of session!.memberCharIds) {
+        await this._sendToSocket(id, 'loot_session_end', end);
+      }
+    }
+  }
+
+  private async _expireLootSession(sessionId: string): Promise<void> {
+    const session = this._lootSessions.get(sessionId);
+    if (!session) return;
+
+    // Auto-pass any unvoted items, then resolve them
+    for (const item of session.items) {
+      if (item.resolved) continue;
+      for (const [charId, r] of item.rolls.entries()) {
+        if (r === null) item.rolls.set(charId, 'pass');
+      }
+      await this._resolveSessionItem(session, item);
     }
   }
 
@@ -2736,21 +4186,113 @@ export class DistributedWorldManager {
     const mob = await MobService.findById(mobId);
     if (!mob) return;
 
-    const timer = setTimeout(async () => {
+    const DESPAWN_DELAY_MS = 2500; // Enough for the death animation to finish
+    const respawnMs = (mob.respawnTime ?? 30) * 1000;
+
+    // Phase 1 — despawn after death animation
+    setTimeout(async () => {
+      const zm = this.zones.get(zoneId);
+      if (zm) {
+        zm.removeMob(mobId);
+        // Remove from wander system so it isn't ticked while despawned
+        this.mobWanderSystems.get(zoneId)?.unregister(mobId);
+        // Tell clients to remove the entity from their scene
+        await this.broadcastEntityRemoved(zoneId, mobId);
+        await this.broadcastNearbyUpdate(zoneId);
+        // Keep Redis entity snapshot current for new joiners
+        await this.publishZoneEntities(zoneId, zm);
+      }
+    }, DESPAWN_DELAY_MS);
+
+    // Phase 2 — respawn after despawn + respawn timer
+    const respawnTimer = setTimeout(async () => {
       try {
-        await MobService.respawn(mobId);
-        const zoneManager = this.zones.get(zoneId);
-        if (zoneManager) {
-          zoneManager.setEntityAlive(mobId, true);
-          zoneManager.setEntityCombatState(mobId, false);
+        const respawnedMob = await MobService.respawn(mobId);
+        const zm = this.zones.get(zoneId);
+        if (zm) {
+          zm.spawnMob(respawnedMob);
+          // Re-register with wander system at the respawn position
+          const spawnedEntity = zm.getEntity(respawnedMob.id);
+          if (spawnedEntity) {
+            this.mobWanderSystems.get(zoneId)?.register(respawnedMob.id, spawnedEntity.position);
+          }
+          // Tell clients to add the respawned entity to their scene
+          await this.broadcastEntityAdded(zoneId, {
+            id: respawnedMob.id,
+            type: 'mob',
+            name: respawnedMob.name,
+            position: { x: respawnedMob.positionX, y: respawnedMob.positionY, z: respawnedMob.positionZ },
+            isAlive: true,
+            health: { current: respawnedMob.maxHealth, max: respawnedMob.maxHealth },
+            hostile: true,
+          });
           await this.broadcastNearbyUpdate(zoneId);
+          await this.publishZoneEntities(zoneId, zm);
+          logger.info({ mobId, name: respawnedMob.name, zoneId }, '[DWM] Mob respawned');
         }
       } finally {
         this.respawnTimers.delete(mobId);
       }
-    }, mob.respawnTime * 1000);
+    }, DESPAWN_DELAY_MS + respawnMs);
 
-    this.respawnTimers.set(mobId, timer);
+    this.respawnTimers.set(mobId, respawnTimer);
+  }
+
+  /**
+   * Handle player respawn request (triggered by pressing H on the client).
+   * Restores the player to full HP, teleports them to a respawn point,
+   * clears combat state, and sends an isAlive:true state update.
+   */
+  private async handlePlayerRespawn(message: MessageEnvelope): Promise<void> {
+    const characterId = message.characterId;
+    if (!characterId) return;
+
+    const zoneId = this.characterToZone.get(characterId);
+    if (!zoneId) return;
+
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const entity = zoneManager.getEntity(characterId);
+    if (!entity || entity.isAlive) return; // Already alive — ignore duplicate requests
+
+    // Cancel any pending 60-min auto-release timer
+    if (this.respawnTimers.has(characterId)) {
+      clearTimeout(this.respawnTimers.get(characterId)!);
+      this.respawnTimers.delete(characterId);
+    }
+
+    const character = await CharacterService.findById(characterId);
+    if (!character) return;
+
+    const maxHp = character.maxHp ?? 100;
+    const spawnPosition = SpawnPointService.getRespawnPosition(
+      zoneId,
+      entity.position.x,
+      entity.position.y,
+      entity.position.z
+    );
+
+    // Restore in DB
+    await CharacterService.updateResources(characterId, { currentHp: maxHp, isAlive: true });
+
+    // Update entity in zone
+    zoneManager.setEntityAlive(characterId, true);
+    zoneManager.teleportEntity(characterId, spawnPosition);
+    zoneManager.setEntityCombatState(characterId, false);
+    this.combatManager.clearAutoAttackTarget(characterId);
+    this.combatManager.clearAutoAttacksOnTarget(characterId);
+
+    // Tell the client they are alive again with full HP
+    await this.sendCharacterResourcesUpdate(zoneManager, characterId, {
+      health: { current: maxHp, max: maxHp },
+      isAlive: true,
+    });
+
+    // Broadcast so nearby entities see the respawned player
+    await this.broadcastNearbyUpdate(zoneId);
+
+    logger.info({ characterId, zoneId, spawnPosition }, '[DWM] Player respawned');
   }
 
   private async handleNpcInhabit(message: MessageEnvelope): Promise<void> {
@@ -2919,38 +4461,76 @@ export class DistributedWorldManager {
   }
 
   /**
-   * Trigger NPC AI responses for NPCs in range of the message
+   * Trigger NPC AI responses for NPCs in range of the message (ambient speech).
+   * Skips NPCs that are player-controlled or currently inhabited by an airlock session.
    */
   private async triggerNPCResponses(zoneId: string, messageOrigin: { x: number; y: number; z: number }, range: number): Promise<void> {
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
 
-    // Get recent messages for this zone
     const recentMessages = this.recentChatMessages.get(zoneId) || [];
     const contextMessages = recentMessages.slice(-5).map(m => ({
-      sender: m.sender,
-      channel: m.channel,
-      message: m.message,
+      sender: m.sender, channel: m.channel, message: m.message,
     }));
 
-    // Find NPCs in range
     const nearbyNPCs = await this.getNearbyNPCs(zoneId, messageOrigin, range);
+    const redis = this.messageBus.getRedisClient();
 
-    // Trigger AI response for each nearby NPC
     for (const companion of nearbyNPCs) {
-      if (this.companionToZone.has(companion.id)) {
-        continue;
-      }
+      // Skip player-controlled companions
+      if (this.companionToZone.has(companion.id)) continue;
+
+      // Skip airlock-inhabited NPCs — the external AI hears chat and responds itself
+      const inhabitId = await redis.get(`airlock:npc:${companion.id}`);
+      if (inhabitId) continue;
+
       const controller = this.npcControllers.get(companion.id);
       if (!controller) continue;
 
-      // Calculate proximity roster for this NPC (no hash needed for NPCs - they don't get roster updates)
       const result = zoneManager.calculateProximityRoster(companion.id);
       if (!result) continue;
 
-      // Generate and broadcast NPC response
       this.handleNPCResponse(companion, result.roster, contextMessages, zoneId);
     }
+  }
+
+  /**
+   * Trigger an AI response for a single specifically-addressed NPC.
+   * Used by the /talk command.  Checks airlock inhabit first; if the NPC is
+   * being puppeted by an external AI the airlock service will react via its own
+   * chat listener, so we skip the internal LLM call in that case.
+   */
+  private async triggerTargetedNPCResponse(
+    zoneId: string,
+    npcId: string,
+    messageOrigin: { x: number; y: number; z: number },
+    range: number,
+  ): Promise<void> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    // If an airlock session is currently inhabiting this NPC, it will respond
+    // via its own socket listener — no internal LLM call needed.
+    const redis = this.messageBus.getRedisClient();
+    const inhabitId = await redis.get(`airlock:npc:${npcId}`);
+    if (inhabitId) return;
+
+    // Also skip player-controlled companions
+    if (this.companionToZone.has(npcId)) return;
+
+    const nearbyNPCs = await this.getNearbyNPCs(zoneId, messageOrigin, range);
+    const companion = nearbyNPCs.find(c => c.id === npcId);
+    if (!companion) return;
+
+    const recentMessages = this.recentChatMessages.get(zoneId) || [];
+    const contextMessages = recentMessages.slice(-5).map(m => ({
+      sender: m.sender, channel: m.channel, message: m.message,
+    }));
+
+    const result = zoneManager.calculateProximityRoster(companion.id);
+    if (!result) return;
+
+    this.handleNPCResponse(companion, result.roster, contextMessages, zoneId);
   }
 
   /**
@@ -3147,6 +4727,133 @@ export class DistributedWorldManager {
   }
 
   /**
+   * Tell every player in a zone to remove an entity from their entity list.
+   * Call this right after removeMob/removeWildlife so the client despawns it.
+   */
+  private async broadcastEntityRemoved(zoneId: string, entityId: string): Promise<void> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const payload = {
+      timestamp: Date.now(),
+      entities: { removed: [entityId] },
+    };
+
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const socketId = zoneManager.getSocketIdForCharacter(charId);
+      if (!socketId) continue;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: charId,
+        socketId,
+        payload: { socketId, event: 'state_update', data: payload },
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Tell every player in a zone to add an entity to their entity list.
+   * Call this right after spawnMob/spawnWildlife so the client renders it.
+   */
+  private async broadcastEntityAdded(
+    zoneId: string,
+    entity: { id: string; type: string; name: string; position: Vector3; isAlive: boolean; health?: { current: number; max: number }; hostile?: boolean }
+  ): Promise<void> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const payload = {
+      timestamp: Date.now(),
+      entities: { added: [entity] },
+    };
+
+    for (const [charId, charZoneId] of this.characterToZone.entries()) {
+      if (charZoneId !== zoneId) continue;
+      const socketId = zoneManager.getSocketIdForCharacter(charId);
+      if (!socketId) continue;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: charId,
+        socketId,
+        payload: { socketId, event: 'state_update', data: payload },
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Exchange player entities on zone join:
+   *  1. Send all existing player entities in the zone to the joiner.
+   *  2. Announce the joiner to every other player already in the zone.
+   */
+  private async _exchangePlayerEntities(
+    character: { id: string; name: string; zoneId: string },
+    zoneManager: ZoneManager,
+  ): Promise<void> {
+    const zoneId   = character.zoneId;
+    const joinerId = character.id;
+
+    // Build a client-compatible Entity for a player entity.
+    const toClientEntity = (e: { id: string; name: string; type: string; description?: string; position: Vector3; isAlive: boolean; heading?: number }) => ({
+      id:          e.id,
+      name:        e.name,
+      type:        e.type,
+      description: e.description ?? '',
+      position:    e.position,
+      isAlive:     e.isAlive,
+      heading:     e.heading,
+    });
+
+    // ── 1. Send existing players to the joiner ────────────────────────────
+    const existingPlayers = zoneManager.getAllEntities()
+      .filter(e => e.type === 'player' && e.id !== joinerId);
+
+    if (existingPlayers.length > 0) {
+      const joinerSocket = zoneManager.getSocketIdForCharacter(joinerId);
+      if (joinerSocket) {
+        const payload = {
+          timestamp: Date.now(),
+          entities: { added: existingPlayers.map(toClientEntity) },
+        };
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: joinerId,
+          socketId: joinerSocket,
+          payload: { socketId: joinerSocket, event: 'state_update', data: payload },
+          timestamp: Date.now(),
+        });
+        logger.info({ characterId: joinerId, count: existingPlayers.length },
+          '[_exchangePlayerEntities] Sent existing players to joiner');
+      }
+    }
+
+    // ── 2. Announce the joiner to everyone else ───────────────────────────
+    const joinerEntity = zoneManager.getEntity(joinerId);
+    if (joinerEntity) {
+      const addedPayload = {
+        timestamp: Date.now(),
+        entities: { added: [toClientEntity(joinerEntity)] },
+      };
+      for (const [charId, charZoneId] of this.characterToZone.entries()) {
+        if (charZoneId !== zoneId || charId === joinerId) continue;
+        const socketId = zoneManager.getSocketIdForCharacter(charId);
+        if (!socketId) continue;
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId,
+          payload: { socketId, event: 'state_update', data: addedPayload },
+          timestamp: Date.now(),
+        });
+      }
+      logger.info({ characterId: joinerId, zoneId },
+        '[_exchangePlayerEntities] Announced joiner to existing players');
+    }
+  }
+
+  /**
    * Broadcast proximity roster updates to all nearby players in a zone
    */
   private async broadcastNearbyUpdate(zoneId: string): Promise<void> {
@@ -3188,7 +4895,9 @@ export class DistributedWorldManager {
     const animationState = animationLockSystem?.getState(characterId);
     const movementDuration = movementSystem.getMovementDuration(characterId);
     const movementSpeed = movementSystem.getMovementSpeed(characterId);
-    const heading = movementSystem.getHeading(characterId);
+    // MovementSystem only tracks headings for player/character movement; fall
+    // back to the entity's own heading field for mobs, wildlife, etc.
+    const heading = movementSystem.getHeading(characterId) ?? entity.heading;
 
     // Build state_update message with animation data
     const stateUpdate = {
@@ -3332,10 +5041,107 @@ export class DistributedWorldManager {
       void this.handleMovementUpdates(positionUpdates);
     }
 
-    // Update wildlife simulation
+    // Update wildlife simulation and flush batched position broadcasts.
+    // Skip local managers when the external Rust wildlife sim is connected —
+    // the bridge handles all entity state in that case.
     const now = Date.now();
-    for (const wildlifeManager of this.wildlifeManagers.values()) {
-      wildlifeManager.update(deltaTime, now);
+    const externalWildlifeActive = this.wildlifeBridge?.isExternalSimActive() ?? false;
+    if (!externalWildlifeActive) {
+      for (const wildlifeManager of this.wildlifeManagers.values()) {
+        wildlifeManager.update(deltaTime, now);
+      }
+    }
+    void this._flushWildlifePositionUpdates();
+
+    // Update flora growth / spawning (also managed by the Rust sim)
+    if (!externalWildlifeActive) {
+      for (const floraManager of this.floraManagers.values()) {
+        floraManager.update(deltaTime, now);
+      }
+    }
+
+    // Update mob wander / chase / return movement
+    for (const [zoneId, wanderSystem] of this.mobWanderSystems) {
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+
+      // ── 1. Inject / clear chase targets from CombatManager ───────────────
+      // Do this before update() so the wander system has fresh target coords.
+      for (const id of wanderSystem.getMobIds()) {
+        const isInCombat = this.combatManager.isInCombat(id);
+
+        if (isInCombat) {
+          // Mob is actively in combat — feed the latest target position so it
+          // chases a moving player.
+          const targetId = this.combatManager.getAutoAttackTarget(id);
+          if (targetId) {
+            const targetEntity = zm.getEntity(targetId);
+            if (targetEntity && targetEntity.isAlive) {
+              wanderSystem.setChaseTarget(id, targetEntity.position);
+            } else {
+              // Target died or left the zone — end combat immediately
+              wanderSystem.endChase(id);
+              this.combatManager.clearAutoAttackTarget(id);
+              this.combatManager.clearQueuedActionsForEntity(id);
+              zm.setEntityCombatState(id, false);
+            }
+          }
+        } else if (wanderSystem.getAIState(id) === 'chasing') {
+          // combatManager.update() timed out this mob's combat but
+          // handleCombatTimeouts skips mobs (no characterToZone entry).
+          // Handle the cleanup here instead.
+          wanderSystem.endChase(id);
+          this.combatManager.clearAutoAttackTarget(id);
+          this.combatManager.clearQueuedActionsForEntity(id);
+          zm.setEntityCombatState(id, false);
+        }
+      }
+
+      // ── 2. Tick the wander / chase / return system ───────────────────────
+      const { moves, leashBroken, stuckRequests } = wanderSystem.update(deltaTime);
+
+      // ── 3. Handle leash breaks — mob chased too far, pull it back ────────
+      for (const id of leashBroken) {
+        const entity = zm.getEntity(id);
+        if (entity) {
+          this.combatManager.clearAutoAttackTarget(id);
+          this.combatManager.clearQueuedActionsForEntity(id);
+          zm.setEntityCombatState(id, false);
+          // wanderSystem already transitioned the mob to 'returning'
+        }
+      }
+
+      // ── 4. Apply position updates (wander, chase, and return all emit moves)
+      const physics = zm.getPhysicsSystem();
+      let anyMoved = leashBroken.length > 0; // combat-state change counts as a zone update
+      for (const { id, position, heading } of moves) {
+        const entity = zm.getEntity(id);
+        if (!entity) continue;
+        if (!entity.isAlive) continue; // Don't move corpses — wander system will be unregistered at despawn
+        // Resolve candidate position against building walls before terrain snap,
+        // so mobs obey the same structure collisions players do.
+        const wallResolved = physics.resolveAgainstStructures(position, 0.5);
+        const snapped = zm.updateMobPosition(id, wallResolved, heading);
+        // Feed the terrain-snapped Y back so the next tick uses the actual
+        // ground elevation and mobs don't float or clip terrain.
+        wanderSystem.updateCurrentPosition(id, snapped);
+        void this.broadcastPositionUpdate(id, zoneId, snapped);
+        anyMoved = true;
+      }
+
+      // ── 5. Unstick mobs that geometry has trapped after MAX_STUCK_PICKS attempts
+      for (const id of stuckRequests) {
+        const entity = zm.getEntity(id);
+        if (!entity || !entity.isAlive) continue;
+        const nudged  = physics.nudgeToUnstuck(entity.position, 0.5);
+        const snapped = zm.updateMobPosition(id, nudged, entity.heading ?? 0);
+        wanderSystem.updateCurrentPosition(id, snapped);
+        void this.broadcastPositionUpdate(id, zoneId, snapped);
+        anyMoved = true;
+        logger.debug({ mobId: id, zoneId, nudged }, '[MobWander] Geometry unstuck applied');
+      }
+
+      if (anyMoved) void this.publishZoneEntities(zoneId, zm);
     }
 
     if (now - this.lastPartyStatusBroadcastAt >= PARTY_STATUS_INTERVAL_MS) {
@@ -3343,8 +5149,74 @@ export class DistributedWorldManager {
       this.lastPartyStatusBroadcastAt = now;
     }
 
+    // Tick physics (gravity/freefall) for NPCs, mobs, and wildlife
+    for (const [zoneId, zoneManager] of this.zones) {
+      const physicsMoved = zoneManager.tickPhysics(deltaTime);
+      if (physicsMoved.length > 0) {
+        for (const { id, position } of physicsMoved) {
+          void this.broadcastPositionUpdate(id, zoneId, position);
+        }
+        // Keep Redis entity snapshot current so world_entry gets correct positions
+        void this.publishZoneEntities(zoneId, zoneManager);
+      }
+    }
+
+    // Log physics sample once per second — gated behind PHYSICS_DEBUG=true
+    if (PHYSICS_DEBUG) {
+      this.physicsLogAccumulator = (this.physicsLogAccumulator ?? 0) + deltaTime;
+      if (this.physicsLogAccumulator >= 1.0) {
+        this.physicsLogAccumulator = 0;
+        for (const [zoneId, zoneManager] of this.zones) {
+          const sample = zoneManager.getPhysicsSample();
+          if (sample.length > 0) {
+            logger.info({ zoneId, entities: sample }, '[Physics] Non-player entity positions (1s sample)');
+          }
+        }
+      }
+    }
+
     // Update corruption system (manages its own tick interval internally)
     this.corruptionSystem.update(this.getZoneCorruptionData());
+
+    // Tick day/night cycle and weather for each zone; broadcast on change.
+    // Also refresh ZoneRegistry every 60 s so joining players always get a
+    // recent timeOfDayValue even if no bucket transition has fired recently.
+    this.envRegistryRefreshAccum += deltaTime;
+    const doRegistryRefresh = this.envRegistryRefreshAccum >= DistributedWorldManager.ENV_REGISTRY_REFRESH_SECS;
+    if (doRegistryRefresh) this.envRegistryRefreshAccum = 0;
+
+    for (const [zoneId, zm] of this.zones) {
+      const changed = zm.tickEnvironment(deltaTime);
+      if (changed) {
+        const envKey = `${zm.getTimeOfDayString()}|${zm.getWeather()}`;
+        if (this.lastEnvKeys.get(zoneId) !== envKey) {
+          this.lastEnvKeys.set(zoneId, envKey);
+          void this._broadcastZoneEnvironment(zoneId, zm);
+          void this.zoneRegistry.setZoneEnvironment(zoneId, {
+            timeOfDay:      zm.getTimeOfDayString(),
+            timeOfDayValue: zm.getTimeOfDayNormalized(),
+            weather:        zm.getWeather(),
+            lighting:       zm.getLighting(),
+          });
+        }
+      } else if (doRegistryRefresh) {
+        // No bucket/weather change, but silently refresh the stored float so
+        // any re-joining player gets a value no more than 60 s stale.
+        void this.zoneRegistry.setZoneEnvironment(zoneId, {
+          timeOfDay:      zm.getTimeOfDayString(),
+          timeOfDayValue: zm.getTimeOfDayNormalized(),
+          weather:        zm.getWeather(),
+          lighting:       zm.getLighting(),
+        });
+      }
+
+      // Publish weather & climate to Redis for external sims (wildlife, climate).
+      // WeatherBridge always publishes; ClimateBridge defers if climate_sim is active.
+      const wb = this.weatherBridges.get(zoneId);
+      const cb = this.climateBridges.get(zoneId);
+      if (wb) void wb.tick(zm.getWeather());
+      if (cb) void cb.tick(zm.getTimeOfDayNormalized(), zm.getWeather());
+    }
   }
 
   /**
@@ -3461,6 +5333,18 @@ export class DistributedWorldManager {
   }
 
   /**
+   * Find the zone ID for any entity type (mob, wildlife, etc.) not in the
+   * dedicated characterToZone / companionToZone maps.
+   * Linear scan across zones — only called for non-player/companion entities.
+   */
+  private findZoneForEntity(entityId: string): string | undefined {
+    for (const [zoneId, zoneManager] of this.zones) {
+      if (zoneManager.getEntity(entityId)) return zoneId;
+    }
+    return undefined;
+  }
+
+  /**
    * Process auto-attacks for all entities whose weapon timer is ready
    * Auto-attack runs on weapon speed, separate from ATB (which is for abilities)
    */
@@ -3469,8 +5353,10 @@ export class DistributedWorldManager {
     const readyAttackers = this.combatManager.getAutoAttackersReady();
 
     for (const { attackerId, targetId } of readyAttackers) {
-      // Find which zone the attacker is in
-      const zoneId = this.characterToZone.get(attackerId) || this.companionToZone.get(attackerId);
+      // Find which zone the attacker is in (covers players, companions, mobs, wildlife)
+      const zoneId = this.characterToZone.get(attackerId)
+        || this.companionToZone.get(attackerId)
+        || this.findZoneForEntity(attackerId);
       if (!zoneId) {
         this.combatManager.clearAutoAttackTarget(attackerId);
         continue;
@@ -3574,7 +5460,8 @@ export class DistributedWorldManager {
   private async onMovementComplete(
     characterId: string,
     reason: 'command' | 'distance_reached' | 'target_reached' | 'target_lost' | 'boundary',
-    finalPosition: Vector3
+    finalPosition: Vector3,
+    source: 'command' | 'direct' = 'command',
   ): Promise<void> {
     const zoneId = this.characterToZone.get(characterId);
     if (!zoneId) return;
@@ -3588,53 +5475,60 @@ export class DistributedWorldManager {
     // Broadcast final position update with idle animation state
     await this.broadcastPositionUpdate(characterId, zoneId, finalPosition);
 
-    // Get socket ID to notify player
-    const socketId = zoneManager.getSocketIdForCharacter(characterId);
-    if (socketId) {
-      // Build narrative message based on reason
-      let narrative: string;
-      switch (reason) {
-        case 'distance_reached':
-          narrative = 'You arrive at your destination.';
-          break;
-        case 'target_reached':
-          narrative = 'You reach your target.';
-          break;
-        case 'target_lost':
-          narrative = 'You stop moving. Target lost.';
-          break;
-        case 'boundary':
-          narrative = 'You stop at the zone boundary.';
-          break;
-        default:
-          narrative = 'You stop moving.';
-      }
+    // Only send narrative feedback for command-sourced movements.
+    // Real-time WASD / TargetWindow Approach/Retreat moves use source='direct'
+    // and produce no chat messages — they happen too frequently and have no
+    // meaningful narrative content.
+    if (source === 'command') {
+      const socketId = zoneManager.getSocketIdForCharacter(characterId);
+      if (socketId) {
+        // Build narrative message based on reason
+        let narrative: string;
+        switch (reason) {
+          case 'distance_reached':
+            narrative = 'You arrive at your destination.';
+            break;
+          case 'target_reached':
+            // Suppress during combat — the player is just repositioning mid-fight.
+            if (this.combatManager.isInCombat(characterId)) return;
+            narrative = 'You reach your target.';
+            break;
+          case 'target_lost':
+            narrative = 'You stop moving. Target lost.';
+            break;
+          case 'boundary':
+            narrative = 'You stop at the zone boundary.';
+            break;
+          default:
+            narrative = 'You stop moving.';
+        }
 
-      // Send movement complete event to player
-      await this.messageBus.publish('gateway:output', {
-        type: MessageType.CLIENT_MESSAGE,
-        characterId,
-        socketId,
-        payload: {
+        // Send movement complete event to player
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId,
           socketId,
-          event: 'event',
-          data: {
-            eventType: 'movement_complete',
-            reason,
-            narrative,
-            position: finalPosition,
-            timestamp: Date.now(),
+          payload: {
+            socketId,
+            event: 'event',
+            data: {
+              eventType: 'movement_complete',
+              reason,
+              narrative,
+              position: finalPosition,
+              timestamp: Date.now(),
+            },
           },
-        },
-        timestamp: Date.now(),
-      });
+          timestamp: Date.now(),
+        });
+      }
     }
 
     // Final proximity update
     await this.sendProximityRosterToEntity(characterId);
     await this.broadcastNearbyUpdate(zoneId);
 
-    logger.debug({ characterId, reason, position: finalPosition }, 'Movement completed');
+    logger.debug({ characterId, reason, source, position: finalPosition }, 'Movement completed');
   }
 
   private async handleCombatTimeouts(expired: string[]): Promise<void> {
@@ -3856,6 +5750,59 @@ export class DistributedWorldManager {
   }
 
   /**
+   * Publish authoritative entity positions for a zone to Redis.
+   * Excludes players (they move too frequently and are tracked separately).
+   */
+  private async publishZoneEntities(zoneId: string, zoneManager: ZoneManager): Promise<void> {
+    const entities = zoneManager.getAllEntities()
+      .filter(e => e.type !== 'player')
+      .map(e => ({
+        id:          e.id,
+        name:        e.name,
+        type:        e.type,
+        position:    e.position,
+        isAlive:     e.isAlive,
+        description: e.description,
+        // Mob/NPC fields for client nameplate display
+        ...(e.tag      !== undefined && { tag:      e.tag }),
+        ...(e.level    !== undefined && { level:    e.level }),
+        ...(e.faction  !== undefined && { faction:  e.faction }),
+        ...(e.aiType   !== undefined && { aiType:   e.aiType }),
+        ...(e.notorious                && { notorious: e.notorious }),
+        // Health object for the HP bar (included whenever tracked — mobs/companions)
+        ...(e.currentHealth !== undefined && e.maxHealth !== undefined && {
+          health: { current: e.currentHealth, max: e.maxHealth },
+        }),
+      }));
+    await this.zoneRegistry.setZoneEntities(zoneId, entities);
+  }
+
+  /**
+   * Push the current zone environment (time of day + weather) to every player
+   * in the zone via a partial state_update.  The client's SceneManager will
+   * smoothly transition lighting / fog to match.
+   */
+  private async _broadcastZoneEnvironment(zoneId: string, zm: ZoneManager): Promise<void> {
+    const socketIds = zm.getPlayerSocketIds();
+    if (socketIds.length === 0) return;
+
+    const zonePartial = {
+      timeOfDay:      zm.getTimeOfDayString(),
+      timeOfDayValue: zm.getTimeOfDayNormalized(),
+      weather:        zm.getWeather(),
+      lighting:       zm.getLighting(),
+    };
+
+    await Promise.all(socketIds.map(socketId =>
+      this.messageBus.publish('gateway:output', {
+        type:     MessageType.STATE_UPDATE,
+        socketId,
+        payload:  { zone: zonePartial },
+      })
+    ));
+  }
+
+  /**
    * Cleanup on shutdown
    */
   async shutdown(): Promise<void> {
@@ -3883,5 +5830,8 @@ export class DistributedWorldManager {
     this.companionToZone.clear();
     this.wildlifeManagers.clear();
     this.zoneCorruptionTags.clear();
+
+    void this.wildlifeBridge?.stop();
+    this.wildlifeBridge = null;
   }
 }

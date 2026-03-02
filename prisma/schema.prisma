@@ -26,6 +26,7 @@ model Character {
   level             Int      @default(1)
   experience        Int      @default(0)
   abilityPoints     Int      @default(0)
+  statPoints        Int      @default(0)
   supernaturalType  String?
   supernaturalData  Json?
   strength          Int      @default(10)
@@ -134,8 +135,32 @@ model ItemTemplate {
   createdAt    DateTime          @default(now())
   instances    InventoryItem[]
   tags         ItemTemplateTag[]
+  lootEntries  LootEntry[]
 
   @@map("item_templates")
+}
+
+model LootTable {
+  id      String      @id @default(uuid())
+  name    String
+  entries LootEntry[]
+  mobs    Mob[]
+
+  @@map("loot_tables")
+}
+
+model LootEntry {
+  id             String       @id @default(uuid())
+  lootTableId    String
+  itemTemplateId String
+  chance         Float        // 0.0–1.0
+  minQuantity    Int          @default(1)
+  maxQuantity    Int          @default(1)
+  lootTable      LootTable    @relation(fields: [lootTableId], references: [id], onDelete: Cascade)
+  itemTemplate   ItemTemplate @relation(fields: [itemTemplateId], references: [id])
+
+  @@index([lootTableId])
+  @@map("loot_entries")
 }
 
 model InventoryItem {
@@ -238,6 +263,10 @@ model Mob {
   positionY Float
   positionZ Float
 
+  // Faction and notoriety — client-side nameplate display
+  faction    String?  // e.g. "hostile", "neutral", "friendly" — drives nameplate color
+  notorious  Boolean  @default(false) // Notorious Monster: client shows "??" instead of level + special marker
+
   // AI behavior
   aiType       String @default("passive") // passive, aggressive, defensive, patrol
   aggroRadius  Float  @default(10.0)
@@ -246,6 +275,8 @@ model Mob {
 
   // Loot
   lootTableId String?
+  goldDrop    Int       @default(0) // Gold awarded on kill (before party split)
+  lootTable   LootTable? @relation(fields: [lootTableId], references: [id])
 
   // Respawn
   respawnTime Int       @default(120) // seconds

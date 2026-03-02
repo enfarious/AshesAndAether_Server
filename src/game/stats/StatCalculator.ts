@@ -139,11 +139,14 @@ export class StatCalculator {
   }
 
   private static calculatePhysicalAccuracy(dexterity: number, bonus: number = 0): number {
-    return 75 + dexterity * 2 + bonus;
+    // No base — purely derived from dexterity (and future weapon skill).
+    // TODO: add weaponSkill parameter once the weapon skill system is implemented.
+    return dexterity * 2 + bonus;
   }
 
   private static calculateEvasion(agility: number, bonus: number = 0): number {
-    return 5 + agility * 2 + bonus;
+    // No base — purely derived from agility. The hit formula carries the 85% floor.
+    return agility * 2 + bonus;
   }
 
   private static calculateDamageAbsorption(vitality: number, bonus: number = 0): number {
@@ -155,7 +158,11 @@ export class StatCalculator {
   }
 
   private static calculateCriticalHitChance(dexterity: number, bonus: number = 0): number {
-    return 5 + dexterity * 0.2 + bonus;
+    // Soft-capped curve — asymptotes toward ~52% from dex alone.
+    // dex 10 ≈ 6.5%  |  dex 30 ≈ 13.5%  |  dex 60 ≈ 20.8%  |  dex 150 ≈ 34%
+    // Hard cap at 75% so stacked gear can never reach 100%.
+    const fromDex = 50 * dexterity / (dexterity + 100);
+    return Math.min(75, 2 + fromDex + bonus);
   }
 
   private static calculatePenetratingBlowChance(strength: number, bonus: number = 0): number {
@@ -177,11 +184,13 @@ export class StatCalculator {
   }
 
   private static calculateMagicAccuracy(intelligence: number, bonus: number = 0): number {
-    return 75 + intelligence * 2 + bonus;
+    // Mirrors physicalAccuracy — no base, purely derived from intelligence.
+    return intelligence * 2 + bonus;
   }
 
   private static calculateMagicEvasion(wisdom: number, bonus: number = 0): number {
-    return 5 + wisdom * 2 + bonus;
+    // Mirrors evasion — no base, purely derived from wisdom.
+    return wisdom * 2 + bonus;
   }
 
   private static calculateMagicAbsorption(wisdom: number, bonus: number = 0): number {
@@ -295,15 +304,18 @@ export class StatCalculator {
   // ========== Combat Formulas ==========
 
   /**
-   * Calculate hit chance
+   * Calculate hit chance.
+   *
+   * Base 85% at equal accuracy/evasion.  Each point of net accuracy above
+   * evasion adds 0.2%; each point below subtracts 0.2%.  Clamped 5–95%.
+   *
+   * Examples (physicalAccuracy = dex*2, evasion = agi*2):
+   *   equal stats (dex=agi=10) → 85 + 0  = 85%
+   *   attacker dex 20 vs agi 10 → 85 + (40-20)*0.2 = 89%
+   *   attacker dex 10 vs agi 40 → 85 + (20-80)*0.2 = 73%
    */
   static calculateHitChance(attackerAccuracy: number, defenderEvasion: number): number {
-    const baseChance = 75; // Base 75% hit chance
-    const accuracyBonus = (attackerAccuracy - 75) * 0.5;
-    const evasionPenalty = defenderEvasion * 0.5;
-
-    const hitChance = baseChance + accuracyBonus - evasionPenalty;
-
+    const hitChance = 85 + (attackerAccuracy - defenderEvasion) * 0.2;
     // Clamp between 5% and 95%
     return Math.max(5, Math.min(95, hitChance));
   }

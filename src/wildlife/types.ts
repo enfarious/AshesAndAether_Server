@@ -48,7 +48,8 @@ export type BiomeType =
 // 80+ = thriving, increased reproduction
 export interface BiomePreference {
   biome: BiomeType;
-  comfort: number;  // 0-100
+  comfort: number;      // 0-100
+  spawnWeight: number;  // Relative spawn chance in this biome (higher = more common here)
 }
 
 // ========== Needs System ==========
@@ -113,8 +114,12 @@ export interface WildlifeSpecies {
   // Habitat
   biomePreferences: BiomePreference[];
   nocturnal: boolean;          // More active at night
+  crepuscular?: boolean;       // Active at dawn/dusk (overrides nocturnal for activity window)
   socialBehavior: 'solitary' | 'pair' | 'pack' | 'herd';
   packSize?: { min: number; max: number };
+
+  // Aggression
+  aggressionRadius?: number;   // Metres — attacks players who enter this range unprovoked (0/omit = passive)
 
   // Reproduction
   gestationTime: number;       // seconds until offspring spawn

@@ -1,9 +1,8 @@
 import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
-import { AccountService, CharacterService, CompanionService, ZoneService } from '@/database';
-import { SpawnPointService } from '@/world/SpawnPointService';
+import { AccountService, CharacterService, CompanionService, ZoneService, InventoryService } from '@/database';
 import { StatCalculator } from '@/game/stats/StatCalculator';
-import { PhysicsSystem } from '@/physics/PhysicsSystem';
+import { SpawnPointService } from '@/world/SpawnPointService';
 import { MessageBus, MessageType, ZoneRegistry } from '@/messaging';
 import { randomUUID } from 'crypto';
 import {
@@ -29,8 +28,22 @@ import {
   ChatMessage,
   InteractMessage,
   CombatActionMessage,
+  EquipSlot,
 } from '@/network/protocol/types';
 import type { Character } from '@prisma/client';
+import {
+  parseUnlockedAbilities,
+  parseActiveLoadout,
+  parsePassiveLoadout,
+} from '@/game/abilities/tree/types';
+import { ACTIVE_WEB } from '@/game/abilities/tree/ActiveWeb';
+import { PASSIVE_WEB } from '@/game/abilities/tree/PassiveWeb';
+import {
+  loadAbilityState,
+  unlockAbility,
+  slotActiveAbility,
+  slotPassiveAbility,
+} from '@/game/abilities/tree/AbilityTreeService';
 
 interface ClientInfo {
   type: ClientType;
@@ -64,6 +77,8 @@ export class GatewayClientSession {
   private pendingCharacterCreate: { name: string; appearance?: { description: string } } | null = null;
   // Guest session flag - if true, account+character deleted on disconnect
   private isGuestSession: boolean = false;
+  // Active weapon set (1 = mainhand/offhand, 2 = mainhand2/offhand2)
+  private activeWeaponSet: 1 | 2 = 1;
 
   constructor(
     private socket: Socket,
@@ -210,8 +225,18 @@ export class GatewayClientSession {
         this.sendDevAck('combat_action', false, 'not_in_world');
         return;
       }
+      logger.info(
+        { abilityId: data.abilityId, targetId: data.targetId, characterId: this.characterId, zoneId: this.currentZoneId },
+        '[Gateway] combat_action received → routing to zone'
+      );
       const routed = await this.routeToZone('combat_action', data);
+      logger.info({ routed, characterId: this.characterId }, '[Gateway] combat_action route result');
       this.sendDevAck('combat_action', routed, routed ? undefined : 'not_routed');
+    });
+
+    this.socket.on('respawn', async () => {
+      if (!this.characterId || !this.currentZoneId) return;
+      await this.routeToZone('respawn', {});
     });
 
     this.socket.on('interact', async (data: InteractMessage['payload']) => {
@@ -273,6 +298,119 @@ export class GatewayClientSession {
       });
 
       this.sendDevAck('proximity_refresh', true);
+    });
+
+    // Inventory — handled at Gateway level (pure DB operations, no zone routing needed)
+    this.socket.on('equip_item', async (data: { itemId?: string; slot?: string }) => {
+      if (!this.characterId) {
+        this.sendDevAck('equip_item', false, 'not_in_world');
+        return;
+      }
+      const { itemId, slot } = data ?? {};
+      if (!itemId || !slot) {
+        this.sendDevAck('equip_item', false, 'missing_params');
+        return;
+      }
+      try {
+        const payload = await InventoryService.equipItem(
+          this.characterId, itemId, slot as EquipSlot, this.activeWeaponSet,
+        );
+        this.socket.emit('inventory_update', payload);
+        this.sendDevAck('equip_item', true);
+      } catch (err) {
+        logger.warn({ err, characterId: this.characterId }, 'equip_item failed');
+        this.sendDevAck('equip_item', false, err instanceof Error ? err.message : 'equip_failed');
+      }
+    });
+
+    this.socket.on('unequip_item', async (data: { slot?: string }) => {
+      if (!this.characterId) {
+        this.sendDevAck('unequip_item', false, 'not_in_world');
+        return;
+      }
+      const { slot } = data ?? {};
+      if (!slot) {
+        this.sendDevAck('unequip_item', false, 'missing_slot');
+        return;
+      }
+      try {
+        const payload = await InventoryService.unequipItem(
+          this.characterId, slot as EquipSlot, this.activeWeaponSet,
+        );
+        this.socket.emit('inventory_update', payload);
+        this.sendDevAck('unequip_item', true);
+      } catch (err) {
+        logger.warn({ err, characterId: this.characterId }, 'unequip_item failed');
+        this.sendDevAck('unequip_item', false, 'unequip_failed');
+      }
+    });
+
+    this.socket.on('weapon_set_swap', async () => {
+      if (!this.characterId) return;
+      this.activeWeaponSet = InventoryService.swapWeaponSet(this.activeWeaponSet);
+      const payload = await InventoryService.buildPayload(this.characterId, this.activeWeaponSet);
+      this.socket.emit('inventory_update', payload);
+    });
+
+    this.socket.on('loot_roll', async (data: { sessionId: string; itemId: string; roll: 'need' | 'want' | 'pass' }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      await this.routeToZone('loot_roll', data);
+    });
+
+    // ── Ability tree ──────────────────────────────────────────────────────────
+
+    this.socket.on('unlock_ability', async (data: unknown) => {
+      if (!this.characterId) return;
+      const { nodeId } = (data ?? {}) as { nodeId?: string };
+      if (!nodeId) return;
+      const result = await unlockAbility(this.characterId, nodeId);
+      const state  = await loadAbilityState(this.characterId);
+      if (!state) return;
+      this.socket.emit('ability_update', {
+        unlockedActiveNodes:  state.unlocked.activeNodes,
+        unlockedPassiveNodes: state.unlocked.passiveNodes,
+        activeLoadout:        state.activeLoadout.slots,
+        passiveLoadout:       state.passiveLoadout.slots,
+        abilityPoints:        state.availableAp,
+        success:              result.success,
+        message:              result.message,
+      });
+    });
+
+    this.socket.on('slot_active_ability', async (data: unknown) => {
+      if (!this.characterId) return;
+      const { slotNumber, nodeId } = (data ?? {}) as { slotNumber?: number; nodeId?: string };
+      if (slotNumber === undefined || nodeId === undefined) return;
+      const result = await slotActiveAbility(this.characterId, slotNumber, nodeId);
+      const state  = await loadAbilityState(this.characterId);
+      if (!state) return;
+      this.socket.emit('ability_update', {
+        unlockedActiveNodes:  state.unlocked.activeNodes,
+        unlockedPassiveNodes: state.unlocked.passiveNodes,
+        activeLoadout:        state.activeLoadout.slots,
+        passiveLoadout:       state.passiveLoadout.slots,
+        abilityPoints:        state.availableAp,
+        success:              result.success,
+        message:              result.message,
+      });
+    });
+
+    this.socket.on('slot_passive_ability', async (data: unknown) => {
+      if (!this.characterId) return;
+      const { slotNumber, nodeId } = (data ?? {}) as { slotNumber?: number; nodeId?: string };
+      if (slotNumber === undefined || nodeId === undefined) return;
+      const result = await slotPassiveAbility(this.characterId, slotNumber, nodeId);
+      const state  = await loadAbilityState(this.characterId);
+      if (!state) return;
+      this.socket.emit('ability_update', {
+        unlockedActiveNodes:  state.unlocked.activeNodes,
+        unlockedPassiveNodes: state.unlocked.passiveNodes,
+        activeLoadout:        state.activeLoadout.slots,
+        passiveLoadout:       state.passiveLoadout.slots,
+        abilityPoints:        state.availableAp,
+        success:              result.success,
+        message:              result.message,
+      });
     });
 
     // Ping/pong
@@ -362,6 +500,40 @@ export class GatewayClientSession {
         });
         break;
 
+      case 'respawn':
+        messageType = MessageType.PLAYER_RESPAWN;
+        await this.messageBus.publish(channel, {
+          type: messageType,
+          zoneId: this.currentZoneId,
+          characterId: this.characterId,
+          socketId: this.socket.id,
+          payload: {
+            characterId: this.characterId,
+            zoneId: this.currentZoneId,
+            socketId: this.socket.id,
+          },
+          timestamp: Date.now(),
+        });
+        break;
+
+      case 'loot_roll':
+        const lootData = data as { sessionId: string; itemId: string; roll: 'need' | 'want' | 'pass' };
+        await this.messageBus.publish(channel, {
+          type: MessageType.PLAYER_ACTION,
+          zoneId: this.currentZoneId,
+          characterId: this.characterId,
+          socketId: this.socket.id,
+          payload: {
+            action: 'loot_roll',
+            characterId: this.characterId,
+            sessionId: lootData.sessionId,
+            itemId: lootData.itemId,
+            roll: lootData.roll,
+          },
+          timestamp: Date.now(),
+        });
+        break;
+
       default:
         logger.warn({ event }, 'Unhandled game event for routing');
         return false;
@@ -426,12 +598,12 @@ export class GatewayClientSession {
           throw new Error('Invalid authentication method');
       }
     } catch (error) {
-      logger.error({ error }, `Authentication failed for ${this.socket.id}`);
       const errorResponse: AuthErrorMessage['payload'] = {
         reason: 'invalid_credentials',
         message: error instanceof Error ? error.message : 'Authentication failed',
         canRetry: true,
       };
+      logger.error({ errorResponse }, `Authentication failed for ${this.socket.id}`);
       this.socket.emit('auth_error', errorResponse);
     }
   }
@@ -904,32 +1076,6 @@ export class GatewayClientSession {
 
     const zone = character.zone;
 
-    // Get respawn position (uses saved lastPosition if available, with collision avoidance)
-    const respawnPos = SpawnPointService.getRespawnPosition(
-      zone.id,
-      character.lastPositionX,
-      character.lastPositionY,
-      character.lastPositionZ
-    );
-
-    // Update character position to respawn position if different
-    if (
-      respawnPos.x !== character.positionX ||
-      respawnPos.y !== character.positionY ||
-      respawnPos.z !== character.positionZ
-    ) {
-      await CharacterService.updatePosition(this.characterId, {
-        x: respawnPos.x,
-        y: respawnPos.y,
-        z: respawnPos.z,
-      });
-      // Reload character with updated position
-      const updatedCharacter = await CharacterService.findByIdWithZone(this.characterId);
-      if (updatedCharacter) {
-        Object.assign(character, updatedCharacter);
-      }
-    }
-
     const coreStats = {
       strength: character.strength,
       vitality: character.vitality,
@@ -941,46 +1087,51 @@ export class GatewayClientSession {
 
     const derivedStats = StatCalculator.calculateDerivedStats(coreStats, character.level);
 
-    // Get companions (NPCs) and mobs in the zone
-    const companions = await ZoneService.getCompanionsInZone(zone.id);
-    const mobs = await ZoneService.getMobsInZone(zone.id);
+    // Fetch authoritative entity positions from the zone server's Redis snapshot.
+    // This is written by DistributedWorldManager after init and after each physics tick,
+    // so positions are physics-corrected. Fall back to DB only if zone isn't live yet.
+    let entities: WorldEntryMessage['payload']['entities'] = [];
+    const liveEntities = await this.zoneRegistry.getZoneEntities(zone.id);
+    if (liveEntities) {
+      entities = liveEntities.filter(e => e.isAlive).map(e => ({
+        id: e.id,
+        type: e.type as 'npc' | 'mob' | 'wildlife',
+        name: e.name,
+        position: e.position,
+        isAlive: e.isAlive,
+        interactive: e.type !== 'wildlife',
+        description: e.description || '',
+        ...(e.tag       !== undefined && { tag:       e.tag }),
+        ...(e.level     !== undefined && { level:     e.level }),
+        ...(e.faction   !== undefined && { faction:   e.faction }),
+        ...(e.notorious !== undefined && { notorious: e.notorious }),
+        ...(e.health    !== undefined && { health:    e.health }),
+      }));
+    } else {
+      // Fallback: zone server not up yet, use DB positions directly
+      logger.warn({ zoneId: zone.id }, 'No live entity snapshot in Redis at world_entry — falling back to DB positions');
+      const companions = await ZoneService.getCompanionsInZone(zone.id);
+      const mobs = await ZoneService.getMobsInZone(zone.id);
+      entities = [
+        ...companions.filter(c => c.isAlive ?? true).map(c => ({
+          id: c.id, type: 'npc' as const, name: c.name,
+          position: { x: c.positionX, y: c.positionY, z: c.positionZ },
+          description: c.description || '', isAlive: c.isAlive ?? true, interactive: true,
+        })),
+        ...mobs.filter(m => m.isAlive).map(m => ({
+          id: m.id, type: 'mob' as const, name: m.name,
+          position: { x: m.positionX, y: m.positionY, z: m.positionZ },
+          description: m.description || '', isAlive: m.isAlive, interactive: true,
+          tag: m.tag, level: m.level, faction: m.faction ?? undefined,
+          notorious: m.notorious,
+          health: { current: m.currentHealth, max: m.maxHealth },
+        })),
+      ];
+    }
 
-    // Build entity list (NPCs and mobs)
-    const npcEntities = companions
-      .filter(companion => companion.isAlive ?? true)
-      .map(companion => ({
-      id: companion.id,
-      type: 'npc' as const,
-      name: companion.name,
-      position: { x: companion.positionX, y: companion.positionY, z: companion.positionZ },
-      description: companion.description || '',
-      isAlive: companion.isAlive ?? true,
-      interactive: true,
-    }));
-
-    // Apply gravity to mobs (pull floating entities to ground)
-    const physicsSystem = new PhysicsSystem();
-    const mobEntities = mobs
-      .filter(mob => mob.isAlive)
-      .map(mob => {
-        const mobPos = { x: mob.positionX, y: mob.positionY, z: mob.positionZ };
-        const adjustedPos = physicsSystem.applyGravity(mobPos);
-        
-        return {
-          id: mob.id,
-          type: 'mob' as const,
-          tag: mob.tag,
-          name: mob.name,
-          position: { x: adjustedPos.x, y: adjustedPos.y, z: adjustedPos.z },
-          description: mob.description || '',
-          isAlive: mob.isAlive,
-          level: mob.level,
-          faction: mob.faction,
-          interactive: true,
-        };
-      });
-
-    const entities = [...npcEntities, ...mobEntities];
+    // Fetch live environment (time of day + weather) published by the zone server.
+    // Falls back to sensible defaults if the zone server hasn't written to Redis yet.
+    const liveEnv = await this.zoneRegistry.getZoneEnvironment(zone.id);
 
     const worldEntry: WorldEntryMessage['payload'] = {
       characterId: character.id,
@@ -1002,26 +1153,61 @@ export class GatewayClientSession {
         stamina: { current: character.currentStamina, max: character.maxStamina },
         mana: { current: character.currentMana, max: character.maxMana },
         unlockedFeats: character.unlockedFeats as string[],
-        unlockedAbilities: character.unlockedAbilities as string[],
-        activeLoadout: character.activeLoadout as string[],
-        passiveLoadout: character.passiveLoadout as string[],
-        specialLoadout: character.specialLoadout as string[],
+        unlockedAbilities: (() => {
+          const ua = parseUnlockedAbilities(character.unlockedAbilities);
+          return { activeNodes: ua.activeNodes, passiveNodes: ua.passiveNodes, apSpent: ua.apSpent };
+        })(),
+        activeLoadout:  parseActiveLoadout(character.activeLoadout).slots,
+        passiveLoadout: parsePassiveLoadout(character.passiveLoadout).slots,
+        specialLoadout: Array.isArray(character.specialLoadout) ? (character.specialLoadout as string[]) : [],
       },
       zone: {
-        id: zone.id,
-        name: zone.name,
-        description: zone.description || '',
-        weather: 'clear',
-        timeOfDay: 'dusk',
-        lighting: 'dim',
-        contentRating: zone.contentRating as 'T' | 'M' | 'AO',
+        id:             zone.id,
+        name:           zone.name,
+        description:    zone.description || '',
+        weather:        liveEnv?.weather        ?? 'clear',
+        timeOfDay:      liveEnv?.timeOfDay      ?? 'day',
+        timeOfDayValue: liveEnv?.timeOfDayValue ?? 0.33,
+        lighting:       liveEnv?.lighting       ?? 'normal',
+        contentRating:  zone.contentRating as 'T' | 'M' | 'AO',
       },
       entities,
       exits: [],
+      // Static node definitions — lets the client render the full ability tree.
+      abilityManifest: [...ACTIVE_WEB, ...PASSIVE_WEB].map(node => ({
+        id:               node.id,
+        web:              node.web,
+        sector:           node.sector,
+        tier:             node.tier,
+        name:             node.name,
+        description:      node.description,
+        cost:             node.cost,
+        adjacentTo:       node.adjacentTo,
+        effectDescription: node.activeEffect?.description,
+        staminaCost:      node.activeEffect?.staminaCost,
+        manaCost:         node.activeEffect?.manaCost,
+        cooldown:         node.activeEffect?.cooldown,
+        castTime:         node.activeEffect?.castTime,
+        targetType:       node.activeEffect?.targetType,
+        range:            node.activeEffect?.range,
+        statBonuses:      node.statBonus
+          ? (Object.fromEntries(
+              Object.entries(node.statBonus).filter(([, v]) => v !== undefined),
+            ) as Record<string, number>)
+          : undefined,
+        questGate: node.questGate,
+      })),
     };
 
     this.socket.emit('world_entry', worldEntry);
     logger.info(`World entry sent for character ${character.name} in ${zone.name}`);
+
+    // Send initial inventory (fire-and-forget — non-critical, world_entry already delivered)
+    void InventoryService.buildPayload(character.id, this.activeWeaponSet).then(inv => {
+      this.socket.emit('inventory_update', inv);
+    }).catch(err => {
+      logger.warn({ err, characterId: character.id }, 'Failed to send initial inventory_update');
+    });
 
     // Notify Zone server that player joined
     this.currentZoneId = zone.id;

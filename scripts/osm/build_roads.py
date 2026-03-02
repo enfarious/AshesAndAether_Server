@@ -170,17 +170,24 @@ def road_to_mesh(
     if len(nodes) < 2:
         return None
 
-    # Convert nodes to local coordinates with elevations
+    # Convert nodes to local coordinates with elevations.
+    # Only include nodes that have valid heightmap coverage — nodes outside the
+    # DEM would fall back to default_elevation=0 (sea level), which creates road
+    # geometry that dives hundreds of metres underground.
     points_3d = []
     for node in nodes:
         x, z = latlon_to_local(node["lat"], node["lon"], origin_lat, origin_lon)
+        # latlon_to_local returns Z+ = North; game uses Z+ = South — negate.
+        z = -z
 
-        # Sample elevation
-        y = default_elevation
+        # Sample elevation — skip this node if it falls outside the DEM.
         if heightmap:
             sampled = heightmap.sample(node["lat"], node["lon"])
-            if sampled is not None:
-                y = sampled
+            if sampled is None:
+                continue  # Node outside DEM bounds; don't place at sea level
+            y = sampled
+        else:
+            y = default_elevation
 
         y += ROAD_SURFACE_OFFSET  # Offset above terrain
         points_3d.append([x, y, z])
@@ -227,14 +234,17 @@ def road_to_mesh(
 
     vertices = np.array(vertices)
 
-    # Create faces (quads as pairs of triangles)
+    # Create faces (quads as pairs of triangles).
+    # Winding: after negating Z above, a single-axis reflection inverts the
+    # winding order, which would make road normals point downward.
+    # Swap the two non-pivot vertices in each triangle to restore upward normals.
     for i in range(len(points_3d) - 1):
         idx = i * 2
-        # Quad from vertices: idx, idx+1, idx+2, idx+3
-        # Triangle 1: idx, idx+2, idx+1
-        # Triangle 2: idx+1, idx+2, idx+3
-        faces.append([idx, idx + 2, idx + 1])
-        faces.append([idx + 1, idx + 2, idx + 3])
+        # Quad from vertices: idx=left[i], idx+1=right[i], idx+2=left[i+1], idx+3=right[i+1]
+        # Triangle 1: idx, idx+1, idx+2  (reversed from pre-Z-flip order)
+        # Triangle 2: idx+1, idx+3, idx+2
+        faces.append([idx, idx + 1, idx + 2])
+        faces.append([idx + 1, idx + 3, idx + 2])
 
     if len(faces) == 0:
         return None
@@ -309,6 +319,14 @@ def main() -> None:
 
         highway_type = tags.get("highway", "road")
         type_counts[highway_type] = type_counts.get(highway_type, 0) + 1
+
+        # Pre-filter: drop nodes outside the DEM so road_to_mesh never falls
+        # back to default_elevation=0 (sea level) for out-of-bounds nodes.
+        if heightmap and heightmap.grid is not None:
+            nodes = [n for n in nodes if heightmap.sample(n["lat"], n["lon"]) is not None]
+            if len(nodes) < 2:
+                skipped += 1
+                continue
 
         # Get road width
         width = get_road_width(tags)

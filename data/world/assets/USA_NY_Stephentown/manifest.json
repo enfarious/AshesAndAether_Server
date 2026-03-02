@@ -9,11 +9,17 @@
   },
   "assets": [
     {
-      "id": "stephentown_terrain",
+      "id": "stephentown_terrain_heightmap",
       "type": "terrain_heightmap",
       "version": "usgs-ned-1-3-arcsec",
       "path": "/world/terrain/usa_ny_stephentown_dem.bin",
       "metaPath": "/world/terrain/usa_ny_stephentown_dem.json"
+    },
+    {
+      "id": "stephentown_terrain",
+      "type": "terrain_mesh",
+      "version": "usgs-ned-1-3-arcsec",
+      "path": "/world/assets/USA_NY_Stephentown/usa_ny_stephentown_terrain.glb"
     },
     {
       "id": "stephentown_buildings",

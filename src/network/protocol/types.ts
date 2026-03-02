@@ -224,6 +224,45 @@ export interface CharacterErrorMessage {
   };
 }
 
+// ========== Ability Tree ==========
+
+/**
+ * Static node metadata sent once in world_entry.abilityManifest so the
+ * client can render the full ability tree without a separate round-trip.
+ */
+export interface AbilityNodeSummary {
+  id:               string;
+  web:              'active' | 'passive';
+  sector:           string;
+  tier:             number;       // 1–4
+  name:             string;
+  description:      string;
+  cost:             number;       // AP cost
+  adjacentTo:       string[];     // neighbour node IDs
+  // Active effect data (active-web nodes only)
+  effectDescription?: string;
+  staminaCost?:       number;
+  manaCost?:          number;
+  cooldown?:          number;     // seconds
+  castTime?:          number;     // seconds (0 = instant)
+  targetType?:        string;     // 'self' | 'enemy' | 'ally' | 'aoe'
+  range?:             number;     // metres
+  // Passive bonuses (passive-web nodes only)
+  statBonuses?: Record<string, number>;
+  questGate?:   string;           // feat ID required (T4 capstones)
+}
+
+/** Emitted after every unlock / slot operation so the client stays in sync. */
+export interface AbilityUpdatePayload {
+  unlockedActiveNodes:  string[];
+  unlockedPassiveNodes: string[];
+  activeLoadout:        (string | null)[];  // 8 slots
+  passiveLoadout:       (string | null)[];  // 8 slots
+  abilityPoints:        number;
+  success:              boolean;
+  message:              string;
+}
+
 // ========== World Entry ==========
 
 export interface Vector3 {
@@ -277,6 +316,7 @@ export interface CharacterState {
   level: number;
   experience: number;
   abilityPoints: number;
+  statPoints: number;
   isAlive: boolean;
 
   // Position
@@ -300,12 +340,12 @@ export interface CharacterState {
 
   // Progression
   unlockedFeats: string[];  // Array of feat IDs
-  unlockedAbilities: string[];  // Array of ability IDs
+  unlockedAbilities: { activeNodes: string[]; passiveNodes: string[]; apSpent: number };
 
   // Loadouts (8 active, 8 passive, 4 special)
-  activeLoadout: string[];  // 8 ability IDs
-  passiveLoadout: string[];  // 8 ability IDs
-  specialLoadout: string[];  // 4 ability IDs (from equipment)
+  activeLoadout:  (string | null)[];  // 8 slots
+  passiveLoadout: (string | null)[];  // 8 slots
+  specialLoadout: string[];           // 4 ability IDs (from equipment)
 }
 
 export interface ZoneInfo {
@@ -314,6 +354,8 @@ export interface ZoneInfo {
   description: string;
   weather: string;
   timeOfDay: string;
+  /** Normalised 0–1 time of day (0 = midnight, 0.25 = 6 am, 0.5 = noon). */
+  timeOfDayValue?: number;
   lighting: string;
   contentRating: ContentRating;  // Zone's content rating
 }
@@ -329,6 +371,11 @@ export interface Entity {
   interactive?: boolean;
   hostile?: boolean;
   animation?: string;
+  // Nameplate data — mob/NPC identification and display
+  tag?: string;         // Stable mob type identifier (e.g. "mob.rat.1")
+  level?: number;       // Used for chevron indicator relative to player level
+  faction?: string;     // "hostile" | "neutral" | "friendly" — nameplate color
+  notorious?: boolean;  // True for Notorious Monsters — shows "??" + special marker
   
   // For 3D client animation/interpolation
   currentAction?: AnimationAction;                    // Current animation state
@@ -352,6 +399,8 @@ export interface WorldEntryMessage {
     zone: ZoneInfo;
     entities: Entity[];
     exits: Exit[];
+    /** Static node definitions — sent once so the client can render the tree. */
+    abilityManifest: AbilityNodeSummary[];
   };
 }
 
@@ -379,6 +428,12 @@ export interface StateUpdateMessage {
       stamina?: { current: number; max: number };
       mana?: { current: number; max: number };
       effects?: StatusEffect[];
+      // Progression updates (XP gain / level-up)
+      experience?: number;
+      level?: number;
+      abilityPoints?: number;
+      statPoints?: number;
+      isAlive?: boolean;
     };
     // Combat gauges (self only - private to the player)
     combat?: {
@@ -849,11 +904,128 @@ export interface PlayerPeekResponse {
   timestamp: number;
 }
 
+// ========== Inventory ==========
+
+export type EquipSlot =
+  | 'head' | 'body' | 'hands' | 'legs' | 'feet'
+  | 'necklace' | 'bracelet' | 'ring1' | 'ring2'
+  | 'mainhand' | 'offhand'
+  | 'mainhand2' | 'offhand2';
+
+export const EQUIP_SLOTS: EquipSlot[] = [
+  'head', 'body', 'hands', 'legs', 'feet',
+  'necklace', 'bracelet', 'ring1', 'ring2',
+  'mainhand', 'offhand', 'mainhand2', 'offhand2',
+];
+
+export interface ItemInfo {
+  id:           string;
+  templateId:   string;
+  name:         string;
+  description:  string;
+  itemType:     string;   // 'weapon', 'armor', 'jewelry', 'consumable', 'misc', etc.
+  quantity:     number;
+  durability?:  number;
+  properties?:  Record<string, unknown>;
+  iconUrl?:     string;
+  equipped:     boolean;
+  equipSlot?:   EquipSlot;
+}
+
+export interface InventoryUpdatePayload {
+  items:          ItemInfo[];                         // All non-equipped items (inventory)
+  equipment:      Partial<Record<EquipSlot, ItemInfo>>; // Currently equipped items by slot
+  activeWeaponSet: 1 | 2;
+  timestamp:      number;
+}
+
+export interface InventoryUpdateMessage {
+  type: 'inventory_update';
+  payload: InventoryUpdatePayload;
+}
+
+export interface EquipItemMessage {
+  type: 'equip_item';
+  payload: {
+    itemId:    string;
+    slot:      EquipSlot;
+    timestamp: number;
+  };
+}
+
+export interface UnequipItemMessage {
+  type: 'unequip_item';
+  payload: {
+    slot:      EquipSlot;
+    timestamp: number;
+  };
+}
+
+export interface WeaponSetSwapMessage {
+  type: 'weapon_set_swap';
+  payload: {
+    timestamp: number;
+  };
+}
+
+// ========== Loot ==========
+
+export interface LootSessionItem {
+  id:          string;   // session-scoped UUID for this roll slot
+  templateId:  string;
+  name:        string;
+  itemType:    string;
+  description: string;
+  iconUrl?:    string;
+  quantity:    number;
+}
+
+/** Zone → Client: loot session opened (solo or party NWP) */
+export interface LootSessionStartPayload {
+  sessionId:        string;
+  mobName:          string;
+  mode:             'solo' | 'party';
+  items:            LootSessionItem[];
+  gold:             number;           // total gold dropped
+  goldPerMember:    number;           // floor(gold / partySize), 0 for solo
+  expiresAt:        number;           // ms timestamp; party only (0 for solo)
+}
+
+/** Zone → Client: one item in a party session resolved */
+export interface LootItemResultPayload {
+  sessionId:  string;
+  itemId:     string;
+  itemName:   string;
+  winnerId:   string | null;    // null = all passed
+  winnerName: string | null;
+  winRoll:    'need' | 'want' | null;
+  rollValue:  number;           // 1–100 shown for party flavour
+}
+
+/** Zone → Client: party loot session fully resolved */
+export interface LootSessionEndPayload {
+  sessionId: string;
+}
+
+/** Client → Zone: cast a vote for one item in a party session */
+export interface LootRollMessage {
+  type: 'loot_roll';
+  payload: {
+    sessionId: string;
+    itemId:    string;
+    roll:      'need' | 'want' | 'pass';
+  };
+}
+
 // ========== Union Type for All Messages ==========
 
 export type ClientMessage =
   | HandshakeMessage
   | AuthMessage
+  | EquipItemMessage
+  | UnequipItemMessage
+  | WeaponSetSwapMessage
+  | LootRollMessage
   | AuthNameConfirmedMessage
   | CharacterSelectMessage
   | CharacterCreateMessage
@@ -877,6 +1049,7 @@ export type ClientMessage =
 
 export type ServerMessage =
   | HandshakeAckMessage
+  | InventoryUpdateMessage
   | AuthSuccessMessage
   | AuthErrorMessage
   | AuthConfirmNameMessage

@@ -270,11 +270,16 @@ def main() -> None:
         centroid_lat = sum(n["lat"] for n in nodes) / len(nodes)
         centroid_lon = sum(n["lon"] for n in nodes) / len(nodes)
 
-        base_elevation = args.default_elevation
         if heightmap:
             sampled = heightmap.sample(centroid_lat, centroid_lon)
-            if sampled is not None:
-                base_elevation = sampled
+            if sampled is None:
+                # Building centroid is outside the DEM. Placing at default_elevation=0
+                # (sea level) would bury the building ~265 m underground. Skip it.
+                skipped += 1
+                continue
+            base_elevation = sampled
+        else:
+            base_elevation = args.default_elevation
 
         # Create mesh
         mesh = polygon_to_mesh(

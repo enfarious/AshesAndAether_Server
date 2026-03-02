@@ -1,9 +1,10 @@
 import { logger } from '@/utils/logger';
-import { ZoneService } from '@/database';
+import { ZoneService, MobService } from '@/database';
 import { COMMUNICATION_RANGES } from '@/network/protocol/types';
 import { PhysicsSystem } from '@/physics/PhysicsSystem';
 import { CollisionLayer } from '@/physics/types';
 import { AnimationLockSystem } from './AnimationLockSystem';
+import { BuildingCollisionLoader } from './BuildingCollisionLoader';
 import type {
   ProximityRosterMessage,
   ProximityChannel,
@@ -12,7 +13,7 @@ import type {
   ProximityEntity,
   ProximityEntityDelta
 } from '@/network/protocol/types';
-import type { Character, Zone } from '@prisma/client';
+import type { Character, Zone, Mob } from '@prisma/client';
 
 interface Vector3 {
   x: number;
@@ -26,6 +27,7 @@ interface Entity {
   id: string;
   name: string;
   type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife';
+  description?: string; // Displayed when a player examines this entity
   position: Vector3;
   socketId?: string; // For players only
   inCombat?: boolean;
@@ -35,6 +37,14 @@ interface Entity {
   freediveSkill?: number;
   freediveMaxDepth?: number;
   freediveMaxSeconds?: number;
+  // Mob-specific fields (used by client for display and color coding)
+  tag?: string;          // e.g. "mob.rat.1" — stable identifier for mob type
+  level?: number;
+  faction?: string;      // e.g. "hostile", "neutral" — drives client nameplate color
+  aiType?: string;       // e.g. "passive", "aggressive" — server-side AI behaviour
+  notorious?: boolean;   // Notorious Monster: client shows "??" for level + special marker
+  currentHealth?: number;
+  maxHealth?: number;
   // Wildlife-specific fields
   speciesId?: string;
   sprite?: string;
@@ -51,21 +61,74 @@ export interface WildlifeEntityData {
   heading?: number;
 }
 
+// ── Environment constants ──────────────────────────────────────────────────
+
+/** Real seconds for one full in-game day (24 game-hours = 24 real minutes). */
+const DAY_CYCLE_SECS = 1440;
+
+/** Time-of-day bucket thresholds (0–1 normalised, 0 = midnight). */
+const TOD_DAWN_START  = 0.167; // ~4 am
+const TOD_DAY_START   = 0.25;  // ~6 am
+const TOD_DUSK_START  = 0.75;  // ~6 pm
+const TOD_NIGHT_START = 0.833; // ~8 pm
+
+type Weather = 'clear' | 'cloudy' | 'fog' | 'mist' | 'rain' | 'storm';
+
+/** Allowed transitions from each weather state (weighted). */
+const WEATHER_TRANSITIONS: Record<Weather, Weather[]> = {
+  clear:  ['cloudy', 'cloudy', 'fog', 'mist'],
+  cloudy: ['clear', 'rain', 'rain', 'fog', 'storm'],
+  fog:    ['clear', 'mist', 'mist', 'cloudy'],
+  mist:   ['fog', 'clear', 'clear', 'cloudy'],
+  rain:   ['cloudy', 'cloudy', 'storm', 'clear'],
+  storm:  ['rain', 'rain', 'cloudy'],
+};
+
+/** Duration range [min, max] in real seconds before weather may change. */
+const WEATHER_DURATION: Record<Weather, [number, number]> = {
+  clear:  [300, 900],
+  cloudy: [180, 600],
+  fog:    [ 90, 360],
+  mist:   [ 90, 300],
+  rain:   [120, 480],
+  storm:  [ 60, 240],
+};
+
+function randomWeatherDuration(wx: Weather): number {
+  const [min, max] = WEATHER_DURATION[wx];
+  return min + Math.random() * (max - min);
+}
+
 /**
  * Manages a single zone - tracks entities, calculates proximity, broadcasts updates
  */
 export class ZoneManager {
   private zone: Zone;
   private entities: Map<string, Entity> = new Map();
+
+  // ── Environment ───────────────────────────────────────────────────────────
+  /** Normalised time-of-day: 0.0 = midnight, 0.25 = 6 am, 0.5 = noon, 0.75 = 6 pm. */
+  private timeOfDay: number = 0.33;  // start ~8 am
+  private weather: Weather = 'clear';
+  private weatherTimer: number = 0;
+  private nextWeatherChangeSecs: number = randomWeatherDuration('clear');
   private lastSpeaker: Map<string, { speaker: string; timestamp: number }> = new Map(); // entityId -> lastSpeaker info
   private physicsSystem: PhysicsSystem;
   private animationLockSystem: AnimationLockSystem;
   private underwaterSeconds: Map<string, { seconds: number; lastUpdate: number }> = new Map();
+  /** Vertical velocity (m/s) for entities currently in freefall. */
+  private fallingVelocity: Map<string, number> = new Map();
 
   constructor(zone: Zone) {
     this.zone = zone;
     this.physicsSystem = new PhysicsSystem();
     this.animationLockSystem = new AnimationLockSystem();
+
+    // Register building footprints as static collision geometry so players
+    // cannot walk through them.  Uses the OSM polygon data for this zone.
+    for (const building of BuildingCollisionLoader.load(zone.id)) {
+      this.physicsSystem.registerEntity(building);
+    }
   }
 
   getPhysicsSystem(): PhysicsSystem {
@@ -188,6 +251,75 @@ export class ZoneManager {
     return profile ?? 'terrestrial';
   }
 
+  // ── Environment API ───────────────────────────────────────────────────────
+
+  /**
+   * Advance the day/night cycle and weather system.
+   * Returns true when the environment string changed (TOD bucket or weather),
+   * signalling the caller to broadcast a zone update.
+   */
+  tickEnvironment(deltaTime: number): boolean {
+    // Time progression
+    const prevTodStr = this._todString();
+    this.timeOfDay += deltaTime / DAY_CYCLE_SECS;
+    if (this.timeOfDay >= 1.0) this.timeOfDay -= 1.0;
+    const newTodStr = this._todString();
+
+    // Weather progression
+    this.weatherTimer += deltaTime;
+    let weatherChanged = false;
+    if (this.weatherTimer >= this.nextWeatherChangeSecs) {
+      this.weatherTimer = 0;
+      const next = this._nextWeather();
+      if (next !== this.weather) {
+        this.weather = next;
+        weatherChanged = true;
+      }
+      this.nextWeatherChangeSecs = randomWeatherDuration(this.weather);
+    }
+
+    return newTodStr !== prevTodStr || weatherChanged;
+  }
+
+  /** Human-readable time-of-day bucket sent to clients. */
+  getTimeOfDayString(): string {
+    return this._todString();
+  }
+
+  /** Normalised 0–1 time-of-day value; clients use this to derive the clock display. */
+  getTimeOfDayNormalized(): number {
+    return this.timeOfDay;
+  }
+
+  /** Current weather identifier sent to clients. */
+  getWeather(): string {
+    return this.weather;
+  }
+
+  /**
+   * Zone-level lighting modifier.
+   * Outdoor zones are 'normal'; dungeons or special zones could override this
+   * via config in the future.  For now always returns 'normal'.
+   */
+  getLighting(): string {
+    return 'normal';
+  }
+
+  private _todString(): string {
+    const t = this.timeOfDay;
+    if (t >= TOD_DAY_START  && t < TOD_DUSK_START)  return 'day';
+    if (t >= TOD_DUSK_START && t < TOD_NIGHT_START) return 'dusk';
+    if (t >= TOD_DAWN_START && t < TOD_DAY_START)   return 'dawn';
+    return 'night';
+  }
+
+  private _nextWeather(): Weather {
+    const candidates = WEATHER_TRANSITIONS[this.weather];
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  }
+
+  // ── Entity management ─────────────────────────────────────────────────────
+
   /**
    * Initialize zone with entities from database
    */
@@ -199,15 +331,20 @@ export class ZoneManager {
 
     for (const companion of companions) {
       const isMob = companion.tag?.startsWith('mob.') === true;
+      const rawPosition = {
+        x: companion.positionX,
+        y: companion.positionY,
+        z: companion.positionZ,
+      };
+      // Apply gravity so mobs/NPCs with stale or placeholder Y values
+      // (e.g. y=0 from DB seeding) land on the actual terrain surface.
+      const position = this.physicsSystem.applyGravity(rawPosition);
       const entity = {
         id: companion.id,
         name: companion.name,
         type: isMob ? 'mob' : 'companion',
-        position: {
-          x: companion.positionX,
-          y: companion.positionY,
-          z: companion.positionZ,
-        },
+        description: companion.description ?? undefined,
+        position,
         inCombat: false,
         isMachine: true,
         isAlive: companion.isAlive ?? true,
@@ -226,6 +363,66 @@ export class ZoneManager {
       });
     }
 
+    // Load mobs in this zone
+    const mobs = await MobService.findAllInZone(this.zone.id);
+
+    for (const mob of mobs) {
+      const rawPosition = {
+        x: mob.positionX,
+        y: mob.positionY,
+        z: mob.positionZ,
+      };
+      const position = this.physicsSystem.applyGravity(rawPosition);
+      const entity: Entity = {
+        id: mob.id,
+        name: mob.name,
+        type: 'mob',
+        description: mob.description ?? undefined,
+        position,
+        inCombat: false,
+        isMachine: true,
+        isAlive: mob.isAlive ?? true,
+        movementProfile: 'terrestrial',
+        tag:           mob.tag           ?? undefined,
+        level:         mob.level         ?? undefined,
+        faction:       mob.faction       ?? undefined,
+        aiType:        mob.aiType        ?? undefined,
+        notorious:     mob.notorious     ?? false,
+        currentHealth: mob.currentHealth,
+        maxHealth:     mob.maxHealth,
+      };
+
+      this.entities.set(mob.id, entity);
+      this.physicsSystem.registerEntity({
+        id: mob.id,
+        position: entity.position,
+        boundingVolume: PhysicsSystem.createBoundingSphere(entity.position, 0.5),
+        type: 'dynamic',
+        collisionLayer: CollisionLayer.ENTITIES,
+      });
+    }
+
+    // Diagnostic: log each non-player entity's position vs terrain elevation
+    // so we can see immediately whether physics will tick or treat them as grounded.
+    for (const entity of this.entities.values()) {
+      if (entity.type === 'player') continue;
+      const terrain = this.physicsSystem.getTerrainCollision(entity.position);
+      logger.info(
+        {
+          zoneId: this.zone.id,
+          entityId: entity.id.slice(-8),
+          name: entity.name,
+          type: entity.type,
+          isAlive: entity.isAlive,
+          y: entity.position.y,
+          terrainElevation: terrain.elevation,
+          aboveGround: entity.position.y > terrain.elevation,
+          elevationServiceLoaded: this.physicsSystem.hasElevationService(),
+        },
+        '[Physics:init] Entity spawn position'
+      );
+    }
+
     logger.info(
       { zoneId: this.zone.id, entityCount: this.entities.size },
       'Zone initialized with entities'
@@ -236,15 +433,20 @@ export class ZoneManager {
    * Add a player to the zone
    */
   addPlayer(character: Character, socketId: string, isMachine: boolean = false): void {
+    // Snap to terrain on entry — DB-stored Y may be stale or placeholder.
+    const rawPosition = {
+      x: character.positionX,
+      y: character.positionY,
+      z: character.positionZ,
+    };
+    const position = this.physicsSystem.applyGravity(rawPosition);
+
     const entity: Entity = {
       id: character.id,
       name: character.name,
       type: 'player',
-      position: {
-        x: character.positionX,
-        y: character.positionY,
-        z: character.positionZ,
-      },
+      description: (character as any).description ?? undefined,
+      position,
       socketId,
       inCombat: false,
       isMachine,
@@ -354,6 +556,22 @@ export class ZoneManager {
     const entity = this.entities.get(entityId);
     if (entity) {
       entity.isAlive = isAlive;
+    }
+  }
+
+  /** Keep the in-memory entity health in sync so publishZoneEntities reflects current state. */
+  setEntityHealth(entityId: string, current: number, max: number): void {
+    const entity = this.entities.get(entityId);
+    if (!entity) return;
+    entity.currentHealth = current;
+    entity.maxHealth     = max;
+  }
+
+  teleportEntity(entityId: string, position: { x: number; y: number; z: number }): void {
+    const entity = this.entities.get(entityId);
+    if (entity) {
+      entity.position = position;
+      this.physicsSystem.updateEntity(entityId, position);
     }
   }
 
@@ -843,6 +1061,85 @@ export class ZoneManager {
   }
 
   /**
+   * Tick physics for all non-player entities with bPhysicsEnabled.
+   * Applies real gravity (velocity accumulation) rather than a flat snap.
+   * Entities already on the ground are skipped cheaply.
+   * Returns entities that moved so the caller can broadcast updates.
+   */
+  tickPhysics(deltaTime: number): Array<{ id: string; position: Vector3 }> {
+    const moved: Array<{ id: string; position: Vector3 }> = [];
+
+    for (const entity of this.entities.values()) {
+      if (entity.type === 'player') continue; // handled by MovementSystem
+      if (!entity.isAlive) continue;
+
+      // All living non-player entities have physics enabled by default.
+      // (When these migrate to the Living class, check entity.bPhysicsEnabled.)
+      const vy = this.fallingVelocity.get(entity.id) ?? 0;
+
+      // Already grounded and no vertical velocity — skip
+      if (vy === 0) {
+        const terrain = this.physicsSystem.getTerrainCollision(entity.position);
+        if (entity.position.y <= terrain.elevation) continue;
+        // Entity is above ground — start falling
+      }
+
+      const result = this.physicsSystem.tickPhysics(
+        entity.position,
+        { x: 0, y: vy, z: 0 },
+        deltaTime
+      );
+
+      entity.position = result.position;
+      this.physicsSystem.updateEntity(entity.id, result.position);
+
+      if (result.landed) {
+        this.fallingVelocity.delete(entity.id);
+      } else {
+        this.fallingVelocity.set(entity.id, result.velocity.y);
+      }
+
+      moved.push({ id: entity.id, position: result.position });
+    }
+
+    return moved;
+  }
+
+  /**
+   * Return a compact snapshot of all non-player entity positions + falling velocity
+   * for diagnostic logging. One entry per entity.
+   */
+  getPhysicsSample(): Array<{ id: string; name: string; type: string; y: number; vy: number; terrainY: number }> {
+    const result = [];
+    for (const entity of this.entities.values()) {
+      if (entity.type === 'player') continue;
+      if (!entity.isAlive) continue;
+      const terrain = this.physicsSystem.getTerrainCollision(entity.position);
+      result.push({
+        id: entity.id.slice(-8),          // last 8 chars enough to identify
+        name: entity.name,
+        type: entity.type,
+        y: Math.round(entity.position.y * 10) / 10,
+        vy: Math.round((this.fallingVelocity.get(entity.id) ?? 0) * 10) / 10,
+        terrainY: Math.round(terrain.elevation * 10) / 10,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Get all entities with their current (physics-corrected) positions.
+   */
+  getAllEntities(): Array<{
+    id: string; name: string; type: string; position: Vector3; isAlive: boolean;
+    description?: string; tag?: string; level?: number; faction?: string;
+    aiType?: string; notorious?: boolean; currentHealth?: number; maxHealth?: number;
+    speciesId?: string; sprite?: string; heading?: number;
+  }> {
+    return Array.from(this.entities.values());
+  }
+
+  /**
    * Get entity count
    */
   getEntityCount(): number {
@@ -866,11 +1163,14 @@ export class ZoneManager {
    * Add a wildlife entity to the zone
    */
   addWildlife(data: WildlifeEntityData): void {
+    // Snap to terrain on arrival — external sources (Rust sim, DB) may have y=0
+    const snappedPosition = this.physicsSystem.applyGravity(data.position);
+
     const entity: Entity = {
       id: data.id,
       name: data.name,
       type: 'wildlife',
-      position: data.position,
+      position: snappedPosition,
       isMachine: true,
       isAlive: true,
       speciesId: data.speciesId,
@@ -891,6 +1191,55 @@ export class ZoneManager {
   }
 
   /**
+   * Remove a mob entity from the zone (called on death before respawn timer).
+   */
+  removeMob(mobId: string): void {
+    const entity = this.entities.get(mobId);
+    if (entity && entity.type === 'mob') {
+      this.entities.delete(mobId);
+      this.physicsSystem.unregisterEntity(mobId);
+      logger.debug({ mobId, zoneId: this.zone.id }, 'Mob despawned');
+    }
+  }
+
+  /**
+   * Spawn (or re-spawn) a mob into the zone from its DB record.
+   * Mirrors the initialization path so position/physics are consistent.
+   */
+  spawnMob(mob: Mob): void {
+    const rawPosition = { x: mob.positionX, y: mob.positionY, z: mob.positionZ };
+    const position = this.physicsSystem.applyGravity(rawPosition);
+    const entity: Entity = {
+      id: mob.id,
+      name: mob.name,
+      type: 'mob',
+      description: mob.description ?? undefined,
+      position,
+      inCombat: false,
+      isMachine: true,
+      isAlive: true,
+      movementProfile: 'terrestrial',
+      tag:           mob.tag           ?? undefined,
+      level:         mob.level         ?? undefined,
+      faction:       mob.faction       ?? undefined,
+      aiType:        mob.aiType        ?? undefined,
+      notorious:     mob.notorious     ?? false,
+      currentHealth: mob.currentHealth,
+      maxHealth:     mob.maxHealth,
+    };
+
+    this.entities.set(mob.id, entity);
+    this.physicsSystem.registerEntity({
+      id: mob.id,
+      position,
+      boundingVolume: PhysicsSystem.createBoundingSphere(position, 0.5),
+      type: 'dynamic',
+      collisionLayer: CollisionLayer.ENTITIES,
+    });
+    logger.debug({ mobId: mob.id, name: mob.name, zoneId: this.zone.id }, 'Mob spawned');
+  }
+
+  /**
    * Remove a wildlife entity from the zone
    */
   removeWildlife(entityId: string): void {
@@ -908,13 +1257,38 @@ export class ZoneManager {
   updateWildlife(entityId: string, position: Vector3, heading: number, behavior?: string): void {
     const entity = this.entities.get(entityId);
     if (entity && entity.type === 'wildlife') {
-      entity.position = position;
+      entity.position = this.physicsSystem.applyGravity(position);
       entity.heading = heading;
       if (behavior !== undefined) {
         entity.behavior = behavior;
       }
       this.physicsSystem.updateEntity(entityId, position);
     }
+  }
+
+  /**
+   * Move a mob to a new XZ position, snapping Y to the terrain surface.
+   *
+   * Called by DistributedWorldManager after each MobWanderSystem tick.
+   * Returns the terrain-snapped position so the caller can broadcast it.
+   *
+   * NOTE: Unlike applyGravity() (which only snaps upward for player-authored
+   * positions), this method snaps the mob to the terrain in BOTH directions —
+   * the server is fully authoritative on mob Y, so we always want the mob to
+   * walk directly on the surface whether it's going uphill or downhill.
+   */
+  updateMobPosition(entityId: string, position: Vector3, heading: number): Vector3 {
+    const entity = this.entities.get(entityId);
+    if (!entity || entity.type !== 'mob') return position;
+
+    // Snap directly to terrain elevation (up or down) — bidirectional snap.
+    const terrain  = this.physicsSystem.getTerrainCollision(position);
+    const snapped  = { ...position, y: terrain.elevation };
+
+    entity.position    = snapped;
+    entity.heading     = heading;
+    this.physicsSystem.updateEntity(entityId, snapped);
+    return snapped;
   }
 
   /**

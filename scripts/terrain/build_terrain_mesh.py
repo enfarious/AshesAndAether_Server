@@ -93,6 +93,10 @@ def create_terrain_mesh(
 
             # Convert to local coordinates
             x, z = latlon_to_local(lat, lon, origin_lat, origin_lon)
+            # latlon_to_local returns Z+ = North, but the game uses Z+ = South.
+            # Negate Z so the terrain mesh is in the same coordinate system
+            # as buildings (which correct for this via their extrusion rotation).
+            z = -z
 
             # Elevation in feet (heightmap is in meters)
             y = grid[row, col] * METERS_TO_FEET
@@ -125,9 +129,10 @@ def create_terrain_mesh(
 
     # Create mesh
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-
-    # Generate vertex normals for smooth shading
-    mesh.fix_normals()
+    # Note: fix_normals() was previously used here to correct inverted winding.
+    # With the Z-negation above, face winding already produces upward normals
+    # so fix_normals() is no longer needed (and requires optional scipy dep).
+    # Vertex normals are computed automatically on export.
 
     return mesh
 

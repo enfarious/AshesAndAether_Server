@@ -47,16 +47,17 @@ export const rabbit: WildlifeSpecies = {
 
   // Habitat
   biomePreferences: [
-    { biome: 'grassland', comfort: 95 },
-    { biome: 'forest', comfort: 80 },
-    { biome: 'urban', comfort: 60 },      // Can adapt to gardens
-    { biome: 'mountain', comfort: 40 },
-    { biome: 'swamp', comfort: 30 },
-    { biome: 'desert', comfort: 15 },     // Would leave quickly
-    { biome: 'tundra', comfort: 20 },
-    { biome: 'coastal', comfort: 50 },
+    { biome: 'grassland', comfort: 95, spawnWeight: 10 },
+    { biome: 'forest',    comfort: 80, spawnWeight: 5  },
+    { biome: 'urban',     comfort: 60, spawnWeight: 3  }, // Can adapt to gardens
+    { biome: 'mountain',  comfort: 40, spawnWeight: 1  },
+    { biome: 'swamp',     comfort: 30, spawnWeight: 0  },
+    { biome: 'desert',    comfort: 15, spawnWeight: 0  }, // Would leave quickly
+    { biome: 'tundra',    comfort: 20, spawnWeight: 0  },
+    { biome: 'coastal',   comfort: 50, spawnWeight: 2  },
   ],
-  nocturnal: false,            // Crepuscular really (dawn/dusk)
+  nocturnal: false,
+  crepuscular: true,           // Dawn/dusk most active
   socialBehavior: 'herd',      // Loose groups
   packSize: { min: 3, max: 8 },
 

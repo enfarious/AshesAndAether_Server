@@ -197,6 +197,77 @@ export class ZoneRegistry {
   }
 
   /**
+   * Write authoritative entity positions for a zone to Redis.
+   * Called by the zone server after init and after physics moves entities.
+   */
+  async setZoneEntities(
+    zoneId: string,
+    entities: Array<{
+      id: string; name: string; type: string;
+      position: { x: number; y: number; z: number };
+      isAlive: boolean;
+      description?: string;
+      tag?: string; level?: number; faction?: string; aiType?: string;
+      notorious?: boolean;
+      health?: { current: number; max: number };
+    }>
+  ): Promise<void> {
+    const client = this.messageBus.getClient();
+    const key = `zone:entities:${zoneId}`;
+    await client.set(key, JSON.stringify(entities));
+  }
+
+  /**
+   * Read authoritative entity positions for a zone from Redis.
+   * Called by the gateway at world_entry time.
+   */
+  async getZoneEntities(
+    zoneId: string
+  ): Promise<Array<{
+    id: string; name: string; type: string;
+    position: { x: number; y: number; z: number };
+    isAlive: boolean;
+    description?: string;
+    tag?: string; level?: number; faction?: string; aiType?: string;
+    notorious?: boolean;
+    health?: { current: number; max: number };
+  }> | null> {
+    const client = this.messageBus.getClient();
+    const key = `zone:entities:${zoneId}`;
+    const data = await client.get(key);
+    if (!data) return null;
+    return JSON.parse(data);
+  }
+
+  // ── Zone environment (time / weather) ────────────────────────────────────
+
+  /**
+   * Write live zone environment (time of day, weather, lighting) to Redis.
+   * Called by the zone server whenever these values change.
+   */
+  async setZoneEnvironment(
+    zoneId: string,
+    env: { timeOfDay: string; timeOfDayValue: number; weather: string; lighting: string }
+  ): Promise<void> {
+    const client = this.messageBus.getClient();
+    await client.set(`zone:env:${zoneId}`, JSON.stringify(env));
+  }
+
+  /**
+   * Read live zone environment from Redis.
+   * Called by the gateway at world_entry time so the initial zone packet
+   * reflects the current server-side time and weather rather than hardcoded values.
+   */
+  async getZoneEnvironment(
+    zoneId: string
+  ): Promise<{ timeOfDay: string; timeOfDayValue: number; weather: string; lighting: string } | null> {
+    const client = this.messageBus.getClient();
+    const data = await client.get(`zone:env:${zoneId}`);
+    if (!data) return null;
+    return JSON.parse(data);
+  }
+
+  /**
    * Clean up this server's assignments on shutdown
    */
   async cleanup(): Promise<void> {

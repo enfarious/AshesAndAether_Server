@@ -20,14 +20,21 @@ export const talkCommand: CommandDefinition = {
       {
         type: 'string',
         required: true,
-        description: 'Target name or ID',
+        description: 'Target name',
       },
       {
         type: 'string',
         required: false,
-        description: 'Message to say',
+        description: 'Message to say (defaults to "Hello.")',
       },
     ],
+    named: {
+      id: {
+        type: 'string',
+        required: false,
+        description: 'Target entity ID (passed by 3D client for directed LLM lookup)',
+      },
+    },
   },
 
   handler: async (context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
@@ -38,6 +45,10 @@ export const talkCommand: CommandDefinition = {
         error: 'You must provide a target to talk to.',
       };
     }
+
+    // Named --id flag lets the 3D client pass the entity UUID without it
+    // appearing in the visible message text.
+    const npcId: string | undefined = args.namedArgs['id']?.trim() || undefined;
 
     const messageText = args.positionalArgs.slice(1).join(' ').trim() || 'Hello.';
     if (messageText.length > 500) {
@@ -63,6 +74,7 @@ export const talkCommand: CommandDefinition = {
             channel: 'say',
             range: 20,
             position: context.position,
+            npcId,   // undefined for freeform /talk; set when client provides --id
           },
         },
       ],

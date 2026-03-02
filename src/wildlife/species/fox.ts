@@ -47,14 +47,14 @@ export const fox: WildlifeSpecies = {
 
   // Habitat
   biomePreferences: [
-    { biome: 'forest', comfort: 95 },
-    { biome: 'grassland', comfort: 85 },
-    { biome: 'mountain', comfort: 60 },
-    { biome: 'tundra', comfort: 50 },      // Arctic foxes exist but this is red fox
-    { biome: 'urban', comfort: 55 },       // Adapts to suburbs
-    { biome: 'coastal', comfort: 45 },
-    { biome: 'swamp', comfort: 35 },
-    { biome: 'desert', comfort: 20 },
+    { biome: 'forest',    comfort: 95, spawnWeight: 8 },
+    { biome: 'grassland', comfort: 85, spawnWeight: 5 },
+    { biome: 'mountain',  comfort: 60, spawnWeight: 2 },
+    { biome: 'tundra',    comfort: 50, spawnWeight: 1 }, // Arctic foxes exist but this is red fox
+    { biome: 'urban',     comfort: 55, spawnWeight: 2 }, // Adapts to suburbs
+    { biome: 'coastal',   comfort: 45, spawnWeight: 1 },
+    { biome: 'swamp',     comfort: 35, spawnWeight: 0 },
+    { biome: 'desert',    comfort: 20, spawnWeight: 0 },
   ],
   nocturnal: true,             // More active at night
   socialBehavior: 'solitary',  // Mostly alone

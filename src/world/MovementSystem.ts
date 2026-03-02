@@ -20,6 +20,9 @@ import { NavmeshService } from './navmesh/NavmeshService';
 // Conversion: 1 foot = 0.3048 meters
 const FEET_TO_METERS = 0.3048;
 const MAX_TARGET_DISTANCE_METERS = 500;
+const PHYSICS_DEBUG = process.env.PHYSICS_DEBUG === 'true';
+/** Continuous-move heartbeat timeout — auto-stop if no update in this many ms. */
+const HEARTBEAT_TIMEOUT_MS = 300;
 
 export interface MovementState {
   characterId: string;
@@ -38,6 +41,19 @@ export interface MovementState {
   pathIndex?: number;           // current waypoint index
   pathTarget?: Vector3;         // final target for navmesh path
   startTime: number;
+  /**
+   * 'command' — movement started via the text-command pipeline; completion
+   *             events carry narrative feedback ("You arrive at your destination.").
+   * 'direct'  — movement started by a raw socket event (WASD, TargetWindow
+   *             Approach/Retreat); no narrative is sent on completion.
+   */
+  source: 'command' | 'direct';
+  /**
+   * Unix-ms of the last heartbeat for continuous movement.
+   * null for non-continuous (target/distance) movement.
+   * When set, movement auto-stops if no heartbeat arrives within HEARTBEAT_TIMEOUT_MS.
+   */
+  lastHeartbeat: number | null;
 }
 
 export interface MovementStartEvent {
@@ -50,6 +66,8 @@ export interface MovementStartEvent {
   target?: string;
   targetPosition?: { x: number; y?: number; z: number };
   targetRange: number;
+  /** See MovementState.source. Defaults to 'command'. */
+  source?: 'command' | 'direct';
 }
 
 export interface MovementStopEvent {
@@ -59,7 +77,12 @@ export interface MovementStopEvent {
 
 type MovementStopReason = 'command' | 'distance_reached' | 'target_reached' | 'target_lost' | 'boundary';
 
-export type MovementCompleteCallback = Function;
+export type MovementCompleteCallback = (
+  characterId: string,
+  reason: 'command' | 'distance_reached' | 'target_reached' | 'target_lost' | 'boundary',
+  finalPosition: Vector3,
+  source: 'command' | 'direct',
+) => void;
 
 export class MovementSystem {
   private activeMovements: Map<string, MovementState> = new Map();
@@ -94,7 +117,7 @@ export class MovementSystem {
    * Start movement for an entity
    */
   async startMovement(event: MovementStartEvent): Promise<boolean> {
-    const { characterId, zoneId, startPosition, heading, speed, distance, target, targetPosition, targetRange } = event;
+    const { characterId, zoneId, startPosition, heading, speed, distance, target, targetPosition, targetRange, source = 'command' } = event;
 
     // Check animation locks
     const zoneManager = this.zoneManagers.get(zoneId);
@@ -115,9 +138,13 @@ export class MovementSystem {
       }
     }
 
-    // Cancel any existing movement
+    // Cancel any existing movement silently — no narrative, no idle-animation
+    // transition, because we're immediately starting a new move.  This prevents
+    // "You stop moving." spam when WASD replaces a move every 80 ms.
     if (this.activeMovements.has(characterId)) {
-      this.stopMovement({ characterId, zoneId }, 'command');
+      const old = this.activeMovements.get(characterId)!;
+      this.activeMovements.delete(characterId);
+      this.persistPosition(characterId, old.currentPosition);
     }
 
     // Get character's base movement speed from stats
@@ -212,6 +239,8 @@ export class MovementSystem {
       pathIndex: pathWaypoints ? 0 : undefined,
       pathTarget,
       startTime: Date.now(),
+      source,
+      lastHeartbeat: null,
     };
 
     this.activeMovements.set(characterId, state);
@@ -266,7 +295,8 @@ export class MovementSystem {
       this.onMovementComplete(
         event.characterId,
         reason,
-        state.currentPosition
+        state.currentPosition,
+        state.source,
       );
     }
   }
@@ -286,10 +316,39 @@ export class MovementSystem {
   }
 
   /**
+   * Update the heading of an active continuous movement without restarting it.
+   * Returns true if the movement existed and was updated.
+   */
+  updateHeading(characterId: string, heading: number): boolean {
+    const state = this.activeMovements.get(characterId);
+    if (!state) return false;
+    state.heading = heading;
+    state.lastHeartbeat = Date.now();
+    return true;
+  }
+
+  /**
+   * Mark a continuous movement as still alive (client keepalive).
+   */
+  refreshHeartbeat(characterId: string): void {
+    const state = this.activeMovements.get(characterId);
+    if (state) state.lastHeartbeat = Date.now();
+  }
+
+  /**
    * Update all active movements - called each tick
    */
   update(deltaTime: number): Map<string, Vector3> {
     const positionUpdates = new Map<string, Vector3>();
+
+    // Check heartbeat timeouts before processing movement
+    const now = Date.now();
+    for (const [characterId, state] of this.activeMovements) {
+      if (state.lastHeartbeat !== null && now - state.lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+        this.stopMovement({ characterId, zoneId: state.zoneId }, 'command');
+        continue;
+      }
+    }
 
     for (const [characterId, state] of this.activeMovements) {
       const newPosition = this.updateMovement(state, deltaTime);
@@ -328,7 +387,7 @@ export class MovementSystem {
     // If following a navmesh path, advance waypoints
     if (state.path && state.pathIndex !== undefined) {
       const waypoint = state.path[state.pathIndex];
-      const distanceToWaypoint = this.calculateDistance(state.currentPosition, waypoint);
+      const distanceToWaypoint = this.calculatePlanarDistance(state.currentPosition, waypoint);
 
       if (distanceToWaypoint <= stoppingTolerance) {
         const nextIndex = state.pathIndex + 1;
@@ -345,18 +404,19 @@ export class MovementSystem {
       }
     }
 
-    // If targeting a fixed position, check arrival and update heading
+    // If targeting a fixed position, check arrival and update heading.
+    // Use XZ-only (planar) distance for arrival — Y is controlled by physics
+    // and will never exactly match the click-point elevation on sloped terrain.
     if (state.targetPosition) {
-      const distanceToTarget = this.calculateDistance(state.currentPosition, state.targetPosition);
+      const planarDist = this.calculatePlanarDistance(state.currentPosition, state.targetPosition);
 
-      // Arrived at target position (within speed-adjusted tolerance)
-      if (distanceToTarget <= stoppingTolerance) {
-        state.currentPosition = { ...state.targetPosition };
+      // Stop when within 1.5 m on the ground plane.  Larger than the physics
+      // snap delta so we never oscillate at the destination.
+      if (planarDist <= Math.max(1.5, distanceThisTick * 1.2)) {
         this.stopMovement({ characterId: state.characterId, zoneId: state.zoneId }, 'target_reached');
         return state.currentPosition;
       }
 
-      // Update heading toward target position
       state.heading = this.calculateHeadingToTarget(state.currentPosition, state.targetPosition);
     }
 
@@ -390,7 +450,7 @@ export class MovementSystem {
     // Calculate new position based on heading
     const headingRad = (state.heading * Math.PI) / 180;
 
-    // Heading: 0 = North (+Z), 90 = East (+X), 180 = South (-Z), 270 = West (-X)
+    // 0° = +Z, 90° = +X (matches calculateHeadingToTarget above)
     const dx = Math.sin(headingRad) * distanceThisTick;
     const dz = Math.cos(headingRad) * distanceThisTick;
 
@@ -431,21 +491,25 @@ export class MovementSystem {
         if (validation.adjustedPosition) {
           // Physics adjusted the position (e.g., terrain collision)
           finalPosition = validation.adjustedPosition;
-          logger.info({
-            characterId: state.characterId,
-            reason: validation.reason,
-            original: newPosition,
-            adjusted: finalPosition
-          }, 'Movement adjusted by physics');
-          console.log(`[PHYSICS] Movement adjusted: ${validation.reason}`, { original: newPosition.y, adjusted: finalPosition.y });
+          if (PHYSICS_DEBUG) {
+            logger.info({
+              characterId: state.characterId,
+              reason: validation.reason,
+              original: newPosition,
+              adjusted: finalPosition
+            }, 'Movement adjusted by physics');
+            console.log(`[PHYSICS] Movement adjusted: ${validation.reason}`, { original: newPosition.y, adjusted: finalPosition.y });
+          }
         } else {
           // Movement blocked by physics
-          logger.info({
-            characterId: state.characterId,
-            reason: validation.reason,
-            blockedPosition: newPosition
-          }, 'Movement blocked by physics');
-          console.log(`[PHYSICS] Movement blocked: ${validation.reason}`);
+          if (PHYSICS_DEBUG) {
+            logger.info({
+              characterId: state.characterId,
+              reason: validation.reason,
+              blockedPosition: newPosition
+            }, 'Movement blocked by physics');
+            console.log(`[PHYSICS] Movement blocked: ${validation.reason}`);
+          }
           return null; // Don't update position
         }
       }
@@ -497,18 +561,15 @@ export class MovementSystem {
     const dx = to.x - from.x;
     const dz = to.z - from.z;
 
-    // atan2 gives angle in radians, convert to degrees
-    // Adjust so 0 = North (+Z), 90 = East (+X)
+    // atan2(dx, dz): 0° when dz>0 (+Z), 90° when dx>0 (+X).
+    // This matches the movement application below: dz=+cos, dx=+sin.
     let heading = Math.atan2(dx, dz) * (180 / Math.PI);
-
-    // Normalize to 0-360
     if (heading < 0) heading += 360;
-
     return heading;
   }
 
   /**
-   * Calculate distance between two positions
+   * 3D distance between two positions
    */
   private calculateDistance(from: Vector3, to: Vector3): number {
     const dx = to.x - from.x;
@@ -518,11 +579,25 @@ export class MovementSystem {
   }
 
   /**
-   * Persist position to database (fire and forget)
+   * XZ-only (ground-plane) distance — ignores elevation.
+   * Used for arrival checks so that physics Y-snapping never causes
+   * the player to oscillate at the destination on sloped terrain.
+   */
+  private calculatePlanarDistance(from: Vector3, to: Vector3): number {
+    const dx = to.x - from.x;
+    const dz = to.z - from.z;
+    return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  /**
+   * Persist position to database (fire and forget).
+   * Always saves lastPosition so world_entry can restore the correct location.
    */
   private persistPosition(characterId: string, position: Vector3): void {
-    CharacterService.updatePosition(characterId, { x: position.x, y: position.y, z: position.z })
-      .catch(error => {
+    CharacterService.updatePosition(characterId, {
+      x: position.x, y: position.y, z: position.z,
+      saveLastPosition: true,
+    }).catch(error => {
         logger.error({ error, characterId, position }, 'Failed to persist position to database');
       });
   }

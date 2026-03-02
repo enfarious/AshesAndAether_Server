@@ -36,6 +36,8 @@ export class DamageCalculator {
       attackerPosition?: Vector3;
       defenderPosition?: Vector3;
       physicsSystem?: PhysicsSystem;
+      /** Entity IDs to exclude from the LoS raycast (attacker + defender). */
+      excludeEntityIds?: string[];
     }
   ): DamageResult {
     const damageType = ability.damage?.type || 'physical';
@@ -67,10 +69,13 @@ export class DamageCalculator {
 
     // Check line-of-sight if physics system is available and positions are provided
     if (options?.physicsSystem && options?.attackerPosition && options?.defenderPosition) {
+      // Offset to eye-height so floor-level entity positions don't clip terrain.
+      const eyeFrom = { ...options.attackerPosition, y: options.attackerPosition.y + 1.5 };
+      const eyeTo   = { ...options.defenderPosition, y: options.defenderPosition.y + 1.5 };
       const los = options.physicsSystem.checkLineOfSight(
-        options.attackerPosition,
-        options.defenderPosition,
-        [] // Could exclude attacker/defender IDs if available
+        eyeFrom,
+        eyeTo,
+        options.excludeEntityIds ?? []
       );
 
       if (!los.clear) {

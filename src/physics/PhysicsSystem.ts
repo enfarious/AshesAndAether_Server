@@ -5,6 +5,7 @@ import type {
   BoundingVolume,
   BoundingSphere,
   BoundingBox,
+  WallSegment,
   CollisionResult,
   RaycastResult,
   TerrainCollision,
@@ -37,6 +38,14 @@ export class PhysicsSystem {
     if (!this.waterService) {
       console.warn('PhysicsSystem: Water data not available, water checks simplified');
     }
+  }
+
+  /**
+   * Whether elevation data was successfully loaded.
+   * If false, getTerrainCollision always returns elevation=0 and physics won't work.
+   */
+  hasElevationService(): boolean {
+    return this.elevationService !== null;
   }
 
   /**
@@ -100,6 +109,16 @@ export class PhysicsSystem {
     // Box vs Box
     if ('min' in vol1 && 'min' in vol2) {
       return this.checkBoxBoxCollision(vol1, vol2);
+    }
+
+    // Sphere vs WallSegment
+    if ('center' in vol1 && 'ax' in vol2) {
+      return this.checkSphereWallCollision(vol1, vol2 as WallSegment);
+    }
+
+    // WallSegment vs Sphere
+    if ('ax' in vol1 && 'center' in vol2) {
+      return this.checkSphereWallCollision(vol2, vol1 as WallSegment);
     }
 
     return { collided: false };
@@ -214,6 +233,61 @@ export class PhysicsSystem {
   }
 
   /**
+   * Sphere vs infinite-height wall segment collision (2D XZ check).
+   *
+   * Finds the closest point on segment AB to the sphere centre projected into
+   * the XZ plane.  If that 2D distance is less than the sphere radius the
+   * player is inside (or touching) the wall, regardless of Y elevation —
+   * walls block at every height.
+   *
+   * This replaces AABB-per-edge for building walls and eliminates the phantom
+   * blocking that AABB corners produce on diagonal wall segments.
+   */
+  private checkSphereWallCollision(sphere: BoundingSphere, wall: WallSegment): CollisionResult {
+    const dx = wall.bx - wall.ax;
+    const dz = wall.bz - wall.az;
+    const lenSq = dx * dx + dz * dz;
+
+    if (lenSq === 0) return { collided: false }; // Degenerate zero-length segment
+
+    // Parameter t ∈ [0,1] of the closest point on segment to sphere centre (XZ)
+    const t = Math.max(0, Math.min(1,
+      ((sphere.center.x - wall.ax) * dx + (sphere.center.z - wall.az) * dz) / lenSq,
+    ));
+
+    // Closest point on segment
+    const closestX = wall.ax + t * dx;
+    const closestZ = wall.az + t * dz;
+
+    // 2D distance from sphere centre to closest wall point
+    const cx = sphere.center.x - closestX;
+    const cz = sphere.center.z - closestZ;
+    const dist2D = Math.sqrt(cx * cx + cz * cz);
+
+    if (dist2D <= sphere.radius) {
+      let nx: number, nz: number;
+      if (dist2D > 0) {
+        nx = cx / dist2D;
+        nz = cz / dist2D;
+      } else {
+        // Sphere centre is on the wall line — use wall perpendicular
+        const len = Math.sqrt(lenSq);
+        nx = -dz / len;
+        nz =  dx / len;
+      }
+
+      return {
+        collided: true,
+        point:    { x: closestX, y: sphere.center.y, z: closestZ },
+        normal:   { x: nx, y: 0, z: nz },
+        distance: sphere.radius - dist2D,
+      };
+    }
+
+    return { collided: false };
+  }
+
+  /**
    * Perform raycast against entities and terrain
    */
   raycast(
@@ -267,11 +341,60 @@ export class PhysicsSystem {
     volume: BoundingVolume,
     maxDistance: number
   ): RaycastResult {
+    if ('ax' in volume) {
+      return this.raycastWall(origin, direction, volume as WallSegment, maxDistance);
+    }
     if ('center' in volume) {
       return this.raycastSphere(origin, direction, volume, maxDistance);
-    } else {
-      return this.raycastBox(origin, direction, volume, maxDistance);
     }
+    return this.raycastBox(origin, direction, volume, maxDistance);
+  }
+
+  /**
+   * Ray vs infinite-height wall segment (2D XZ intersection).
+   *
+   * Projects both the ray and the wall into the XZ plane and solves for the
+   * parametric intersection.  Returns a hit when the ray crosses the segment
+   * within [0, maxDistance].
+   */
+  private raycastWall(
+    origin: Vector3,
+    direction: Vector3,
+    wall: WallSegment,
+    maxDistance: number,
+  ): RaycastResult {
+    const wdx = wall.bx - wall.ax;
+    const wdz = wall.bz - wall.az;
+
+    // 2D cross product of ray direction and wall direction
+    const denom = direction.x * wdz - direction.z * wdx;
+    if (Math.abs(denom) < 1e-10) return { hit: false }; // Ray parallel to wall
+
+    // t = how far along the ray the intersection occurs
+    const t = ((wall.ax - origin.x) * wdz - (wall.az - origin.z) * wdx) / denom;
+    // s = how far along the wall segment (0..1)
+    const s = ((wall.ax - origin.x) * direction.z - (wall.az - origin.z) * direction.x) / denom;
+
+    if (t < 0 || t > maxDistance || s < 0 || s > 1) return { hit: false };
+
+    const point: Vector3 = {
+      x: origin.x + direction.x * t,
+      y: origin.y + direction.y * t,
+      z: origin.z + direction.z * t,
+    };
+
+    // Wall normal perpendicular to wall in XZ, pointing toward ray origin
+    const wLen = Math.sqrt(wdx * wdx + wdz * wdz);
+    let nx = -wdz / wLen;
+    let nz =  wdx / wLen;
+    if (nx * direction.x + nz * direction.z > 0) { nx = -nx; nz = -nz; }
+
+    return {
+      hit: true,
+      point,
+      normal:   { x: nx, y: 0, z: nz },
+      distance: t,
+    };
   }
 
   /**
@@ -419,21 +542,21 @@ export class PhysicsSystem {
       };
     }
 
-    // Convert world coordinates to lat/lon
-    // World system: origin at terrain center, 1 unit = 1 meter
-    // X = east/west (longitude), Z = north/south (latitude), Y = elevation
+    // Convert world coordinates to lat/lon.
+    // World origin = zone centre (manifest origin lat/lon).
+    // X = East (+) / West (-)  →  longitude increases with X
+    // Z = South (+) / North (-) →  latitude DECREASES as Z increases
+    //   (screen-up = -Z = northward = higher latitude)
     const metadata = this.elevationService.getMetadata();
     const centerLat = metadata.center?.lat ?? metadata.originLat;
     const centerLon = metadata.center?.lon ?? metadata.originLon;
-    
-    // Convert meters to degrees
-    // 1 degree latitude ≈ 111,320 meters
-    // 1 degree longitude ≈ 111,320 * cos(lat) meters
-    const latOffset = position.z / 111320;
-    const lonOffset = position.x / (111320 * Math.cos((centerLat * Math.PI) / 180));
-    
-    const lat = centerLat + latOffset;
-    const lon = centerLon + lonOffset;
+
+    const metersPerDegreeLat = 111320;
+    const metersPerDegreeLon = 111320 * Math.cos((centerLat * Math.PI) / 180);
+
+    // Z increasing = moving south = latitude decreasing → subtract Z offset
+    const lat = centerLat - position.z / metersPerDegreeLat;
+    const lon = centerLon + position.x / metersPerDegreeLon;
 
     const elevation = this.elevationService.getElevationMeters(lat, lon) ?? 0;
     const isWater = this.waterService ? this.waterService.isWater(lat, lon) : elevation < 0;
@@ -537,6 +660,82 @@ export class PhysicsSystem {
   }
 
   /**
+   * Push a position out of any intersecting structure walls (2D XZ, infinite height).
+   *
+   * Iterates every registered WallSegment static entity and applies a separation
+   * impulse for each penetration.  Multiple passes converge quickly for typical
+   * building layouts.  Y is passed through unchanged.
+   *
+   * Used by the mob wander system so NPCs / mobs respect building walls the same
+   * way players do.
+   */
+  resolveAgainstStructures(position: Vector3, radius: number): Vector3 {
+    let rx = position.x;
+    let rz = position.z;
+
+    for (const entity of this.staticEntities.values()) {
+      const vol = entity.boundingVolume;
+      if (!('ax' in vol)) continue; // Only WallSegment entities
+
+      const wall = vol as WallSegment;
+      const dx   = wall.bx - wall.ax;
+      const dz   = wall.bz - wall.az;
+      const lenSq = dx * dx + dz * dz;
+      if (lenSq === 0) continue;
+
+      const t = Math.max(0, Math.min(1,
+        ((rx - wall.ax) * dx + (rz - wall.az) * dz) / lenSq,
+      ));
+
+      const closestX = wall.ax + t * dx;
+      const closestZ = wall.az + t * dz;
+
+      const cx     = rx - closestX;
+      const cz     = rz - closestZ;
+      const dist2D = Math.sqrt(cx * cx + cz * cz);
+
+      if (dist2D < radius) {
+        if (dist2D > 0) {
+          const penetration = radius - dist2D;
+          rx += (cx / dist2D) * penetration;
+          rz += (cz / dist2D) * penetration;
+        } else {
+          // Exactly on the wall line — push along wall perpendicular
+          const len = Math.sqrt(lenSq);
+          rx += (-dz / len) * radius;
+          rz += ( dx / len) * radius;
+        }
+      }
+    }
+
+    return { x: rx, y: position.y, z: rz };
+  }
+
+  /**
+   * Nudge an entity that is embedded in or pressed against building geometry to
+   * a nearby clear position so physics can resume normally.
+   *
+   * Strategy: run resolveAgainstStructures with progressively larger radii (2×,
+   * 3×, 4× the entity radius) to push the entity away from every nearby wall,
+   * then lift it 1 m above its current Y so gravity / terrain-snap can drop it
+   * cleanly to the ground surface.
+   *
+   * This is used by MobWanderSystem's stuckRequests handler and the /unstuck
+   * player command.
+   */
+  nudgeToUnstuck(position: Vector3, radius: number): Vector3 {
+    let pos: Vector3 = { ...position };
+    // Each pass uses a larger effective radius, pushing the entity progressively
+    // further from any wall it may be clipping through.
+    for (const r of [radius * 2, radius * 3, radius * 4]) {
+      pos = this.resolveAgainstStructures(pos, r);
+    }
+    // Lift 1 m so physics/terrain-snap drops the entity to the actual surface
+    // rather than leaving it floating at the pre-nudge elevation.
+    return { x: pos.x, y: pos.y + 1.0, z: pos.z };
+  }
+
+  /**
    * Check line of sight between two positions
    */
   checkLineOfSight(
@@ -578,6 +777,49 @@ export class PhysicsSystem {
   }
 
   /**
+   * Tick physics for a single entity that has bPhysicsEnabled=true.
+   *
+   * Applies real gravity:
+   *   - Accumulates downward velocity each tick (9.81 m/s²)
+   *   - Moves entity by velocity * deltaTime
+   *   - If the new position is at or below terrain, snaps to ground and
+   *     zeros vertical velocity (landed)
+   *
+   * Returns { position, velocity, landed } — caller stores them back.
+   */
+  tickPhysics(
+    position: Vector3,
+    velocity: Vector3,
+    deltaTime: number
+  ): { position: Vector3; velocity: Vector3; landed: boolean } {
+    const GRAVITY = -9.81; // m/s²
+    const terminalVelocity = -55; // m/s — roughly human terminal velocity
+
+    // Accumulate gravity
+    const newVy = Math.max(terminalVelocity, velocity.y + GRAVITY * deltaTime);
+    const newVelocity = { ...velocity, y: newVy };
+
+    // Integrate position
+    const newPosition: Vector3 = {
+      x: position.x + newVelocity.x * deltaTime,
+      y: position.y + newVelocity.y * deltaTime,
+      z: position.z + newVelocity.z * deltaTime,
+    };
+
+    // Floor check
+    const terrain = this.getTerrainCollision(newPosition);
+    if (newPosition.y <= terrain.elevation) {
+      return {
+        position: { ...newPosition, y: terrain.elevation },
+        velocity: { ...newVelocity, y: 0 },
+        landed: true,
+      };
+    }
+
+    return { position: newPosition, velocity: newVelocity, landed: false };
+  }
+
+  /**
    * Apply gravity to a position - pulls entities down to terrain level
    * Returns adjusted position (y may be lowered to terrain elevation)
    */
@@ -586,21 +828,12 @@ export class PhysicsSystem {
 
     const terrainCollision = this.getTerrainCollision(position);
 
-    // If below terrain, snap to ground
-    if (position.y < terrainCollision.elevation) {
-      return {
-        ...position,
-        y: terrainCollision.elevation,
-      };
-    }
-
-    // If above terrain, snap to ground (passive gravity)
-    // This handles entities spawned at height
-    if (position.y > terrainCollision.elevation + 0.5) {
-      return {
-        ...position,
-        y: terrainCollision.elevation,
-      };
+    // Bidirectional snap — keep entities on the terrain surface whether
+    // they're above (floating) or below (clipped).  The server is
+    // authoritative on Y; stale DB values and movement ticks both need
+    // to land cleanly on the heightmap.
+    if (position.y !== terrainCollision.elevation) {
+      return { ...position, y: terrainCollision.elevation };
     }
 
     return position;

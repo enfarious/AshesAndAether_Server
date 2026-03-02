@@ -72,6 +72,7 @@ export class CharacterService {
         level: 1,
         experience: 0,
         abilityPoints: 0,
+        statPoints: 0,
 
         // Core stats
         ...coreStats,
@@ -220,7 +221,12 @@ export class CharacterService {
   static async findEquippedHandItems(characterId: string): Promise<Array<{
     id: string;
     equipSlot: string | null;
-    template: { id: string; name: string; properties: unknown };
+    template: {
+      id: string;
+      name: string;
+      properties: unknown;
+      tags: Array<{ tag: { name: string } }>;
+    };
   }>> {
     return prisma.inventoryItem.findMany({
       where: {
@@ -236,6 +242,11 @@ export class CharacterService {
             id: true,
             name: true,
             properties: true,
+            tags: {
+              select: {
+                tag: { select: { name: true } },
+              },
+            },
           },
         },
       },
@@ -267,6 +278,49 @@ export class CharacterService {
         },
       },
     });
+  }
+
+  /**
+   * Award XP to a character, levelling up as needed.
+   *
+   * @param characterId  DB id of the character
+   * @param xpAmount     Raw XP to award (already scaled by the caller)
+   * @returns Updated totals + how many levels were gained
+   */
+  static async awardXp(
+    characterId: string,
+    xpAmount: number,
+  ): Promise<{
+    newExperience: number;
+    newLevel: number;
+    levelsGained: number;
+    abilityPoints: number;
+    statPoints: number;
+  }> {
+    const char = await prisma.character.findUnique({
+      where: { id: characterId },
+      select: { level: true, experience: true, abilityPoints: true, statPoints: true },
+    });
+    if (!char) throw new Error(`Character not found: ${characterId}`);
+
+    const MAX_LEVEL   = 30;
+    const XP_PER_LEVEL = 1000;
+
+    const prevLevel   = char.level;
+    const newExp      = char.experience + xpAmount;
+    // Level = floor(totalXP / 1000) + 1, but never exceed cap
+    const rawLevel    = Math.floor(newExp / XP_PER_LEVEL) + 1;
+    const newLevel    = Math.min(MAX_LEVEL, rawLevel);
+    const levelsGained = Math.max(0, newLevel - prevLevel);
+    const newAP       = char.abilityPoints + levelsGained;
+    const newSP       = (char.statPoints ?? 0) + levelsGained;
+
+    await prisma.character.update({
+      where: { id: characterId },
+      data: { experience: newExp, level: newLevel, abilityPoints: newAP, statPoints: newSP },
+    });
+
+    return { newExperience: newExp, newLevel, levelsGained, abilityPoints: newAP, statPoints: newSP };
   }
 
   /**

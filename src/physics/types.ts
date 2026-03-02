@@ -15,7 +15,21 @@ export interface BoundingBox {
   max: Vector3;
 }
 
-export type BoundingVolume = BoundingSphere | BoundingBox;
+/**
+ * Infinite-height wall segment used for building collision.
+ *
+ * Collision is a 2D sphere-vs-line-segment check in the XZ plane; the Y axis
+ * is ignored so the wall blocks at every elevation — no phantom AABB corners
+ * for diagonal walls.
+ */
+export interface WallSegment {
+  ax: number; // Start X
+  az: number; // Start Z
+  bx: number; // End X
+  bz: number; // End Z
+}
+
+export type BoundingVolume = BoundingSphere | BoundingBox | WallSegment;
 
 // Collision detection results
 export interface CollisionResult {

@@ -59,6 +59,7 @@ export class WildlifeManager {
   private getTimeOfDay?: () => number;
   private getWaterSources?: () => Array<{ id: string; position: Vector3 }>;
   private getPlants?: () => Array<{ id: string; position: Vector3; plantType: string }>;
+  private getTerrainY?: (x: number, z: number) => number | null;
 
   constructor(zoneId: string, zoneBiome: BiomeType) {
     this.zoneId = zoneId;
@@ -84,11 +85,13 @@ export class WildlifeManager {
     getTimeOfDay?: () => number;
     getWaterSources?: () => Array<{ id: string; position: Vector3 }>;
     getPlants?: () => Array<{ id: string; position: Vector3; plantType: string }>;
+    getTerrainY?: (x: number, z: number) => number | null;
   }): void {
     this.getPlayersInRange = providers.getPlayersInRange;
     this.getTimeOfDay = providers.getTimeOfDay;
     this.getWaterSources = providers.getWaterSources;
     this.getPlants = providers.getPlants;
+    this.getTerrainY = providers.getTerrainY;
   }
 
   // ========== Main Update Loop ==========
@@ -406,11 +409,13 @@ export class WildlifeManager {
       const dx = Math.sin(radians) * speed * (deltaTime / 1000);
       const dz = Math.cos(radians) * speed * (deltaTime / 1000);
 
+      const newX = entity.position.x + dx;
+      const newZ = entity.position.z + dz;
       entity.lastPosition = { ...entity.position };
       entity.position = {
-        x: entity.position.x + dx,
-        y: entity.position.y, // TODO: terrain height
-        z: entity.position.z + dz,
+        x: newX,
+        y: this.terrainY(newX, newZ, entity.position.y),
+        z: newZ,
       };
       entity.heading = heading;
 
@@ -479,10 +484,12 @@ export class WildlifeManager {
         z: (Math.random() - 0.5) * 4,
       };
 
+      const ox = parent.position.x + offset.x;
+      const oz = parent.position.z + offset.z;
       const offspring = this.spawnEntity(species.id, {
-        x: parent.position.x + offset.x,
-        y: parent.position.y,
-        z: parent.position.z + offset.z,
+        x: ox,
+        y: this.terrainY(ox, oz, parent.position.y),
+        z: oz,
       }, now);
 
       if (offspring) {
@@ -599,10 +606,12 @@ export class WildlifeManager {
     const attempts = 10;
 
     for (let i = 0; i < attempts; i++) {
+      const sx = (Math.random() - 0.5) * 200;
+      const sz = (Math.random() - 0.5) * 200;
       const position = {
-        x: (Math.random() - 0.5) * 200, // -100 to 100
-        y: 0,
-        z: (Math.random() - 0.5) * 200,
+        x: sx,
+        y: this.terrainY(sx, sz, 0),
+        z: sz,
       };
 
       // Check player distance
@@ -663,6 +672,11 @@ export class WildlifeManager {
       if (species) this.species.set(entity.speciesId, species);
     }
     return species;
+  }
+
+  /** Returns terrain elevation at (x, z), or the provided fallback if unavailable. */
+  private terrainY(x: number, z: number, fallback: number): number {
+    return this.getTerrainY?.(x, z) ?? fallback;
   }
 
   private calculateDistance(a: Vector3, b: Vector3): number {

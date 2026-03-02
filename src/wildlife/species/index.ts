@@ -8,6 +8,9 @@
 import type { WildlifeSpecies, WildlifeSpawnConfig } from '../types';
 import { rabbit, rabbitSpawnConfig } from './rabbit';
 import { fox, foxSpawnConfig } from './fox';
+import { deer, deerSpawnConfig } from './deer';
+import { wolf, wolfSpawnConfig } from './wolf';
+import { boar, boarSpawnConfig } from './boar';
 
 // Species registry - add new species here
 const SPECIES_REGISTRY: Map<string, WildlifeSpecies> = new Map();
@@ -21,7 +24,10 @@ function registerSpecies(species: WildlifeSpecies, spawnConfig: WildlifeSpawnCon
 
 // Initialize registry
 registerSpecies(rabbit, rabbitSpawnConfig);
-registerSpecies(fox, foxSpawnConfig);
+registerSpecies(fox,    foxSpawnConfig);
+registerSpecies(deer,   deerSpawnConfig);
+registerSpecies(wolf,   wolfSpawnConfig);
+registerSpecies(boar,   boarSpawnConfig);
 
 /**
  * Get a species definition by ID
@@ -68,3 +74,6 @@ export function getSpeciesForBiome(biome: string): WildlifeSpecies[] {
 // Re-export individual species for direct import
 export { rabbit, rabbitSpawnConfig } from './rabbit';
 export { fox, foxSpawnConfig } from './fox';
+export { deer, deerSpawnConfig } from './deer';
+export { wolf, wolfSpawnConfig } from './wolf';
+export { boar, boarSpawnConfig } from './boar';

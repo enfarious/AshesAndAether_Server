@@ -3,7 +3,6 @@ import bcrypt from 'bcryptjs';
 import { logger } from '@/utils/logger';
 import { AccountService, CharacterService, ZoneService } from '@/database';
 import { StatCalculator } from '@/game/stats/StatCalculator';
-import { PhysicsSystem } from '@/physics/PhysicsSystem';
 import { SpawnPointService } from '@/world/SpawnPointService';
 import { WorldManager } from '@/world/WorldManager';
 import {
@@ -112,15 +111,21 @@ export class ClientSession {
     // Chat
     this.socket.on('chat', (data: ChatMessage['payload']) => {
       if (!this.characterId) return;
-      logger.debug({ data }, `Chat message from ${this.socket.id}`);
-      // TODO: Handle chat
+      logger.info(
+        { channel: (data as any).channel, characterId: this.characterId },
+        '[ClientSession] chat received — STUB, not yet routed to WorldManager'
+      );
+      // TODO: Route to this.worldManager
     });
 
     // Combat actions
     this.socket.on('combat_action', (data: CombatActionMessage['payload']) => {
       if (!this.characterId) return;
-      logger.debug({ data }, `Combat action from ${this.socket.id}`);
-      // TODO: Handle combat action
+      logger.info(
+        { abilityId: (data as any).abilityId, targetId: (data as any).targetId, characterId: this.characterId },
+        '[ClientSession] combat_action received — STUB, not yet routed to WorldManager'
+      );
+      // TODO: Route to this.worldManager
     });
 
     // Interaction
@@ -482,46 +487,19 @@ export class ClientSession {
 
     const derivedStats = StatCalculator.calculateDerivedStats(coreStats, character.level);
 
-    // Get companions (NPCs) and mobs in the zone
-    const companions = await ZoneService.getCompanionsInZone(zone.id);
-    const mobs = await ZoneService.getMobsInZone(zone.id);
-
-    // Build entity list (NPCs and mobs)
-    const npcEntities = companions
-      .filter(companion => companion.isAlive ?? true)
-      .map(companion => ({
-      id: companion.id,
-      type: 'npc' as const,
-      name: companion.name,
-      position: { x: companion.positionX, y: companion.positionY, z: companion.positionZ },
-      description: companion.description || '',
-      isAlive: companion.isAlive ?? true,
-      interactive: true,
-    }));
-
-    // Apply gravity to mobs (pull floating entities to ground)
-    const physicsSystem = new PhysicsSystem();
-    const mobEntities = mobs
-      .filter(mob => mob.isAlive)
-      .map(mob => {
-        const mobPos = { x: mob.positionX, y: mob.positionY, z: mob.positionZ };
-        const adjustedPos = physicsSystem.applyGravity(mobPos);
-        
-        return {
-          id: mob.id,
-          type: 'mob' as const,
-          tag: mob.tag,
-          name: mob.name,
-          position: { x: adjustedPos.x, y: adjustedPos.y, z: adjustedPos.z },
-          description: mob.description || '',
-          isAlive: mob.isAlive,
-          level: mob.level,
-          faction: mob.faction,
-          interactive: true,
-        };
-      });
-
-    const entities = [...npcEntities, ...mobEntities];
+    // Pull entity positions from ZoneManager — gravity has already been applied
+    // during zone initialisation, so these are the authoritative grounded positions.
+    const zoneEntities = this.worldManager.getZoneEntities(zone.id);
+    const entities = zoneEntities
+      .filter(e => e.isAlive && e.type !== 'player')
+      .map(e => ({
+        id: e.id,
+        type: e.type as 'npc' | 'mob' | 'companion' | 'wildlife',
+        name: e.name,
+        position: e.position,
+        isAlive: e.isAlive,
+        interactive: true,
+      }));
 
     const worldEntry: WorldEntryMessage['payload'] = {
       characterId: character.id,
