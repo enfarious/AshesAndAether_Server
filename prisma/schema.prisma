@@ -67,6 +67,12 @@ model Character {
   updatedAt         DateTime @updatedAt
   lastSeenAt        DateTime @default(now())
 
+  // Village system — return point for exiting villages
+  returnZoneId    String?
+  returnPositionX Float?
+  returnPositionY Float?
+  returnPositionZ Float?
+
   // Corruption system
   corruption              Float     @default(0) // 0-100 scale
   lastCorruptionTickAt    DateTime  @default(now())
@@ -88,6 +94,9 @@ model Character {
   wallet          CharacterWallet?
   tradeReputation TradeReputation?
   marketOrders    MarketOrder[]
+
+  // Village system
+  village PlayerVillage?
 
   @@index([accountId])
   @@index([zoneId])
@@ -699,4 +708,87 @@ model TileBuildJob {
   @@index([status, priority])
   @@index([tileId])
   @@map("tile_build_jobs")
+}
+
+// ============================================================================
+// VILLAGE / PLOT SYSTEM
+// ============================================================================
+
+model PlotTemplate {
+  id            String   @id @default(uuid())
+  name          String   @unique
+  description   String?
+  terrainType   String   @default("village_meadow")
+  sizeX         Float    @default(64)
+  sizeY         Float    @default(20)
+  sizeZ         Float    @default(64)
+  gridSize      Float    @default(2.0)
+  maxStructures Int      @default(8)
+  buildMinX     Float    @default(-28)
+  buildMinZ     Float    @default(-28)
+  buildMaxX     Float    @default(28)
+  buildMaxZ     Float    @default(28)
+  assetManifestId String?
+  spawnX        Float    @default(0)
+  spawnY        Float    @default(0)
+  spawnZ        Float    @default(10)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  villages PlayerVillage[]
+
+  @@map("plot_templates")
+}
+
+model StructureCatalog {
+  id            String   @id @default(uuid())
+  name          String   @unique
+  displayName   String
+  description   String?
+  category      String   @default("utility")
+  sizeX         Float    @default(4)
+  sizeZ         Float    @default(4)
+  modelAsset    String
+  iconUrl       String?
+  goldCost      Int      @default(0)
+  maxPerVillage Int      @default(1)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  instances VillageStructure[]
+
+  @@map("structure_catalog")
+}
+
+model PlayerVillage {
+  id          String   @id @default(uuid())
+  characterId String   @unique
+  name        String   @default("My Village")
+  templateId  String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  character  Character          @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  template   PlotTemplate       @relation(fields: [templateId], references: [id])
+  structures VillageStructure[]
+
+  @@index([characterId])
+  @@map("player_villages")
+}
+
+model VillageStructure {
+  id        String   @id @default(uuid())
+  villageId String
+  catalogId String
+  positionX Float
+  positionY Float    @default(0)
+  positionZ Float
+  rotation  Float    @default(0)
+  createdAt DateTime @default(now())
+
+  village PlayerVillage    @relation(fields: [villageId], references: [id], onDelete: Cascade)
+  catalog StructureCatalog @relation(fields: [catalogId], references: [id])
+
+  @@index([villageId])
+  @@map("village_structures")
 }

@@ -401,6 +401,28 @@ export interface WorldEntryMessage {
     exits: Exit[];
     /** Static node definitions — sent once so the client can render the tree. */
     abilityManifest: AbilityNodeSummary[];
+    /** True for guest (ephemeral) sessions — client uses this to show /register prompt. */
+    isGuest?: boolean;
+  };
+}
+
+// ========== Guest Registration ==========
+
+export interface RegisterAccountMessage {
+  type: 'register_account';
+  payload: {
+    username: string;
+    email: string;
+    password: string;
+  };
+}
+
+export interface RegisterResultMessage {
+  type: 'register_result';
+  payload: {
+    success: boolean;
+    username?: string;
+    error?: string;
   };
 }
 

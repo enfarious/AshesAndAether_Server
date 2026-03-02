@@ -77,6 +77,9 @@ export interface CommandContext {
 
   // Communication
   socketId: string;
+
+  // Account flags
+  isGuest?: boolean;
 }
 
 // ========== Command Result ==========

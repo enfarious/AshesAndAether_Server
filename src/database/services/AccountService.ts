@@ -102,6 +102,34 @@ export class AccountService {
   }
 
   /**
+   * Check if email is available
+   */
+  static async isEmailAvailable(email: string): Promise<boolean> {
+    const existing = await prisma.account.findUnique({
+      where: { email },
+    });
+    return existing === null;
+  }
+
+  /**
+   * Convert a guest account to a fully registered account in-place.
+   * Preserves the account ID and all linked characters.
+   */
+  static async convertGuestToRegistered(
+    accountId: string,
+    username: string,
+    email: string,
+    password: string,
+  ): Promise<Account> {
+    const saltRounds = 12;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+    return prisma.account.update({
+      where: { id: accountId },
+      data: { username, email, passwordHash },
+    });
+  }
+
+  /**
    * Delete an account by ID
    * Characters, inventory, quest progress, faction reputation, and corruption events
    * are automatically cascade-deleted by the database.

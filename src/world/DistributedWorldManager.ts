@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService } from '@/database';
+import { AccountService, CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService } from '@/database';
 import { randomUUID } from 'crypto';
 import type { LootSessionStartPayload, LootItemResultPayload, LootSessionEndPayload, LootSessionItem } from '@/network/protocol/types';
 import { ZoneManager } from './ZoneManager';
@@ -44,6 +44,7 @@ import {
 } from '@/corruption';
 import { MarketBridge } from '@/market/MarketBridge';
 import { SpawnPointService } from '@/world/SpawnPointService';
+import { VillageService } from '@/village';
 
 const FEET_TO_METERS = 0.3048;
 const PHYSICS_DEBUG = process.env.PHYSICS_DEBUG === 'true';
@@ -127,6 +128,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
   // Market system
   private marketBridge: MarketBridge;
+
+  // ── Village instance system ──────────────────────────────────────────────
+  private villageInstances: Map<string, {
+    zoneManager: ZoneManager;
+    ownerCharacterId: string;
+    playerCount: number;
+    idleTimer: NodeJS.Timeout | null;
+  }> = new Map();
 
   // Command system
   private commandRegistry: CommandRegistry;
@@ -237,7 +246,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // If no zones assigned, load all zones (for single-server mode)
     if (this.assignedZoneIds.length === 0) {
       const allZones = await ZoneService.findAll();
-      this.assignedZoneIds = allZones.map(z => z.id);
+      // Filter out village zones — they are spun up on demand, not at startup
+      this.assignedZoneIds = allZones.filter(z => !VillageService.isVillageZone(z.id)).map(z => z.id);
       logger.info('No zone assignment specified - loading all zones (single-server mode)');
     }
 
@@ -476,11 +486,15 @@ export class DistributedWorldManager implements IWildlifeWorld {
       case MessageType.PLAYER_RESPAWN:
         void this.handlePlayerRespawn(message);
         break;
-      case MessageType.PLAYER_ACTION:
-        if ((message.payload as { action?: string }).action === 'loot_roll') {
+      case MessageType.PLAYER_ACTION: {
+        const actionPayload = message.payload as { action?: string };
+        if (actionPayload.action === 'loot_roll') {
           void this._handleLootRoll(message);
+        } else if (actionPayload.action === 'village_place') {
+          void this._handleVillagePlace(message);
         }
         break;
+      }
       default:
         logger.warn({ type: message.type }, 'Unhandled message type');
     }
@@ -535,6 +549,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Send current plant entities so the client can render flora
     await this._sendPlantsToPlayer(character.id, character.zoneId);
 
+    // Send structure entities for village zones (belt-and-suspenders — world_entry
+    // should already include them, but this guarantees they appear)
+    await this._sendStructuresToPlayer(character.id, character.zoneId);
+
+    // Send village_state event for VillagePanel UI
+    await this._sendVillageStateToPlayer(character.id, character.zoneId);
+
     // Correct the player's clock — world_entry may carry a stale timeOfDayValue from
     // ZoneRegistry (which only updates on bucket transitions, up to ~12 min intervals).
     // Sending the live value now overwrites it via applyZonePartial on the client.
@@ -544,6 +565,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // The world_entry Redis snapshot intentionally excludes players (they move too
     // frequently), so we need to send them explicitly via state_update.
     await this._exchangePlayerEntities(character, zoneManager);
+
+    // ── Village instance tracking ──
+    const villageInst = this.villageInstances.get(character.zoneId);
+    if (villageInst) {
+      if (villageInst.idleTimer) { clearTimeout(villageInst.idleTimer); villageInst.idleTimer = null; }
+      villageInst.playerCount++;
+    }
 
     logger.info({ characterId: character.id, zoneId: character.zoneId }, 'Player joined zone');
   }
@@ -600,7 +628,220 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Broadcast proximity updates
     await this.broadcastNearbyUpdate(zoneId);
 
+    // ── Village instance tracking: tear down when empty ──
+    const villageInstLeave = this.villageInstances.get(zoneId);
+    if (villageInstLeave) {
+      villageInstLeave.playerCount = Math.max(0, villageInstLeave.playerCount - 1);
+      if (villageInstLeave.playerCount === 0) {
+        villageInstLeave.idleTimer = setTimeout(() => {
+          void this.tearDownVillageInstance(zoneId);
+        }, 60_000);
+      }
+    }
+
     logger.info({ characterId, zoneId }, 'Player left zone');
+  }
+
+  // ── Village instance lifecycle ──────────────────────────────────────────
+
+  /**
+   * Spin up a village zone instance. Creates a lightweight ZoneManager with
+   * the plot template terrain and placed structures as entities.
+   */
+  private async spinUpVillageInstance(ownerCharacterId: string): Promise<string> {
+    const zoneId = VillageService.villageZoneId(ownerCharacterId);
+
+    // Already running?
+    if (this.villageInstances.has(zoneId)) {
+      const inst = this.villageInstances.get(zoneId)!;
+      if (inst.idleTimer) { clearTimeout(inst.idleTimer); inst.idleTimer = null; }
+      // Refresh Redis entity snapshot so the gateway's enterWorld() picks up structures
+      await this.publishZoneEntities(zoneId, inst.zoneManager);
+      return zoneId;
+    }
+
+    const village = await VillageService.getVillage(ownerCharacterId);
+    if (!village) throw new Error('Village not found');
+
+    // The Zone DB record was created by VillageService.createVillage()
+    const zone = await ZoneService.findById(zoneId);
+    if (!zone) throw new Error('Village zone record not found in DB');
+
+    const zoneManager = new ZoneManager(zone);
+    await zoneManager.initialize();
+
+    // Add placed structures as 'structure' entities
+    for (const struct of village.structures) {
+      zoneManager.addStructure({
+        id: struct.id,
+        name: struct.catalog.displayName,
+        description: struct.catalog.description ?? undefined,
+        position: { x: struct.positionX, y: struct.positionY, z: struct.positionZ },
+      });
+    }
+
+    // Subscribe to the village zone's input channel
+    const channel = `zone:${zoneId}:input`;
+    await this.messageBus.subscribe(channel, (message: MessageEnvelope) => this.handleZoneMessage(message));
+
+    // Register in zone maps
+    this.zones.set(zoneId, zoneManager);
+    this.movementSystem.registerZoneManager(zoneId, zoneManager);
+    this.villageInstances.set(zoneId, {
+      zoneManager,
+      ownerCharacterId,
+      playerCount: 0,
+      idleTimer: null,
+    });
+
+    // Register in ZoneRegistry so gateway can find it
+    await this.zoneRegistry.assignZone(zoneId, this.serverId);
+
+    // Publish entities to Redis for world_entry
+    await this.publishZoneEntities(zoneId, zoneManager);
+
+    // Write environment so gateway has env data
+    await this.zoneRegistry.setZoneEnvironment(zoneId, {
+      timeOfDay: zoneManager.getTimeOfDayString(),
+      timeOfDayValue: zoneManager.getTimeOfDayNormalized(),
+      weather: zoneManager.getWeather(),
+      lighting: zoneManager.getLighting(),
+    });
+
+    logger.info({ zoneId, owner: ownerCharacterId }, 'Village instance spun up');
+    return zoneId;
+  }
+
+  /**
+   * Tear down a village instance after idle timeout.
+   */
+  private async tearDownVillageInstance(zoneId: string): Promise<void> {
+    const inst = this.villageInstances.get(zoneId);
+    if (!inst) return;
+    if (inst.idleTimer) clearTimeout(inst.idleTimer);
+
+    // Don't tear down if players are still in it
+    if (inst.playerCount > 0) return;
+
+    // Unsubscribe from Redis channel
+    const channel = `zone:${zoneId}:input`;
+    await this.messageBus.unsubscribe(channel);
+
+    // Unregister from ZoneRegistry
+    await this.zoneRegistry.unassignZone(zoneId);
+
+    // Remove from local maps
+    this.zones.delete(zoneId);
+    this.movementSystem.unregisterZoneManager(zoneId);
+    this.villageInstances.delete(zoneId);
+
+    logger.info({ zoneId }, 'Village instance torn down');
+  }
+
+  /**
+   * Handle village_place action — player confirmed structure placement.
+   */
+  private async _handleVillagePlace(message: MessageEnvelope): Promise<void> {
+    const { characterId, catalogId, posX, posZ, rotation } = message.payload as {
+      characterId: string;
+      catalogId: string;
+      posX: number;
+      posZ: number;
+      rotation: number;
+      action: string;
+    };
+
+    const zoneId = this.characterToZone.get(characterId);
+    if (!zoneId || !VillageService.isVillageZone(zoneId)) return;
+
+    const ownerCharId = VillageService.extractOwnerCharacterId(zoneId);
+    if (ownerCharId !== characterId) {
+      logger.warn({ characterId, zoneId }, 'Non-owner attempted to place structure');
+      return;
+    }
+
+    const village = await VillageService.getVillage(characterId);
+    if (!village) return;
+
+    try {
+      const structure = await VillageService.placeStructure(village.id, catalogId, posX, posZ, rotation);
+
+      // Add entity to ZoneManager
+      const zm = this.zones.get(zoneId);
+      if (zm) {
+        zm.addStructure({
+          id: structure.id,
+          name: structure.catalog.displayName,
+          description: structure.catalog.description ?? undefined,
+          position: { x: structure.positionX, y: structure.positionY, z: structure.positionZ },
+        });
+        await this.publishZoneEntities(zoneId, zm);
+      }
+
+      // Broadcast new entity to all players in the village
+      const addedPayload = {
+        timestamp: Date.now(),
+        entities: {
+          added: [{
+            id: structure.id,
+            name: structure.catalog.displayName,
+            type: 'structure' as const,
+            position: { x: structure.positionX, y: structure.positionY, z: structure.positionZ },
+            isAlive: true,
+          }],
+        },
+      };
+
+      for (const [charId, charZoneId] of this.characterToZone.entries()) {
+        if (charZoneId !== zoneId) continue;
+        const sid = this._charToSocket.get(charId);
+        if (!sid) continue;
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId: sid,
+          payload: { socketId: sid, event: 'state_update', data: addedPayload },
+          timestamp: Date.now(),
+        });
+      }
+
+      // Send success message to placer
+      const sid = this._charToSocket.get(characterId);
+      if (sid) {
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId,
+          socketId: sid,
+          payload: {
+            socketId: sid,
+            event: 'chat_message',
+            data: {
+              channel: 'system',
+              message: `Placed ${structure.catalog.displayName}.`,
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    } catch (err: any) {
+      const sid = this._charToSocket.get(characterId);
+      if (sid) {
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId,
+          socketId: sid,
+          payload: {
+            socketId: sid,
+            event: 'chat_message',
+            data: {
+              channel: 'system',
+              message: `Failed to place structure: ${err.message}`,
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
   }
 
   /**
@@ -998,6 +1239,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
       return null;
     }
 
+    // Detect guest accounts (non-bcrypt hash with guest- prefix)
+    const account = await AccountService.findByIdWithCharacters(character.accountId);
+    const isGuest = account?.passwordHash.startsWith('guest-') ?? false;
+
     const context: CommandContext = {
       characterId,
       characterName: character.name,
@@ -1007,6 +1252,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       heading: character.heading,
       inCombat: entity.inCombat || false,
       socketId: entity.socketId,
+      isGuest,
     };
 
     const result = await this.commandExecutor.execute(command, context);
@@ -1454,6 +1700,173 @@ export class DistributedWorldManager implements IWildlifeWorld {
           }
           break;
         }
+
+        // ── Village system events ──────────────────────────────────────
+        case 'village_enter': {
+          const { targetCharacterId, targetPlayerName } = event.data as {
+            targetCharacterId: string | null;
+            targetPlayerName?: string;
+          };
+
+          let ownerCharId = targetCharacterId;
+
+          // Resolve player name → character ID for /village visit
+          if (!ownerCharId && targetPlayerName) {
+            const target = await CharacterService.findByName(targetPlayerName);
+            if (!target) {
+              overrideResponse = { success: false, error: `Player '${targetPlayerName}' not found.` };
+              break;
+            }
+            ownerCharId = target.id;
+          }
+
+          if (!ownerCharId) {
+            overrideResponse = { success: false, error: 'Invalid village target.' };
+            break;
+          }
+
+          // Verify village exists
+          const village = await VillageService.getVillage(ownerCharId);
+          if (!village) {
+            overrideResponse = { success: false, error: "That player doesn't have a village." };
+            break;
+          }
+
+          try {
+            // Save return point
+            await VillageService.saveReturnPoint(
+              context.characterId, context.zoneId,
+              context.position.x, context.position.y, context.position.z,
+            );
+
+            // Spin up village instance if needed
+            const villageZoneId = await this.spinUpVillageInstance(ownerCharId);
+
+            // Update character position to village spawn
+            const template = village.template;
+            await VillageService.updateCharacterZone(
+              context.characterId, villageZoneId,
+              template.spawnX, template.spawnY, template.spawnZ,
+            );
+
+            // Tell gateway to trigger zone transfer
+            await this.messageBus.publish('gateway:output', {
+              type: MessageType.CLIENT_MESSAGE,
+              characterId: context.characterId,
+              socketId: context.socketId,
+              payload: {
+                socketId: context.socketId,
+                event: 'zone_transfer',
+                data: { zoneId: villageZoneId },
+              },
+              timestamp: Date.now(),
+            });
+          } catch (err: any) {
+            overrideResponse = { success: false, error: err.message };
+          }
+          break;
+        }
+
+        case 'village_leave': {
+          const character = await CharacterService.findById(context.characterId);
+
+          // Determine destination: saved return point, or Stephentown as fallback
+          let destZoneId = character?.returnZoneId ?? null;
+          let destX = character?.returnPositionX ?? 0;
+          let destY = character?.returnPositionY ?? 0;
+          let destZ = character?.returnPositionZ ?? 0;
+
+          if (!destZoneId || VillageService.isVillageZone(destZoneId)) {
+            const fallbackZone = 'USA_NY_Stephentown';
+            const spawn = SpawnPointService.getStarterSpawn(fallbackZone);
+            destZoneId = fallbackZone;
+            destX = spawn?.position?.x ?? 0;
+            destY = spawn?.position?.y ?? 265;
+            destZ = spawn?.position?.z ?? 0;
+          }
+
+          await VillageService.updateCharacterZone(
+            context.characterId, destZoneId,
+            destX, destY, destZ,
+          );
+          await VillageService.clearReturnPoint(context.characterId);
+
+          await this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: context.characterId,
+            socketId: context.socketId,
+            payload: {
+              socketId: context.socketId,
+              event: 'zone_transfer',
+              data: { zoneId: destZoneId },
+            },
+            timestamp: Date.now(),
+          });
+          break;
+        }
+
+        case 'village_placement_mode': {
+          // Forward placement mode info to the client
+          await this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: context.characterId,
+            socketId: context.socketId,
+            payload: {
+              socketId: context.socketId,
+              event: 'village_placement_mode',
+              data: event.data,
+            },
+            timestamp: Date.now(),
+          });
+          break;
+        }
+
+        case 'village_remove': {
+          const { structureId } = event.data as { structureId: string };
+          const ownerCharIdRemove = VillageService.extractOwnerCharacterId(context.zoneId);
+          if (ownerCharIdRemove !== context.characterId) {
+            overrideResponse = { success: false, error: 'You can only remove structures in your own village.' };
+            break;
+          }
+
+          const villageForRemove = await VillageService.getVillage(context.characterId);
+          if (!villageForRemove) {
+            overrideResponse = { success: false, error: 'Village not found.' };
+            break;
+          }
+
+          try {
+            await VillageService.removeStructure(structureId, villageForRemove.id);
+
+            // Remove entity from ZoneManager
+            const zm = this.zones.get(context.zoneId);
+            if (zm) {
+              zm.removeStructure(structureId);
+              await this.publishZoneEntities(context.zoneId, zm);
+            }
+
+            // Broadcast entity removal to all players in the village
+            const rmPayload = { timestamp: Date.now(), entities: { removed: [structureId] } };
+            for (const [charId, charZoneId] of this.characterToZone.entries()) {
+              if (charZoneId !== context.zoneId) continue;
+              const sid = this._charToSocket.get(charId);
+              if (!sid) continue;
+              await this.messageBus.publish('gateway:output', {
+                type: MessageType.CLIENT_MESSAGE,
+                characterId: charId,
+                socketId: sid,
+                payload: { socketId: sid, event: 'state_update', data: rmPayload },
+                timestamp: Date.now(),
+              });
+            }
+
+            overrideResponse = { success: true, message: 'Structure removed.' };
+          } catch (err: any) {
+            overrideResponse = { success: false, error: err.message };
+          }
+          break;
+        }
+
         default:
           return {
             success: false,
@@ -3782,6 +4195,96 @@ export class DistributedWorldManager implements IWildlifeWorld {
         socketId,
         event: 'state_update',
         data: { timestamp: Date.now(), entities: { added } },
+      } as ClientMessagePayload,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Send structure entities to a newly-joined player in a village zone.
+   * Called from handlePlayerJoinZone. Ensures structures are visible even
+   * if the world_entry Redis snapshot missed them for any reason.
+   */
+  private async _sendStructuresToPlayer(characterId: string, zoneId: string): Promise<void> {
+    if (!VillageService.isVillageZone(zoneId)) return;
+
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+    const socketId = zm.getSocketIdForCharacter(characterId);
+    if (!socketId) return;
+
+    const structures = zm.getAllEntities().filter(e => e.type === 'structure');
+    if (structures.length === 0) return;
+
+    const added = structures.map(s => ({
+      id:          s.id,
+      type:        'structure',
+      name:        s.name,
+      position:    s.position,
+      description: s.description ?? '',
+      isAlive:     true,
+      interactive: false,
+    }));
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'state_update',
+        data: { timestamp: Date.now(), entities: { added } },
+      } as ClientMessagePayload,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Send village_state metadata to a newly-joined player for the VillagePanel UI.
+   * Called from handlePlayerJoinZone.
+   */
+  private async _sendVillageStateToPlayer(characterId: string, zoneId: string): Promise<void> {
+    if (!VillageService.isVillageZone(zoneId)) return;
+
+    const ownerCharId = VillageService.extractOwnerCharacterId(zoneId);
+    if (!ownerCharId) return;
+    const village = await VillageService.getVillage(ownerCharId);
+    if (!village) return;
+
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+    const socketId = zm.getSocketIdForCharacter(characterId);
+    if (!socketId) return;
+
+    const ownerChar = await CharacterService.findById(ownerCharId);
+
+    const payload = {
+      villageName:      village.name,
+      ownerCharacterId: ownerCharId,
+      ownerName:        ownerChar?.name ?? 'Unknown',
+      templateName:     village.template.name,
+      structures:       village.structures.map(s => ({
+        id:        s.id,
+        catalogId: s.catalogId,
+        name:      s.catalog.displayName,
+        position:  { x: s.positionX, y: s.positionY, z: s.positionZ },
+        rotation:  s.rotation,
+        sizeX:     s.catalog.sizeX,
+        sizeZ:     s.catalog.sizeZ,
+      })),
+      maxStructures: village.template.maxStructures,
+      gridSize:      village.template.gridSize,
+      isOwner:       characterId === ownerCharId,
+    };
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'village_state',
+        data: payload,
       } as ClientMessagePayload,
       timestamp: Date.now(),
     });

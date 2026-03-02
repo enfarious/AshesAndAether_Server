@@ -27,7 +27,17 @@ export class PhysicsSystem {
   private entities: Map<string, PhysicsEntity> = new Map();
   private staticEntities: Map<string, PhysicsEntity> = new Map();
 
-  constructor() {
+  /**
+   * @param flat  When true, skip elevation/water loading (e.g. village instances
+   *              that use a flat y=0 ground plane instead of real DEM terrain).
+   */
+  constructor(flat = false) {
+    if (flat) {
+      this.elevationService = null;
+      this.waterService = null;
+      return;
+    }
+
     // Try to load elevation data
     this.elevationService = ElevationService.tryLoad();
     if (!this.elevationService) {

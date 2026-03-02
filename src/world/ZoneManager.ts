@@ -26,7 +26,7 @@ type MovementProfile = 'terrestrial' | 'amphibious' | 'aquatic';
 interface Entity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife';
+  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' | 'structure';
   description?: string; // Displayed when a player examines this entity
   position: Vector3;
   socketId?: string; // For players only
@@ -121,7 +121,8 @@ export class ZoneManager {
 
   constructor(zone: Zone) {
     this.zone = zone;
-    this.physicsSystem = new PhysicsSystem();
+    const isVillage = zone.id.startsWith('village:');
+    this.physicsSystem = new PhysicsSystem(isVillage);
     this.animationLockSystem = new AnimationLockSystem();
 
     // Register building footprints as static collision geometry so players
@@ -1237,6 +1238,39 @@ export class ZoneManager {
       collisionLayer: CollisionLayer.ENTITIES,
     });
     logger.debug({ mobId: mob.id, name: mob.name, zoneId: this.zone.id }, 'Mob spawned');
+  }
+
+  // ── Structure entities (village system) ──────────────────────────────────
+
+  /** Add a structure entity (for village instances). */
+  addStructure(data: { id: string; name: string; description?: string; position: Vector3 }): void {
+    const position = this.physicsSystem.applyGravity(data.position);
+    const entity: Entity = {
+      id: data.id,
+      name: data.name,
+      type: 'structure',
+      description: data.description,
+      position,
+      isMachine: true,
+      isAlive: true,
+    };
+    this.entities.set(data.id, entity);
+    this.physicsSystem.registerEntity({
+      id: data.id,
+      position,
+      boundingVolume: PhysicsSystem.createBoundingSphere(position, 1.0),
+      type: 'static',
+      collisionLayer: CollisionLayer.ENTITIES,
+    });
+  }
+
+  /** Remove a structure entity. */
+  removeStructure(entityId: string): void {
+    const entity = this.entities.get(entityId);
+    if (entity && entity.type === 'structure') {
+      this.entities.delete(entityId);
+      this.physicsSystem.unregisterEntity(entityId);
+    }
   }
 
   /**

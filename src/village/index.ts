@@ -1,0 +1,1 @@
+export { VillageService } from './VillageService';

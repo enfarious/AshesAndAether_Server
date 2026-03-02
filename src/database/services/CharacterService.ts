@@ -153,6 +153,11 @@ export class CharacterService {
    * Delete a character by ID
    */
   static async deleteCharacter(characterId: string): Promise<void> {
+    // Cascade handles PlayerVillage + VillageStructure, but the Zone
+    // record created for the village instance needs explicit cleanup.
+    const villageZoneId = `village:${characterId}`;
+    await prisma.zone.deleteMany({ where: { id: villageZoneId } });
+
     await prisma.character.delete({
       where: { id: characterId },
     });

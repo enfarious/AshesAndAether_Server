@@ -1,6 +1,7 @@
 import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
 import { AccountService, CharacterService, CompanionService, ZoneService, InventoryService } from '@/database';
+import { VillageService } from '@/village';
 import { StatCalculator } from '@/game/stats/StatCalculator';
 import { SpawnPointService } from '@/world/SpawnPointService';
 import { MessageBus, MessageType, ZoneRegistry } from '@/messaging';
@@ -357,6 +358,49 @@ export class GatewayClientSession {
       await this.routeToZone('loot_roll', data);
     });
 
+    // ── Zone transfer (village system) ──────────────────────────────────────
+
+    this.socket.on('zone_transfer_ready', async () => {
+      if (!this.characterId || !this.currentZoneId) return;
+
+      // Leave old zone
+      const oldZoneId = this.currentZoneId;
+      const oldChannel = `zone:${oldZoneId}:input`;
+      await this.messageBus.publish(oldChannel, {
+        type: MessageType.PLAYER_LEAVE_ZONE,
+        zoneId: oldZoneId,
+        characterId: this.characterId,
+        socketId: this.socket.id,
+        payload: { characterId: this.characterId, zoneId: oldZoneId },
+        timestamp: Date.now(),
+      });
+      await this.zoneRegistry.removePlayer(this.characterId);
+      this.currentZoneId = null;
+
+      // Enter the new zone (reads updated zoneId from DB)
+      await this.enterWorld();
+    });
+
+    this.socket.on('village_place_confirm', async (data: { catalogId: string; posX: number; posZ: number; rotation: number }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const channel = `zone:${this.currentZoneId}:input`;
+      await this.messageBus.publish(channel, {
+        type: MessageType.PLAYER_ACTION,
+        zoneId: this.currentZoneId,
+        characterId: this.characterId,
+        socketId: this.socket.id,
+        payload: {
+          action: 'village_place',
+          characterId: this.characterId,
+          catalogId: data.catalogId,
+          posX: data.posX,
+          posZ: data.posZ,
+          rotation: data.rotation,
+        },
+        timestamp: Date.now(),
+      });
+    });
+
     // ── Ability tree ──────────────────────────────────────────────────────────
 
     this.socket.on('unlock_ability', async (data: unknown) => {
@@ -411,6 +455,16 @@ export class GatewayClientSession {
         success:              result.success,
         message:              result.message,
       });
+    });
+
+    // ── Guest registration ─────────────────────────────────────────────────────
+
+    this.socket.on('register_account', async (data: unknown) => {
+      if (!this.authenticated || !this.accountId) {
+        this.socket.emit('register_result', { success: false, error: 'Not authenticated' });
+        return;
+      }
+      await this.handleGuestRegistration(data as { username?: string; email?: string; password?: string });
     });
 
     // Ping/pong
@@ -746,6 +800,69 @@ export class GatewayClientSession {
     }
   }
 
+  private async handleGuestRegistration(data: { username?: string; email?: string; password?: string }): Promise<void> {
+    const fail = (error: string) => this.socket.emit('register_result', { success: false, error });
+
+    if (!this.isGuestSession) {
+      fail('You already have a registered account.');
+      return;
+    }
+
+    const { username = '', email = '', password = '' } = data;
+
+    // ── Validate username ───────────────────────────────────────────────────
+    if (!/^[A-Za-z0-9_-]{3,20}$/.test(username)) {
+      fail('Username must be 3–20 characters and contain only letters, numbers, underscores, or hyphens.');
+      return;
+    }
+
+    // ── Validate email ──────────────────────────────────────────────────────
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      fail('Please enter a valid email address.');
+      return;
+    }
+
+    // ── Validate password ───────────────────────────────────────────────────
+    if (password.length < 8) {
+      fail('Password must be at least 8 characters.');
+      return;
+    }
+
+    // ── Availability checks ─────────────────────────────────────────────────
+    const [usernameAvailable, emailAvailable] = await Promise.all([
+      AccountService.isUsernameAvailable(username),
+      AccountService.isEmailAvailable(email),
+    ]);
+
+    if (!usernameAvailable) {
+      fail('That username is already taken. Please choose another.');
+      return;
+    }
+    if (!emailAvailable) {
+      fail('An account with that email already exists.');
+      return;
+    }
+
+    // ── Convert the guest account ───────────────────────────────────────────
+    try {
+      await AccountService.convertGuestToRegistered(this.accountId!, username, email, password);
+
+      // Rename the guest character to match the new username
+      if (this.characterId) {
+        await CharacterService.updateCharacter(this.characterId, { name: username });
+      }
+
+      this.isGuestSession = false;
+      this.maxCharacters = 5;
+
+      logger.info(`Guest account converted to registered: ${username} (${this.accountId})`);
+      this.socket.emit('register_result', { success: true, username });
+    } catch (error) {
+      logger.error({ error }, `Guest registration failed for ${this.socket.id}`);
+      fail('Registration failed. Please try again.');
+    }
+  }
+
   private async completeCredentialAuth(account: import('@prisma/client').Account): Promise<void> {
     this.authenticated = true;
     this.accountId = account.id;
@@ -1067,6 +1184,40 @@ export class GatewayClientSession {
 
     logger.info(`Character ${this.characterId} entering world`);
 
+    // If the character is stuck in a village zone whose ephemeral instance is
+    // gone (e.g. server restart), restore them to their saved return point.
+    // Skip this if the village instance is still live (active zone transfer).
+    const preCheck = await CharacterService.findById(this.characterId);
+    if (preCheck && preCheck.zoneId.startsWith('village:')) {
+      const villageLive = await this.zoneRegistry.getZoneAssignment(preCheck.zoneId);
+      const serverAlive = villageLive
+        ? await this.zoneRegistry.isServerAlive(villageLive.serverId)
+        : false;
+      if (!villageLive || !serverAlive) {
+        // Clean up stale zone assignment left over from a previous server run
+        if (villageLive && !serverAlive) {
+          await this.zoneRegistry.unassignZone(preCheck.zoneId);
+        }
+        if (preCheck.returnZoneId) {
+          logger.info({ characterId: this.characterId, from: preCheck.zoneId, to: preCheck.returnZoneId },
+            'Restoring character from stale village zone to return point');
+          await VillageService.updateCharacterZone(
+            this.characterId, preCheck.returnZoneId,
+            preCheck.returnPositionX ?? 0, preCheck.returnPositionY ?? 0, preCheck.returnPositionZ ?? 0,
+          );
+          await VillageService.clearReturnPoint(this.characterId);
+        } else {
+          // No return point — fall back to the starter zone spawn
+          const starterZoneId = 'USA_NY_Stephentown';
+          const spawn = SpawnPointService.getStarterSpawn(starterZoneId);
+          logger.warn({ characterId: this.characterId }, 'No return point, resetting to starter zone');
+          await VillageService.updateCharacterZone(
+            this.characterId, starterZoneId, spawn.x, spawn.y, spawn.z,
+          );
+        }
+      }
+    }
+
     const character = await CharacterService.findByIdWithZone(this.characterId);
 
     if (!character) {
@@ -1095,11 +1246,11 @@ export class GatewayClientSession {
     if (liveEntities) {
       entities = liveEntities.filter(e => e.isAlive).map(e => ({
         id: e.id,
-        type: e.type as 'npc' | 'mob' | 'wildlife',
+        type: e.type,
         name: e.name,
         position: e.position,
         isAlive: e.isAlive,
-        interactive: e.type !== 'wildlife',
+        interactive: e.type !== 'wildlife' && e.type !== 'structure',
         description: e.description || '',
         ...(e.tag       !== undefined && { tag:       e.tag }),
         ...(e.level     !== undefined && { level:     e.level }),
@@ -1128,6 +1279,19 @@ export class GatewayClientSession {
         })),
       ];
     }
+
+    // Include the player's own entity so the client creates the PlayerEntity
+    // immediately rather than waiting for the first position broadcast.
+    entities.push({
+      id: character.id,
+      type: 'player',
+      name: character.name,
+      position: { x: character.positionX, y: character.positionY, z: character.positionZ },
+      isAlive: character.isAlive ?? true,
+      interactive: false,
+      description: '',
+      heading: character.heading,
+    });
 
     // Fetch live environment (time of day + weather) published by the zone server.
     // Falls back to sensible defaults if the zone server hasn't written to Redis yet.
@@ -1173,6 +1337,7 @@ export class GatewayClientSession {
       },
       entities,
       exits: [],
+      isGuest: this.isGuestSession,
       // Static node definitions — lets the client render the full ability tree.
       abilityManifest: [...ACTIVE_WEB, ...PASSIVE_WEB].map(node => ({
         id:               node.id,
