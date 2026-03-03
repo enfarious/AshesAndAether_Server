@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { AccountService, CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService } from '@/database';
+import { AccountService, CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService, prisma } from '@/database';
 import { randomUUID } from 'crypto';
 import type { LootSessionStartPayload, LootItemResultPayload, LootSessionEndPayload, LootSessionItem } from '@/network/protocol/types';
 import { ZoneManager } from './ZoneManager';
@@ -776,6 +776,35 @@ export class DistributedWorldManager implements IWildlifeWorld {
           position: { x: structure.positionX, y: structure.positionY, z: structure.positionZ },
         });
         await this.publishZoneEntities(zoneId, zm);
+      }
+
+      // If this is a market_stall, create the MarketStall DB record
+      if (structure.catalog.name === 'market_stall') {
+        try {
+          // Find the region via the character's return zone (their overworld location)
+          const character = await prisma.character.findUnique({
+            where: { id: characterId },
+            select: { name: true, returnZoneId: true },
+          });
+          const returnZoneId = character?.returnZoneId;
+          const region = returnZoneId
+            ? await prisma.region.findFirst({ where: { zoneIds: { has: returnZoneId } } })
+            : await prisma.region.findFirst(); // fallback to any region
+
+          if (region) {
+            await VillageService.createMarketStall(
+              structure.id,
+              characterId,
+              region.id,
+              zoneId!,
+              { x: structure.positionX, y: structure.positionY, z: structure.positionZ },
+              character?.name,
+            );
+            logger.info({ characterId, stallRegion: region.name }, 'Market stall DB record created');
+          }
+        } catch (stallErr) {
+          logger.error({ error: stallErr }, 'Failed to create market stall record (structure placed OK)');
+        }
       }
 
       // Broadcast new entity to all players in the village
@@ -2806,19 +2835,39 @@ export class DistributedWorldManager implements IWildlifeWorld {
       ? `${header}\n${description}`
       : header;
 
+    // Build a rich peek payload with everything the client can display.
+    const peek: Record<string, unknown> = {
+      id:          entity.id,
+      name:        entity.name,
+      entityType:  entity.type,
+      isAlive:     entity.isAlive,
+      inCombat:    entity.inCombat ?? false,
+      range,
+      description: description ?? null,
+    };
+
+    // Level — mobs/players/companions
+    if (entity.level != null) {
+      peek.level = entity.level;
+    }
+
+    // Health — percentage only (don't expose exact numbers to other players)
+    if (entity.currentHealth != null && entity.maxHealth != null && entity.maxHealth > 0) {
+      peek.healthPct = Math.round((entity.currentHealth / entity.maxHealth) * 100);
+    }
+
+    // Mob / wildlife specifics
+    if (entity.type === 'mob' || entity.type === 'wildlife') {
+      if (entity.faction)   peek.faction   = entity.faction;
+      if (entity.notorious) peek.notorious = true;
+      if (entity.tag)       peek.tag       = entity.tag;
+    }
+
     return {
       message,
       data: {
         type: 'look',
-        target: {
-          id: entity.id,
-          name: entity.name,
-          entityType: entity.type,
-          isAlive: entity.isAlive,
-          inCombat: entity.inCombat ?? false,
-          range,
-          description: description ?? null,
-        },
+        target: peek,
       },
     };
   }

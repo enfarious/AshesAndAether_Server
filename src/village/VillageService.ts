@@ -1,4 +1,5 @@
 import { prisma } from '@/database';
+import type { MarketStall } from '@prisma/client';
 
 export class VillageService {
   // ── Village CRUD ──────────────────────────────────────────────────
@@ -118,8 +119,9 @@ export class VillageService {
     });
   }
 
-  /** Remove a structure by ID. */
+  /** Remove a structure by ID. Also cleans up any linked MarketStall. */
   static async removeStructure(structureId: string, villageId: string) {
+    await VillageService.removeMarketStall(structureId);
     return prisma.villageStructure.delete({
       where: { id: structureId, villageId },
     });
@@ -164,6 +166,99 @@ export class VillageService {
       where: { id: characterId },
       data: { zoneId, positionX: x, positionY: y, positionZ: z, lastSeenAt: new Date() },
     });
+  }
+
+  // ── Market stall helpers ─────────────────────────────────────────
+
+  /** Create a MarketStall record and link it to the VillageStructure. */
+  static async createMarketStall(
+    structureId: string,
+    ownerId: string,
+    regionId: string,
+    zoneId: string,
+    position: { x: number; y: number; z: number },
+    ownerName?: string,
+  ) {
+    const stall = await prisma.marketStall.create({
+      data: {
+        ownerId,
+        regionId,
+        name: ownerName ? `${ownerName}'s Market Stall` : 'Market Stall',
+        stallType: 'GENERAL',
+        zoneId,
+        positionX: position.x,
+        positionY: position.y,
+        positionZ: position.z,
+        isActive: true,
+      },
+    });
+
+    await prisma.villageStructure.update({
+      where: { id: structureId },
+      data: { marketStallId: stall.id },
+    });
+
+    return stall;
+  }
+
+  /** Remove a MarketStall linked to a VillageStructure. Detaches orders from the stall. */
+  static async removeMarketStall(structureId: string) {
+    const structure = await prisma.villageStructure.findUnique({
+      where: { id: structureId },
+      select: { marketStallId: true },
+    });
+
+    if (!structure?.marketStallId) return;
+
+    // Detach any active orders from this stall (they remain active, just stall-less)
+    await prisma.marketOrder.updateMany({
+      where: { stallId: structure.marketStallId, status: { in: ['ACTIVE', 'PENDING_DELIVERY'] } },
+      data: { stallId: null },
+    });
+
+    await prisma.marketStall.delete({
+      where: { id: structure.marketStallId },
+    });
+  }
+
+  /** Remove all MarketStalls for a village (for village deletion). */
+  static async removeAllMarketStalls(villageId: string) {
+    const structures = await prisma.villageStructure.findMany({
+      where: { villageId, marketStallId: { not: null } },
+      select: { id: true },
+    });
+
+    for (const structure of structures) {
+      await VillageService.removeMarketStall(structure.id);
+    }
+  }
+
+  /** Find the nearest active MarketStall within range of a position in a given zone. */
+  static async findNearbyStall(
+    zoneId: string,
+    position: { x: number; y: number; z: number },
+    maxDistance: number = 20,
+  ): Promise<MarketStall | null> {
+    const stalls = await prisma.marketStall.findMany({
+      where: { zoneId, isActive: true },
+    });
+
+    let nearest: MarketStall | null = null;
+    let nearestDist = maxDistance;
+
+    for (const stall of stalls) {
+      if (stall.positionX == null || stall.positionY == null || stall.positionZ == null) continue;
+      const dx = position.x - stall.positionX;
+      const dy = position.y - stall.positionY;
+      const dz = position.z - stall.positionZ;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist <= nearestDist) {
+        nearest = stall;
+        nearestDist = dist;
+      }
+    }
+
+    return nearest;
   }
 
   // ── Utility ───────────────────────────────────────────────────────

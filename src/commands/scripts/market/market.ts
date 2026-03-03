@@ -4,14 +4,18 @@
 
 import { prisma } from '@/database';
 import { WalletService } from '@/database/services/WalletService';
+import { VillageService } from '@/village';
+import type { MarketStall } from '@prisma/client';
 import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } from '@/commands/types';
+
+const MARKET_STALL_RANGE = 20; // meters
 
 export const marketCommand: CommandDefinition = {
   name: 'market',
   aliases: ['m', 'auction', 'trade'],
   description: 'Manage market orders and trading',
   category: 'world',
-  usage: '/market <list|buy|cancel|search|myorders|wallet> [args]',
+  usage: '/market <list|buy|cancel|search|stall|myorders|wallet> [args]',
   examples: [
     '/market list "Iron Sword" 100',
     '/market list "Iron Sword" 100 world',
@@ -19,6 +23,7 @@ export const marketCommand: CommandDefinition = {
     '/market cancel abc123',
     '/market search sword',
     '/market search iron regional',
+    '/market stall',
     '/market myorders',
     '/market wallet',
   ],
@@ -33,10 +38,36 @@ export const marketCommand: CommandDefinition = {
     const action = (args.positionalArgs[0] || '').toLowerCase();
     const restArgs = args.positionalArgs.slice(1);
 
+    // Wallet, orders, and help don't require stall proximity
+    switch (action) {
+      case 'wallet':
+      case 'gold':
+      case 'balance':
+        return handleWallet(context);
+
+      case 'myorders':
+      case 'orders':
+        return handleMyOrders(context);
+    }
+
+    // All trade actions require proximity to a market stall
+    const nearbyStall = await VillageService.findNearbyStall(
+      context.zoneId,
+      context.position,
+      MARKET_STALL_RANGE,
+    );
+
+    if (!nearbyStall) {
+      return {
+        success: false,
+        error: 'You must be near a market stall to trade. Find one in a town or place one in your village.',
+      };
+    }
+
     switch (action) {
       case 'list':
       case 'sell':
-        return handleList(context, restArgs);
+        return handleList(context, restArgs, nearbyStall);
 
       case 'buy':
       case 'purchase':
@@ -47,16 +78,10 @@ export const marketCommand: CommandDefinition = {
 
       case 'search':
       case 'find':
-        return handleSearch(context, restArgs);
+        return handleSearch(context, restArgs, nearbyStall);
 
-      case 'myorders':
-      case 'orders':
-        return handleMyOrders(context);
-
-      case 'wallet':
-      case 'gold':
-      case 'balance':
-        return handleWallet(context);
+      case 'stall':
+        return handleStall(nearbyStall);
 
       case 'help':
       default:
@@ -67,6 +92,7 @@ export const marketCommand: CommandDefinition = {
   /market buy <order_id> [quantity] - Buy from a listing
   /market cancel <order_id> - Cancel your listing
   /market search <item_name> [regional|world] - Search listings
+  /market stall - View nearby market stall info
   /market myorders - View your active orders
   /market wallet - Check your gold balance`,
         };
@@ -77,7 +103,7 @@ export const marketCommand: CommandDefinition = {
 /**
  * Handle /market list - List an item for sale
  */
-async function handleList(context: CommandContext, args: string[]): Promise<CommandResult> {
+async function handleList(context: CommandContext, args: string[], nearbyStall: MarketStall): Promise<CommandResult> {
   // Parse: itemName price [scope]
   // Item name may be quoted
   const parsed = parseListArgs(args);
@@ -111,20 +137,15 @@ async function handleList(context: CommandContext, args: string[]): Promise<Comm
     };
   }
 
-  // Get the character's current region
-  const zone = await prisma.zone.findUnique({
-    where: { id: context.zoneId },
-  });
-
-  // Find the region for this zone
-  const region = await prisma.region.findFirst({
-    where: { zoneIds: { has: context.zoneId } },
+  // Use the nearby stall's region for the order
+  const region = await prisma.region.findUnique({
+    where: { id: nearbyStall.regionId },
   });
 
   if (!region) {
     return {
       success: false,
-      error: 'No trading region found for your current location.',
+      error: 'No trading region found for this market stall.',
     };
   }
 
@@ -191,6 +212,7 @@ async function handleList(context: CommandContext, args: string[]): Promise<Comm
   return {
     success: true,
     message: `Listing ${item.template.name} for ${price} gold (${scope.toLowerCase()}, ${listingFee}g fee)...`,
+    data: { type: 'market_list', success: true },
     events: [
       {
         type: 'market_order_create',
@@ -203,6 +225,7 @@ async function handleList(context: CommandContext, args: string[]): Promise<Comm
           pricePerUnit: price,
           orderType: 'SELL',
           orderScope: scope,
+          stallId: nearbyStall.id,
           worldSlotIndex,
         },
       },
@@ -262,6 +285,7 @@ async function handleBuy(context: CommandContext, args: string[]): Promise<Comma
   return {
     success: true,
     message: `Purchasing ${buyQuantity}x ${template?.name ?? 'item'} for ${totalCost} gold...`,
+    data: { type: 'market_buy', success: true },
     events: [
       {
         type: 'market_order_fill',
@@ -305,6 +329,7 @@ async function handleCancel(context: CommandContext, args: string[]): Promise<Co
   return {
     success: true,
     message: 'Cancelling order...',
+    data: { type: 'market_cancel', success: true },
     events: [
       {
         type: 'market_order_cancel',
@@ -320,7 +345,7 @@ async function handleCancel(context: CommandContext, args: string[]): Promise<Co
 /**
  * Handle /market search - Search listings
  */
-async function handleSearch(context: CommandContext, args: string[]): Promise<CommandResult> {
+async function handleSearch(_context: CommandContext, args: string[], nearbyStall: MarketStall): Promise<CommandResult> {
   const searchTerm = args[0];
   const scopeArg = args[1]?.toLowerCase();
 
@@ -328,12 +353,11 @@ async function handleSearch(context: CommandContext, args: string[]): Promise<Co
     return { success: false, error: 'Usage: /market search <item_name> [regional|world]' };
   }
 
-  // Determine scope and region
+  // Determine scope and region (use the stall's region)
   const scope = scopeArg === 'world' ? 'WORLD' : scopeArg === 'regional' ? 'REGIONAL' : undefined;
 
-  // Get current region for regional searches
-  const region = await prisma.region.findFirst({
-    where: { zoneIds: { has: context.zoneId } },
+  const region = await prisma.region.findUnique({
+    where: { id: nearbyStall.regionId },
   });
 
   // Build query
@@ -349,7 +373,11 @@ async function handleSearch(context: CommandContext, args: string[]): Promise<Co
   });
 
   if (matchingTemplates.length === 0) {
-    return { success: true, message: `No items found matching '${searchTerm}'.` };
+    return {
+      success: true,
+      message: `No items found matching '${searchTerm}'.`,
+      data: { type: 'market_search', results: [] },
+    };
   }
 
   where.itemTemplateId = { in: matchingTemplates.map((t) => t.id) };
@@ -373,7 +401,11 @@ async function handleSearch(context: CommandContext, args: string[]): Promise<Co
   });
 
   if (orders.length === 0) {
-    return { success: true, message: `No listings found for '${searchTerm}'.` };
+    return {
+      success: true,
+      message: `No listings found for '${searchTerm}'.`,
+      data: { type: 'market_search', results: [] },
+    };
   }
 
   // Get item names
@@ -392,9 +424,20 @@ async function handleSearch(context: CommandContext, args: string[]): Promise<Co
     return `  ${scopeTag} ${itemName} x${qty} @ ${o.pricePerUnit}g - ${o.region?.name ?? 'Unknown'} (${o.id.slice(0, 8)})`;
   });
 
+  // Build structured results for UI clients
+  const results = orders.map((o) => ({
+    orderId: o.id,
+    itemName: nameMap.get(o.itemTemplateId) ?? 'Unknown',
+    quantity: o.quantity - o.filledQuantity,
+    pricePerUnit: o.pricePerUnit,
+    scope: o.orderScope as 'REGIONAL' | 'WORLD',
+    regionName: o.region?.name ?? 'Unknown',
+  }));
+
   return {
     success: true,
     message: `Found ${orders.length} listing(s) for '${searchTerm}':\n${lines.join('\n')}`,
+    data: { type: 'market_search', results },
   };
 }
 
@@ -415,7 +458,11 @@ async function handleMyOrders(context: CommandContext): Promise<CommandResult> {
   });
 
   if (orders.length === 0) {
-    return { success: true, message: 'You have no active market orders.' };
+    return {
+      success: true,
+      message: 'You have no active market orders.',
+      data: { type: 'market_orders', orders: [] },
+    };
   }
 
   // Get item names
@@ -434,9 +481,21 @@ async function handleMyOrders(context: CommandContext): Promise<CommandResult> {
     return `  ${scopeTag} ${itemName} x${qty} @ ${o.pricePerUnit}g${filled} - ${o.id.slice(0, 8)}`;
   });
 
+  // Build structured order data for UI clients
+  const orderData = orders.map((o) => ({
+    orderId: o.id,
+    itemName: nameMap.get(o.itemTemplateId) ?? 'Unknown',
+    quantity: o.quantity - o.filledQuantity,
+    filledQuantity: o.filledQuantity,
+    pricePerUnit: o.pricePerUnit,
+    scope: o.orderScope as 'REGIONAL' | 'WORLD',
+    status: o.status,
+  }));
+
   return {
     success: true,
     message: `Your active orders (${orders.length}):\n${lines.join('\n')}`,
+    data: { type: 'market_orders', orders: orderData },
   };
 }
 
@@ -449,6 +508,50 @@ async function handleWallet(context: CommandContext): Promise<CommandResult> {
   return {
     success: true,
     message: `Your wallet balance: ${balance} gold`,
+    data: { type: 'market_wallet', balance },
+  };
+}
+
+/**
+ * Handle /market stall - Show info about the nearby market stall
+ */
+async function handleStall(stall: MarketStall): Promise<CommandResult> {
+  // Get owner name
+  const owner = await prisma.character.findUnique({
+    where: { id: stall.ownerId },
+    select: { name: true },
+  });
+
+  // Get region name
+  const region = await prisma.region.findUnique({
+    where: { id: stall.regionId },
+    select: { name: true },
+  });
+
+  // Count active orders at this stall
+  const activeOrders = await prisma.marketOrder.count({
+    where: { stallId: stall.id, status: 'ACTIVE' },
+  });
+
+  return {
+    success: true,
+    message: [
+      `Market Stall: ${stall.name}`,
+      `  Owner: ${owner?.name ?? 'NPC'}`,
+      `  Region: ${region?.name ?? 'Unknown'}`,
+      `  Type: ${stall.stallType}`,
+      `  Active listings: ${activeOrders}`,
+    ].join('\n'),
+    data: {
+      type: 'market_stall',
+      stall: {
+        name: stall.name,
+        owner: owner?.name ?? 'NPC',
+        region: region?.name ?? 'Unknown',
+        stallType: stall.stallType,
+        activeOrders,
+      },
+    },
   };
 }
 
