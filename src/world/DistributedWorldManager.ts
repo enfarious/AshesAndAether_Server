@@ -6,8 +6,10 @@ import { ZoneManager } from './ZoneManager';
 import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
 import { NPCAIController, LLMService } from '@/ai';
-import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands, setArenaManager } from '@/commands';
+import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands, setArenaManager, setVaultManager } from '@/commands';
 import { ArenaManager } from '@/arena/ArenaManager';
+import { VaultManager, TEST_VAULT_TEMPLATE } from '@/vault';
+import type { VaultScalingModifiers, VaultTemplateDefinition } from '@/vault';
 import type { CommandContext, CommandEvent } from '@/commands/types';
 import type { Character, Companion } from '@prisma/client';
 import { StatCalculator } from '@/game/stats/StatCalculator';
@@ -146,6 +148,15 @@ export class DistributedWorldManager implements IWildlifeWorld {
   // Arena system
   private arenaManager: ArenaManager;
 
+  // Vault system
+  private vaultManager!: VaultManager;
+  private vaultInstances: Map<string, {
+    zoneManager: ZoneManager;
+    instanceId: string;
+    playerCount: number;
+    idleTimer: NodeJS.Timeout | null;
+  }> = new Map();
+
   // ── Loot system ────────────────────────────────────────────────────────────
   /** characterId → socketId for targeted loot messages */
   private _charToSocket: Map<string, string> = new Map();
@@ -272,6 +283,42 @@ export class DistributedWorldManager implements IWildlifeWorld {
     );
     setArenaManager(this.arenaManager);
     logger.info('Arena system initialized');
+
+    // Initialize vault system
+    this.vaultManager = new VaultManager(
+      // broadcast: send an event to specific character IDs via the gateway
+      (_instanceId, recipientIds, event, data) => {
+        for (const charId of recipientIds) {
+          const sid = this._charToSocket.get(charId);
+          if (!sid) continue;
+          void this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: charId,
+            socketId: sid,
+            payload: { socketId: sid, event, data },
+            timestamp: Date.now(),
+          });
+        }
+      },
+      // spawnMob: create a mob entity in the vault zone
+      async (zoneId, mobTag, position, level, scalingModifiers) => {
+        return this.spawnVaultMob(zoneId, mobTag, position, level, scalingModifiers);
+      },
+      // createZone: spin up vault zone instance
+      async (instanceId, vaultTemplate) => {
+        return this.spinUpVaultInstance(instanceId, vaultTemplate);
+      },
+      // destroyZone: tear down vault zone instance
+      async (zoneId) => {
+        await this.tearDownVaultInstance(zoneId);
+      },
+      // ejectPlayer: send player back to their return point
+      async (characterId) => {
+        await this.ejectPlayerFromVault(characterId);
+      },
+    );
+    setVaultManager(this.vaultManager);
+    logger.info('Vault system initialized');
   }
 
   /**
@@ -283,8 +330,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // If no zones assigned, load all zones (for single-server mode)
     if (this.assignedZoneIds.length === 0) {
       const allZones = await ZoneService.findAll();
-      // Filter out village zones — they are spun up on demand, not at startup
-      this.assignedZoneIds = allZones.filter(z => !VillageService.isVillageZone(z.id)).map(z => z.id);
+      // Filter out village and vault zones — they are spun up on demand, not at startup
+      this.assignedZoneIds = allZones.filter(z =>
+        !VillageService.isVillageZone(z.id) && !VaultManager.isVaultZone(z.id)
+      ).map(z => z.id);
       logger.info('No zone assignment specified - loading all zones (single-server mode)');
     }
 
@@ -614,6 +663,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
       villageInst.playerCount++;
     }
 
+    // ── Vault instance tracking ──
+    if (VaultManager.isVaultZone(character.zoneId)) {
+      const vaultInst = this.vaultInstances.get(character.zoneId);
+      if (vaultInst) {
+        if (vaultInst.idleTimer) { clearTimeout(vaultInst.idleTimer); vaultInst.idleTimer = null; }
+        vaultInst.playerCount++;
+      }
+      this.vaultManager.handlePlayerJoin(character.id);
+    }
+
     logger.info({ characterId: character.id, zoneId: character.zoneId }, 'Player joined zone');
   }
 
@@ -678,6 +737,15 @@ export class DistributedWorldManager implements IWildlifeWorld {
           void this.tearDownVillageInstance(zoneId);
         }, 60_000);
       }
+    }
+
+    // ── Vault instance tracking: handle disconnect ──
+    if (VaultManager.isVaultZone(zoneId)) {
+      const vaultInstLeave = this.vaultInstances.get(zoneId);
+      if (vaultInstLeave) {
+        vaultInstLeave.playerCount = Math.max(0, vaultInstLeave.playerCount - 1);
+      }
+      this.vaultManager.handleDisconnect(characterId);
     }
 
     logger.info({ characterId, zoneId }, 'Player left zone');
@@ -777,6 +845,212 @@ export class DistributedWorldManager implements IWildlifeWorld {
     this.villageInstances.delete(zoneId);
 
     logger.info({ zoneId }, 'Village instance torn down');
+  }
+
+  // ── Vault instance management ─────────────────────────────────────────────
+
+  /**
+   * Spin up a vault zone instance. Creates a Zone DB record and ZoneManager,
+   * following the village spin-up pattern.
+   */
+  private async spinUpVaultInstance(
+    instanceId: string,
+    template: VaultTemplateDefinition,
+  ): Promise<string> {
+    const zoneId = VaultManager.vaultZoneId(instanceId);
+
+    // Already running?
+    if (this.vaultInstances.has(zoneId)) {
+      return zoneId;
+    }
+
+    // Create Zone DB record with unique negative world coordinates
+    const coords = VaultManager.vaultWorldCoords(instanceId);
+
+    await prisma.zone.create({
+      data: {
+        id: zoneId,
+        name: template.name,
+        description: template.description,
+        worldX: coords.worldX,
+        worldY: coords.worldY,
+        sizeX: template.zoneDimensions.sizeX,
+        sizeY: template.zoneDimensions.sizeY,
+        sizeZ: template.zoneDimensions.sizeZ,
+        terrainType: 'vault',
+        weatherEnabled: false,
+        timeOfDayEnabled: false,
+        corruptionTag: 'DEEP_LAB',
+        isWarded: false,
+      },
+    });
+
+    const zone = await ZoneService.findById(zoneId);
+    if (!zone) throw new Error('Failed to create vault zone record');
+
+    const zoneManager = new ZoneManager(zone);
+    await zoneManager.initialize();
+
+    // Subscribe to the vault zone's input channel
+    const channel = `zone:${zoneId}:input`;
+    await this.messageBus.subscribe(channel, (msg: MessageEnvelope) => this.handleZoneMessage(msg));
+
+    // Register in zone maps
+    this.zones.set(zoneId, zoneManager);
+    this.movementSystem.registerZoneManager(zoneId, zoneManager);
+    this.vaultInstances.set(zoneId, {
+      zoneManager,
+      instanceId,
+      playerCount: 0,
+      idleTimer: null,
+    });
+
+    // Register in ZoneRegistry so gateway can find it
+    await this.zoneRegistry.assignZone(zoneId, this.serverId);
+
+    // Publish entities to Redis for world_entry
+    await this.publishZoneEntities(zoneId, zoneManager);
+
+    // Write environment
+    await this.zoneRegistry.setZoneEnvironment(zoneId, {
+      timeOfDay: zoneManager.getTimeOfDayString(),
+      timeOfDayValue: zoneManager.getTimeOfDayNormalized(),
+      weather: zoneManager.getWeather(),
+      lighting: zoneManager.getLighting(),
+    });
+
+    logger.info({ zoneId, instanceId, vaultName: template.name }, 'Vault instance spun up');
+    return zoneId;
+  }
+
+  /**
+   * Tear down a vault zone instance. Cleans up all resources and deletes the
+   * Zone DB record (vault zones are transient, unlike village zones).
+   */
+  private async tearDownVaultInstance(zoneId: string): Promise<void> {
+    const inst = this.vaultInstances.get(zoneId);
+    if (!inst) return;
+    if (inst.idleTimer) clearTimeout(inst.idleTimer);
+
+    // Unsubscribe from Redis channel
+    const channel = `zone:${zoneId}:input`;
+    await this.messageBus.unsubscribe(channel);
+
+    // Unregister from ZoneRegistry
+    await this.zoneRegistry.unassignZone(zoneId);
+
+    // Remove from local maps
+    this.zones.delete(zoneId);
+    this.movementSystem.unregisterZoneManager(zoneId);
+    this.vaultInstances.delete(zoneId);
+
+    // Delete the transient Zone DB record
+    try {
+      await prisma.zone.delete({ where: { id: zoneId } });
+    } catch (err) {
+      logger.warn({ zoneId, err }, 'Failed to delete vault zone record (may already be gone)');
+    }
+
+    logger.info({ zoneId }, 'Vault instance torn down');
+  }
+
+  /**
+   * Spawn a mob entity inside a vault zone with scaled stats.
+   * Returns the entity ID for tracking by VaultManager.
+   */
+  private async spawnVaultMob(
+    zoneId: string,
+    mobTag: string,
+    position: { x: number; y: number; z: number },
+    level: number,
+    scaling: VaultScalingModifiers,
+  ): Promise<string> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) throw new Error(`Zone ${zoneId} not found for vault mob spawn`);
+
+    // Base stats for vault mobs (scaled by level and difficulty)
+    const baseHp = Math.round((150 + level * 50) * scaling.mobHpMultiplier);
+    const entityId = `vault-mob:${randomUUID()}`;
+
+    // Create mob in DB for combat system compatibility
+    const mob = await prisma.mob.create({
+      data: {
+        id: entityId,
+        name: mobTag.split('.').pop() ?? 'Construct',
+        tag: `${mobTag}.${entityId.slice(-8)}`, // Unique tag per spawn
+        level,
+        stats: {
+          strength:     8 + level * 2,
+          vitality:     10 + level * 2,
+          dexterity:    6 + level,
+          agility:      6 + level,
+          intelligence: 4 + level,
+          wisdom:       4 + level,
+        },
+        currentHealth: baseHp,
+        maxHealth: baseHp,
+        isAlive: true,
+        zoneId,
+        positionX: position.x,
+        positionY: position.y,
+        positionZ: position.z,
+        faction: 'hostile',
+        aiType: 'aggressive',
+        aggroRadius: 15.0,
+        respawnTime: 0, // Vault mobs don't respawn
+        lootTableId: mobTag.includes('overlord') ? 'loot-table-vault-boss' : 'loot-table-vault-construct',
+        goldDrop: mobTag.includes('overlord') ? 50 : 10,
+      },
+    });
+
+    // Add to zone manager using existing spawnMob method
+    zoneManager.spawnMob(mob);
+
+    logger.debug({ entityId, mobTag, level, zoneId, hp: baseHp }, 'Vault mob spawned');
+    return entityId;
+  }
+
+  /**
+   * Eject a player from a vault back to their saved return point.
+   * Used on vault failure/timeout.
+   */
+  private async ejectPlayerFromVault(characterId: string): Promise<void> {
+    const character = await CharacterService.findById(characterId);
+    if (!character) return;
+
+    let destZoneId = character.returnZoneId;
+    let destX = character.returnPositionX ?? 0;
+    let destY = character.returnPositionY ?? 0;
+    let destZ = character.returnPositionZ ?? 0;
+
+    // Fallback to Stephentown if no return point or return point is inside another instance
+    if (!destZoneId || VillageService.isVillageZone(destZoneId) || VaultManager.isVaultZone(destZoneId)) {
+      const fallbackZone = 'USA_NY_Stephentown';
+      const spawn = SpawnPointService.getStarterSpawn(fallbackZone);
+      destZoneId = fallbackZone;
+      destX = spawn?.position?.x ?? 0;
+      destY = spawn?.position?.y ?? 265;
+      destZ = spawn?.position?.z ?? 0;
+    }
+
+    await VillageService.updateCharacterZone(characterId, destZoneId, destX, destY, destZ);
+    await VillageService.clearReturnPoint(characterId);
+
+    // Send zone transfer to gateway
+    const socketId = this._charToSocket.get(characterId);
+    if (socketId) {
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: {
+          socketId,
+          event: 'zone_transfer',
+          data: { zoneId: destZoneId },
+        },
+        timestamp: Date.now(),
+      });
+    }
   }
 
   /**
@@ -1931,6 +2205,328 @@ export class DistributedWorldManager implements IWildlifeWorld {
             }
 
             overrideResponse = { success: true, message: 'Structure removed.' };
+          } catch (err: any) {
+            overrideResponse = { success: false, error: err.message };
+          }
+          break;
+        }
+
+        // ── Vault system events ────────────────────────────────────────
+        case 'vault_enter': {
+          try {
+            // Check not already in a vault or village
+            if (VaultManager.isVaultZone(context.zoneId)) {
+              overrideResponse = { success: false, error: 'You are already inside a vault.' };
+              break;
+            }
+            if (VillageService.isVillageZone(context.zoneId)) {
+              overrideResponse = { success: false, error: 'You cannot enter a vault from inside a village.' };
+              break;
+            }
+
+            const template = TEST_VAULT_TEMPLATE;
+
+            // Check player has a vault key in inventory
+            const keyItems = await prisma.inventoryItem.findMany({
+              where: {
+                characterId: context.characterId,
+                template: {
+                  tags: { some: { tag: { name: template.requiredKeyTag } } },
+                },
+              },
+            });
+
+            if (keyItems.length === 0) {
+              overrideResponse = {
+                success: false,
+                error: `You need a ${template.name} key to enter. Assemble one with /vault assemble.`,
+              };
+              break;
+            }
+
+            // Consume the key
+            await prisma.inventoryItem.delete({ where: { id: keyItems[0].id } });
+
+            // Get party members (or just the solo player)
+            const partyId = await this.partyService.getPartyIdForMember(context.characterId);
+            let partyMembers: Array<{ id: string; name: string }> = [
+              { id: context.characterId, name: context.characterName },
+            ];
+
+            if (partyId) {
+              const partyInfo = await this.partyService.getPartyInfo(partyId);
+              if (partyInfo && partyInfo.members.length > 1) {
+                // Fetch names for all party members
+                const chars = await prisma.character.findMany({
+                  where: { id: { in: partyInfo.members } },
+                  select: { id: true, name: true },
+                });
+                partyMembers = chars.map(c => ({ id: c.id, name: c.name }));
+              }
+            }
+
+            // Create vault instance
+            const instanceId = await this.vaultManager.createInstance(
+              context.characterId,
+              context.characterName,
+              partyMembers,
+              template,
+            );
+
+            const vaultZoneId = VaultManager.vaultZoneId(instanceId);
+
+            // Save return points and transfer all party members
+            for (const member of partyMembers) {
+              const memberChar = await CharacterService.findById(member.id);
+              if (!memberChar) continue;
+
+              // Save return point
+              await VillageService.saveReturnPoint(
+                member.id, memberChar.zoneId,
+                memberChar.positionX, memberChar.positionY, memberChar.positionZ,
+              );
+
+              // Get player spawn position from first room
+              const spawnPos = template.rooms[0].spawnPositions.player[
+                partyMembers.indexOf(member) % template.rooms[0].spawnPositions.player.length
+              ];
+
+              // Update character zone to vault
+              await VillageService.updateCharacterZone(
+                member.id, vaultZoneId,
+                spawnPos.x, spawnPos.y, spawnPos.z,
+              );
+
+              // Track vault player count
+              const vaultInst = this.vaultInstances.get(vaultZoneId);
+              if (vaultInst) vaultInst.playerCount++;
+
+              // Send zone transfer to each member's gateway
+              const memberSocketId = this._charToSocket.get(member.id);
+              if (memberSocketId) {
+                await this.messageBus.publish('gateway:output', {
+                  type: MessageType.CLIENT_MESSAGE,
+                  characterId: member.id,
+                  socketId: memberSocketId,
+                  payload: {
+                    socketId: memberSocketId,
+                    event: 'zone_transfer',
+                    data: { zoneId: vaultZoneId },
+                  },
+                  timestamp: Date.now(),
+                });
+              }
+            }
+
+            // Spawn first room mobs
+            const instance = this.vaultManager.getInstanceForCharacter(context.characterId);
+            if (instance) {
+              await this.vaultManager.spawnRoom(instance.instanceId, 0);
+            }
+
+            overrideResponse = {
+              success: true,
+              message: `Entering ${template.name}... Key consumed.`,
+            };
+          } catch (err: any) {
+            overrideResponse = { success: false, error: err.message };
+          }
+          break;
+        }
+
+        case 'vault_leave': {
+          try {
+            const character = await CharacterService.findById(context.characterId);
+
+            // Determine destination: saved return point, or Stephentown as fallback
+            let destZoneId = character?.returnZoneId ?? null;
+            let destX = character?.returnPositionX ?? 0;
+            let destY = character?.returnPositionY ?? 0;
+            let destZ = character?.returnPositionZ ?? 0;
+
+            if (!destZoneId || VillageService.isVillageZone(destZoneId) || VaultManager.isVaultZone(destZoneId)) {
+              const fallbackZone = 'USA_NY_Stephentown';
+              const spawn = SpawnPointService.getStarterSpawn(fallbackZone);
+              destZoneId = fallbackZone;
+              destX = spawn?.position?.x ?? 0;
+              destY = spawn?.position?.y ?? 265;
+              destZ = spawn?.position?.z ?? 0;
+            }
+
+            // Remove from vault manager tracking
+            this.vaultManager.removeParticipant(context.characterId);
+
+            // Decrement vault player count
+            const vaultInst = this.vaultInstances.get(context.zoneId);
+            if (vaultInst) {
+              vaultInst.playerCount = Math.max(0, vaultInst.playerCount - 1);
+            }
+
+            await VillageService.updateCharacterZone(
+              context.characterId, destZoneId,
+              destX, destY, destZ,
+            );
+            await VillageService.clearReturnPoint(context.characterId);
+
+            await this.messageBus.publish('gateway:output', {
+              type: MessageType.CLIENT_MESSAGE,
+              characterId: context.characterId,
+              socketId: context.socketId,
+              payload: {
+                socketId: context.socketId,
+                event: 'zone_transfer',
+                data: { zoneId: destZoneId },
+              },
+              timestamp: Date.now(),
+            });
+
+            overrideResponse = {
+              success: true,
+              message: 'You have left the vault.',
+            };
+          } catch (err: any) {
+            overrideResponse = { success: false, error: err.message };
+          }
+          break;
+        }
+
+        case 'vault_assemble': {
+          try {
+            const template = TEST_VAULT_TEMPLATE;
+
+            // Check proximity to civic anchor (library or townhall)
+            const anchors = await prisma.civicAnchor.findMany({
+              where: { zoneId: context.zoneId, isActive: true },
+            });
+
+            let nearAnchor = false;
+            for (const anchor of anchors) {
+              const dx = context.position.x - anchor.worldX;
+              const dz = context.position.z - anchor.worldZ;
+              const dist = Math.sqrt(dx * dx + dz * dz);
+              if (dist <= anchor.wardRadius) {
+                nearAnchor = true;
+                break;
+              }
+            }
+
+            if (!nearAnchor) {
+              overrideResponse = {
+                success: false,
+                error: 'You must be near a town hall or library workbench to assemble a vault key.',
+              };
+              break;
+            }
+
+            // Count fragments in inventory
+            const fragmentItems = await prisma.inventoryItem.findMany({
+              where: {
+                characterId: context.characterId,
+                template: {
+                  tags: { some: { tag: { name: template.requiredFragmentTag } } },
+                },
+              },
+              orderBy: { quantity: 'desc' },
+            });
+
+            // Calculate total fragment quantity (they're stackable)
+            let totalFragments = 0;
+            for (const item of fragmentItems) {
+              totalFragments += item.quantity;
+            }
+
+            if (totalFragments < template.fragmentsRequired) {
+              overrideResponse = {
+                success: false,
+                error: `You need ${template.fragmentsRequired} fragments to assemble a key (you have ${totalFragments}).`,
+              };
+              break;
+            }
+
+            // Consume fragments (remove from stacks)
+            let remaining = template.fragmentsRequired;
+            for (const item of fragmentItems) {
+              if (remaining <= 0) break;
+              if (item.quantity <= remaining) {
+                remaining -= item.quantity;
+                await prisma.inventoryItem.delete({ where: { id: item.id } });
+              } else {
+                await prisma.inventoryItem.update({
+                  where: { id: item.id },
+                  data: { quantity: item.quantity - remaining },
+                });
+                remaining = 0;
+              }
+            }
+
+            // Find key template
+            const keyTemplate = await prisma.itemTemplate.findFirst({
+              where: { tags: { some: { tag: { name: template.requiredKeyTag } } } },
+            });
+
+            if (!keyTemplate) {
+              overrideResponse = { success: false, error: 'Key template not found. Contact an admin.' };
+              break;
+            }
+
+            // Create key in inventory
+            await prisma.inventoryItem.create({
+              data: {
+                characterId: context.characterId,
+                itemTemplateId: keyTemplate.id,
+                quantity: 1,
+              },
+            });
+
+            overrideResponse = {
+              success: true,
+              message: `Assembled a ${keyTemplate.name}! Use /vault enter to begin.`,
+            };
+          } catch (err: any) {
+            overrideResponse = { success: false, error: err.message };
+          }
+          break;
+        }
+
+        case 'vault_fragments': {
+          try {
+            const template = TEST_VAULT_TEMPLATE;
+
+            const fragmentItems = await prisma.inventoryItem.findMany({
+              where: {
+                characterId: context.characterId,
+                template: {
+                  tags: { some: { tag: { name: template.requiredFragmentTag } } },
+                },
+              },
+            });
+
+            let totalFragments = 0;
+            for (const item of fragmentItems) {
+              totalFragments += item.quantity;
+            }
+
+            // Also check for assembled keys
+            const keyItems = await prisma.inventoryItem.findMany({
+              where: {
+                characterId: context.characterId,
+                template: {
+                  tags: { some: { tag: { name: template.requiredKeyTag } } },
+                },
+              },
+            });
+
+            const lines = [
+              `--- Vault Fragments ---`,
+              `Nanotech Lab Fragments: ${totalFragments}/${template.fragmentsRequired}`,
+              `Nanotech Lab Keys: ${keyItems.length}`,
+            ];
+
+            if (totalFragments >= template.fragmentsRequired) {
+              lines.push('You have enough fragments! Use /vault assemble near a workbench.');
+            }
+
+            overrideResponse = { success: true, message: lines.join('\n') };
           } catch (err: any) {
             overrideResponse = { success: false, error: err.message };
           }
@@ -3435,8 +4031,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
             }, 2500);
           } else if (!targetData.isPlayer) {
             // Resolve and distribute loot before despawning
-            void this._resolveMobLoot(targetData.entityId, zoneManager.getZone().id);
-            await this.scheduleMobRespawn(targetData.entityId, zoneManager.getZone().id, targetData.maxHealth);
+            const deadMobZoneId = zoneManager.getZone().id;
+            void this._resolveMobLoot(targetData.entityId, deadMobZoneId);
+
+            // Vault mob death: notify VaultManager for room clear tracking
+            if (VaultManager.isVaultZone(deadMobZoneId)) {
+              this.vaultManager.reportMobDeath(targetData.entityId, deadMobZoneId);
+              // Vault mobs don't respawn — skip scheduleMobRespawn
+            } else {
+              await this.scheduleMobRespawn(targetData.entityId, deadMobZoneId, targetData.maxHealth);
+            }
           } else {
             // Player died — push isAlive:false so the client shows the death overlay.
             await this.sendCharacterResourcesUpdate(zoneManager, targetData.entityId, {

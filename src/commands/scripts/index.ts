@@ -35,6 +35,8 @@ import { unstuckCommand } from './world/unstuck';
 import { villageCommand } from './world/village';
 import { arenaCommand, setArenaManager } from './world/arena-command';
 export { setArenaManager };
+import { vaultCommand, setVaultManager } from './world/vault-command';
+export { setVaultManager };
 import { marketCommand } from './market/market';
 
 /**
@@ -73,6 +75,7 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(unstuckCommand);
   registry.register(villageCommand);
   registry.register(arenaCommand);
+  registry.register(vaultCommand);
 
   // Market commands
   registry.register(marketCommand);
