@@ -1,6 +1,6 @@
 import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
-import { AccountService, CharacterService, CompanionService, ZoneService, InventoryService } from '@/database';
+import { AccountService, CharacterService, CompanionService, ZoneService, InventoryService, prisma } from '@/database';
 import { VillageService } from '@/village';
 import { StatCalculator } from '@/game/stats/StatCalculator';
 import { SpawnPointService } from '@/world/SpawnPointService';
@@ -455,6 +455,173 @@ export class GatewayClientSession {
         success:              result.success,
         message:              result.message,
       });
+    });
+
+    // ── Stat allocation ─────────────────────────────────────────────────────────
+
+    const VALID_CORE_STATS = ['strength', 'vitality', 'dexterity', 'agility', 'intelligence', 'wisdom'] as const;
+
+    this.socket.on('allocate_stat', async (data: unknown) => {
+      if (!this.characterId) return;
+      const { stat } = (data ?? {}) as { stat?: string };
+      if (!stat || !(VALID_CORE_STATS as readonly string[]).includes(stat)) {
+        this.socket.emit('stat_allocate_result', { success: false, error: 'Invalid stat.' });
+        return;
+      }
+
+      const character = await CharacterService.findById(this.characterId);
+      if (!character || character.statPoints <= 0) {
+        this.socket.emit('stat_allocate_result', { success: false, error: 'No stat points available.' });
+        return;
+      }
+
+      // Increment the chosen stat and decrement stat points
+      const updated = await prisma.character.update({
+        where: { id: this.characterId },
+        data: {
+          [stat]: { increment: 1 },
+          statPoints: { decrement: 1 },
+        },
+      });
+
+      // Recalculate derived stats
+      const coreStats = {
+        strength: updated.strength,
+        vitality: updated.vitality,
+        dexterity: updated.dexterity,
+        agility: updated.agility,
+        intelligence: updated.intelligence,
+        wisdom: updated.wisdom,
+      };
+      const derivedStats = StatCalculator.calculateDerivedStats(coreStats, updated.level);
+
+      // Persist derived stats
+      await prisma.character.update({
+        where: { id: this.characterId },
+        data: {
+          maxHp: derivedStats.maxHp,
+          maxStamina: derivedStats.maxStamina,
+          maxMana: derivedStats.maxMana,
+          attackRating: derivedStats.attackRating,
+          defenseRating: derivedStats.defenseRating,
+          magicAttack: derivedStats.magicAttack,
+          magicDefense: derivedStats.magicDefense,
+        },
+      });
+
+      // Emit state update so the client refreshes
+      this.socket.emit('state_update', {
+        character: {
+          coreStats,
+          derivedStats,
+          statPoints: updated.statPoints,
+        },
+      });
+
+      this.socket.emit('stat_allocate_result', { success: true, stat, newValue: (coreStats as Record<string, number>)[stat] });
+      logger.debug({ characterId: this.characterId, stat, newPoints: updated.statPoints }, 'Stat allocated');
+    });
+
+    // ── Respec ────────────────────────────────────────────────────────────────
+
+    const RESPEC_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+    this.socket.on('respec_stats', async () => {
+      if (!this.characterId) return;
+      const character = await CharacterService.findById(this.characterId);
+      if (!character) return;
+
+      // Check cooldown
+      if (character.lastStatRespecAt) {
+        const elapsed = Date.now() - new Date(character.lastStatRespecAt).getTime();
+        if (elapsed < RESPEC_COOLDOWN_MS) {
+          const remaining = Math.ceil((RESPEC_COOLDOWN_MS - elapsed) / 60000);
+          this.socket.emit('respec_result', { success: false, error: `Stat respec on cooldown. ${remaining} min remaining.` });
+          return;
+        }
+      }
+
+      // Total stat points = level - 1 (1 per level gained, starting at level 1 with 0)
+      const totalStatPoints = character.level - 1;
+
+      // Reset all core stats to 10, refund all points
+      const coreStats = {
+        strength: 10, vitality: 10, dexterity: 10,
+        agility: 10, intelligence: 10, wisdom: 10,
+      };
+      const derivedStats = StatCalculator.calculateDerivedStats(coreStats, character.level);
+
+      await prisma.character.update({
+        where: { id: this.characterId },
+        data: {
+          strength: 10, vitality: 10, dexterity: 10,
+          agility: 10, intelligence: 10, wisdom: 10,
+          statPoints: totalStatPoints,
+          lastStatRespecAt: new Date(),
+          maxHp: derivedStats.maxHp,
+          maxStamina: derivedStats.maxStamina,
+          maxMana: derivedStats.maxMana,
+          attackRating: derivedStats.attackRating,
+          defenseRating: derivedStats.defenseRating,
+          magicAttack: derivedStats.magicAttack,
+          magicDefense: derivedStats.magicDefense,
+        },
+      });
+
+      this.socket.emit('state_update', {
+        character: {
+          coreStats,
+          derivedStats,
+          statPoints: totalStatPoints,
+        },
+      });
+      this.socket.emit('respec_result', { success: true, type: 'stats', message: `Stats reset. ${totalStatPoints} stat points refunded.` });
+      logger.info({ characterId: this.characterId, refunded: totalStatPoints }, 'Stat respec completed');
+    });
+
+    this.socket.on('respec_abilities', async () => {
+      if (!this.characterId) return;
+      const character = await CharacterService.findById(this.characterId);
+      if (!character) return;
+
+      // Check cooldown
+      if (character.lastAbilityRespecAt) {
+        const elapsed = Date.now() - new Date(character.lastAbilityRespecAt).getTime();
+        if (elapsed < RESPEC_COOLDOWN_MS) {
+          const remaining = Math.ceil((RESPEC_COOLDOWN_MS - elapsed) / 60000);
+          this.socket.emit('respec_result', { success: false, error: `Ability respec on cooldown. ${remaining} min remaining.` });
+          return;
+        }
+      }
+
+      // Total ability points = level - 1
+      const totalAbilityPoints = character.level - 1;
+
+      // Reset abilities, loadouts, refund all AP
+      await prisma.character.update({
+        where: { id: this.characterId },
+        data: {
+          unlockedAbilities: { activeNodes: [], passiveNodes: [], apSpent: 0 },
+          activeLoadout: Array(8).fill(null),
+          passiveLoadout: Array(8).fill(null),
+          abilityPoints: totalAbilityPoints,
+          lastAbilityRespecAt: new Date(),
+        },
+      });
+
+      // Emit ability_update so the ability window refreshes
+      this.socket.emit('ability_update', {
+        unlockedActiveNodes: [],
+        unlockedPassiveNodes: [],
+        activeLoadout: Array(8).fill(null),
+        passiveLoadout: Array(8).fill(null),
+        abilityPoints: totalAbilityPoints,
+        success: true,
+        message: `Abilities reset. ${totalAbilityPoints} AP refunded.`,
+      });
+
+      this.socket.emit('respec_result', { success: true, type: 'abilities', message: `Abilities reset. ${totalAbilityPoints} AP refunded.` });
+      logger.info({ characterId: this.characterId, refunded: totalAbilityPoints }, 'Ability respec completed');
     });
 
     // ── Guest registration ─────────────────────────────────────────────────────

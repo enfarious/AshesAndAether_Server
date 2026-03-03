@@ -1326,6 +1326,43 @@ export class ZoneManager {
   }
 
   /**
+   * Move a companion to a new XZ position, snapping Y to terrain.
+   * Same pattern as updateMobPosition but for companion entities.
+   */
+  updateCompanionPosition(entityId: string, position: Vector3, heading: number): Vector3 {
+    const entity = this.entities.get(entityId);
+    if (!entity || entity.type !== 'companion') return position;
+
+    const terrain = this.physicsSystem.getTerrainCollision(position);
+    const snapped = { ...position, y: terrain.elevation };
+
+    entity.position = snapped;
+    entity.heading = heading;
+    this.physicsSystem.updateEntity(entityId, snapped);
+    return snapped;
+  }
+
+  /**
+   * Get all companion entities in this zone.
+   */
+  getCompanions(): Array<{ id: string; position: Vector3; isAlive: boolean; inCombat: boolean; currentHealth?: number; maxHealth?: number }> {
+    const companions: Array<{ id: string; position: Vector3; isAlive: boolean; inCombat: boolean; currentHealth?: number; maxHealth?: number }> = [];
+    for (const entity of this.entities.values()) {
+      if (entity.type === 'companion') {
+        companions.push({
+          id: entity.id,
+          position: entity.position,
+          isAlive: entity.isAlive,
+          inCombat: entity.inCombat ?? false,
+          currentHealth: entity.currentHealth,
+          maxHealth: entity.maxHealth,
+        });
+      }
+    }
+    return companions;
+  }
+
+  /**
    * Get all player positions in the zone (for wildlife sim)
    */
   getPlayerPositions(): Array<{ id: string; position: Vector3 }> {

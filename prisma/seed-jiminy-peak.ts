@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
@@ -86,7 +86,7 @@ Rumors persist of a cave entrance near the summit - an entrance to something old
       weatherEnabled: true,
       timeOfDayEnabled: true,
       contentRating: 'T',
-      navmeshData: null,
+      navmeshData: Prisma.JsonNull,
       // Corruption system
       corruptionTag: 'CURSED_RESORT',
       isWarded: false,

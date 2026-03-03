@@ -3,11 +3,30 @@ import OpenAI from 'openai';
 import { logger } from '@/utils/logger';
 import type { Companion } from '@prisma/client';
 import type { ProximityRosterMessage } from '@/network/protocol/types';
+import type { CompanionCombatSettings } from './CompanionCombatSettings';
 
 interface NPCResponse {
   action: 'chat' | 'emote' | 'none';
   channel?: 'say' | 'shout' | 'emote';
   message?: string;
+}
+
+export interface CombatSettingsContext {
+  companionName: string;
+  archetype: string;
+  personalityType: string;
+  companionHealthRatio: number;
+  currentSettings: CompanionCombatSettings;
+  /** Enemy descriptions: e.g. ["rat (level 3)", "wolf alpha (level 7)"] */
+  enemies: string[];
+  /** Ally health states: e.g. ["Kael: 45%", "Lyra: 80%"] */
+  allyStates: string[];
+  /** Time in combat (seconds). */
+  fightDurationSec: number;
+  /** Why this update was triggered. */
+  triggerReason: string;
+  /** Player command if that was the trigger. */
+  playerCommand?: string;
 }
 
 type LLMProvider = 'anthropic' | 'openai-compatible';
@@ -296,6 +315,178 @@ Keep responses short (1-2 sentences). Stay in character.`;
       channel: 'say',
       message: trimmed,
     };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Combat Settings Generation (prefrontal cortex)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Generate a combat settings update based on the current fight situation.
+   * Returns a partial settings object — only fields the LLM wants to change.
+   * Returns null on failure (caller keeps current settings).
+   */
+  async generateCombatSettingsUpdate(
+    companion: Companion,
+    combatContext: CombatSettingsContext,
+  ): Promise<Partial<CompanionCombatSettings> | null> {
+    if (!this.isConfigured()) return null;
+
+    try {
+      const systemPrompt = this.buildCombatSystemPrompt(combatContext);
+      const userPrompt = this.buildCombatUserPrompt(combatContext);
+
+      let responseText: string;
+
+      switch (this.provider) {
+        case 'anthropic':
+          responseText = await this.generateCombatAnthropic(companion, systemPrompt, userPrompt);
+          break;
+        case 'openai-compatible':
+          responseText = await this.generateCombatOpenAI(companion, systemPrompt, userPrompt);
+          break;
+        default:
+          return null;
+      }
+
+      return this.parseCombatSettings(responseText);
+    } catch (error) {
+      logger.error({ error, companionId: companion.id }, '[LLM] Combat settings generation failed');
+      return null;
+    }
+  }
+
+  private async generateCombatAnthropic(
+    companion: Companion,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    if (!this.anthropic) throw new Error('Anthropic not initialized');
+
+    const response = await this.anthropic.messages.create({
+      model: companion.llmModel || 'claude-3-5-sonnet-20241022',
+      max_tokens: 150,
+      temperature: 0.4,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    });
+
+    return response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+
+  private async generateCombatOpenAI(
+    companion: Companion,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    if (!this.openaiClient) throw new Error('OpenAI client not initialized');
+
+    const model = process.env.OPENAI_MODEL || companion.llmModel || 'gpt-4-turbo-preview';
+
+    const response = await this.openaiClient.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 150,
+      temperature: 0.4,
+    });
+
+    return response.choices[0]?.message?.content || '';
+  }
+
+  private buildCombatSystemPrompt(ctx: CombatSettingsContext): string {
+    return `You are the tactical brain of ${ctx.companionName}, a ${ctx.archetype} companion with a ${ctx.personalityType} personality.
+
+You decide HOW your companion fights by adjusting a settings object. You do NOT control individual actions — the behavior tree handles that. You set the strategy.
+
+Current settings:
+${JSON.stringify(ctx.currentSettings, null, 2)}
+
+Respond with ONLY a JSON object containing the fields you want to change. Omit fields you want to keep the same.
+
+Available fields:
+- preferredRange: "melee" | "close" | "mid" | "far"
+- priority: "weakest" | "nearest" | "threatening_player"
+- stance: "aggressive" | "cautious" | "support"
+- abilityWeights: { "heal": 0-1, "damage": 0-1, "cc": 0-1 }
+- retreatThreshold: 0-1 (fraction of max HP to trigger retreat)
+
+Example response: {"stance": "support", "abilityWeights": {"heal": 0.9, "damage": 0.1}}
+Example response: {"preferredRange": "far", "priority": "weakest"}
+
+Stay in character. A scrappy fighter rarely switches to support. A cautious healer rarely goes aggressive. But extreme situations can override personality.`;
+  }
+
+  private buildCombatUserPrompt(ctx: CombatSettingsContext): string {
+    let prompt = `SITUATION UPDATE (trigger: ${ctx.triggerReason})\n`;
+    prompt += `Your HP: ${Math.round(ctx.companionHealthRatio * 100)}%\n`;
+    prompt += `Fight duration: ${Math.round(ctx.fightDurationSec)}s\n`;
+
+    if (ctx.enemies.length > 0) {
+      prompt += `Enemies: ${ctx.enemies.join(', ')}\n`;
+    }
+    if (ctx.allyStates.length > 0) {
+      prompt += `Allies: ${ctx.allyStates.join(', ')}\n`;
+    }
+    if (ctx.playerCommand) {
+      prompt += `\nPLAYER COMMAND: "${ctx.playerCommand}" — obey this command by adjusting your settings.\n`;
+    }
+
+    prompt += '\nWhat settings changes, if any?';
+    return prompt;
+  }
+
+  /**
+   * Parse the LLM's JSON response into a partial settings object.
+   * Validates all fields and clamps values to valid ranges.
+   */
+  private parseCombatSettings(text: string): Partial<CompanionCombatSettings> | null {
+    // Extract JSON from response (LLM might include backticks or explanation)
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn({ text }, '[LLM] No JSON found in combat settings response');
+      return null;
+    }
+
+    try {
+      const raw = JSON.parse(jsonMatch[0]);
+      const result: Partial<CompanionCombatSettings> = {};
+
+      // Validate each field
+      if (raw.preferredRange && ['melee', 'close', 'mid', 'far'].includes(raw.preferredRange)) {
+        result.preferredRange = raw.preferredRange;
+      }
+      if (raw.priority && ['weakest', 'nearest', 'threatening_player'].includes(raw.priority)) {
+        result.priority = raw.priority;
+      }
+      if (raw.stance && ['aggressive', 'cautious', 'support'].includes(raw.stance)) {
+        result.stance = raw.stance;
+      }
+      if (typeof raw.retreatThreshold === 'number') {
+        result.retreatThreshold = Math.max(0, Math.min(1, raw.retreatThreshold));
+      }
+      if (raw.abilityWeights && typeof raw.abilityWeights === 'object') {
+        result.abilityWeights = {};
+        for (const [key, value] of Object.entries(raw.abilityWeights)) {
+          if (typeof value === 'number') {
+            result.abilityWeights[key] = Math.max(0, Math.min(1, value));
+          }
+        }
+      }
+
+      // If nothing valid was parsed, return null
+      if (Object.keys(result).length === 0) {
+        logger.warn({ raw }, '[LLM] Combat settings response had no valid fields');
+        return null;
+      }
+
+      return result;
+    } catch (e) {
+      logger.warn({ text, error: e }, '[LLM] Failed to parse combat settings JSON');
+      return null;
+    }
   }
 
   /**

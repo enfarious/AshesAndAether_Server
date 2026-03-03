@@ -26,7 +26,9 @@ model Character {
   level             Int      @default(1)
   experience        Int      @default(0)
   abilityPoints     Int      @default(0)
-  statPoints        Int      @default(0)
+  statPoints          Int      @default(0)
+  lastStatRespecAt    DateTime?
+  lastAbilityRespecAt DateTime?
   supernaturalType  String?
   supernaturalData  Json?
   strength          Int      @default(10)
@@ -238,6 +240,10 @@ model Companion {
 
   // Quests this NPC can give
   questIds String[]
+
+  // Combat AI
+  archetype      String @default("opportunist") // scrappy_fighter | cautious_healer | opportunist | tank
+  combatSettings Json?                          // Persisted last-known CompanionCombatSettings (optional, for resuming)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -518,8 +518,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const companions = await ZoneService.getCompanionsInZone(zoneId);
 
     for (const companion of companions) {
-      const controller = new NPCAIController(companion);
+      const controller = new NPCAIController(companion, this.llmService);
       this.npcControllers.set(companion.id, controller);
+      this.companionToZone.set(companion.id, zoneId);
       logger.debug({ companionId: companion.id, name: companion.name, zone: zoneId }, 'NPC AI controller initialized');
     }
   }
@@ -6453,6 +6454,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
       if (anyMoved) void this.publishZoneEntities(zoneId, zm);
     }
 
+    // ── Update companion combat AI ────────────────────────────────────────
+    void this.tickCompanionCombat(deltaTime);
+
     if (now - this.lastPartyStatusBroadcastAt >= PARTY_STATUS_INTERVAL_MS) {
       void this.broadcastPartyStatus();
       this.lastPartyStatusBroadcastAt = now;
@@ -6838,6 +6842,216 @@ export class DistributedWorldManager implements IWildlifeWorld {
     await this.broadcastNearbyUpdate(zoneId);
 
     logger.debug({ characterId, reason, source, position: finalPosition }, 'Movement completed');
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Companion Combat AI Tick
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Tick all companion combat controllers.
+   *
+   * For each companion currently in combat (or near hostile entities),
+   * runs the behavior tree and applies movement + ability outputs.
+   */
+  private async tickCompanionCombat(deltaTime: number): Promise<void> {
+    for (const [companionId, controller] of this.npcControllers) {
+      const zoneId = this.companionToZone.get(companionId);
+      if (!zoneId) continue;
+
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+
+      const companionEntity = zm.getEntity(companionId);
+      if (!companionEntity || !companionEntity.isAlive) continue;
+
+      // Detect if companion should be in combat (hostile entities nearby)
+      const nearbyEntities = zm.getEntitiesInRangeForCombat(companionEntity.position, 30, companionId);
+      const enemies = nearbyEntities.filter(e =>
+        e.isAlive && (e.type === 'mob' || (e.faction === 'hostile'))
+      );
+
+      // Combat lifecycle transitions
+      if (enemies.length > 0 && !controller.inCombat) {
+        controller.enterCombat();
+        this.combatManager.startCombat(companionId, Date.now());
+        zm.setEntityCombatState(companionId, true);
+      } else if (enemies.length === 0 && controller.inCombat) {
+        controller.exitCombat();
+        zm.setEntityCombatState(companionId, false);
+        continue; // Skip tick — just exited combat
+      }
+
+      if (!controller.inCombat) {
+        // Not in combat — run social AI instead (existing behavior)
+        // Social updates are on their own cooldown inside the controller
+        continue;
+      }
+
+      // Build combat context for the behavior tree
+      const combatContext = this.buildCompanionCombatContext(
+        companionId, companionEntity, zm, enemies, nearbyEntities,
+      );
+
+      // Tick the behavior tree
+      const result = await controller.updateCombat(combatContext, deltaTime);
+
+      // Apply movement output
+      if (result.movement) {
+        const newPos = {
+          x: companionEntity.position.x + result.movement.x,
+          y: companionEntity.position.y,
+          z: companionEntity.position.z + result.movement.z,
+        };
+        const physics = zm.getPhysicsSystem();
+        const wallResolved = physics.resolveAgainstStructures(newPos, 0.5);
+        const snapped = zm.updateCompanionPosition(companionId, wallResolved, result.heading ?? 0);
+        void this.broadcastPositionUpdate(companionId, zoneId, snapped);
+      }
+
+      // Apply ability action output
+      if (result.abilityAction) {
+        void this.executeCompanionAbility(
+          companionId, zoneId, result.abilityAction.abilityId, result.abilityAction.targetId, controller,
+        );
+      }
+    }
+  }
+
+  /**
+   * Build the CombatContext for a companion's behavior tree tick.
+   */
+  private buildCompanionCombatContext(
+    companionId: string,
+    companionEntity: ReturnType<ZoneManager['getEntity']> & {},
+    zm: ZoneManager,
+    enemies: ReturnType<ZoneManager['getEntitiesInRangeForCombat']>,
+    allNearby: ReturnType<ZoneManager['getEntitiesInRangeForCombat']>,
+  ) {
+    const controller = this.npcControllers.get(companionId)!;
+
+    // Find the owner (first player entity in range — simplified for now)
+    const ownerEntity = allNearby.find(e => e.type === 'player' && e.isAlive) ?? null;
+
+    // Find allies (other companions + players)
+    const allies = allNearby.filter(e =>
+      e.isAlive && e.id !== companionId && (e.type === 'player' || e.type === 'companion')
+    );
+
+    // Map enemies to CombatEntity format
+    const mappedEnemies = enemies.map(e => ({
+      id: e.id,
+      name: e.name,
+      type: e.type as 'mob' | 'wildlife',
+      position: e.position,
+      isAlive: e.isAlive,
+      inCombat: e.inCombat,
+      currentHealth: e.currentHealth,
+      maxHealth: e.maxHealth,
+      level: e.level,
+      tag: e.tag,
+      faction: e.faction,
+    }));
+
+    const mappedAllies = allies.map(e => ({
+      id: e.id,
+      name: e.name,
+      type: e.type as 'player' | 'companion',
+      position: e.position,
+      isAlive: e.isAlive,
+      inCombat: e.inCombat,
+      currentHealth: e.currentHealth,
+      maxHealth: e.maxHealth,
+    }));
+
+    const mappedOwner = ownerEntity ? {
+      id: ownerEntity.id,
+      name: ownerEntity.name,
+      type: 'player' as const,
+      position: ownerEntity.position,
+      isAlive: ownerEntity.isAlive,
+      inCombat: ownerEntity.inCombat,
+      currentHealth: ownerEntity.currentHealth,
+      maxHealth: ownerEntity.maxHealth,
+    } : null;
+
+    // Get cooldown state from CombatManager
+    const now = Date.now();
+    const abilities = controller.getAbilities();
+    const cooldowns = new Map<string, number>();
+    for (const ability of abilities) {
+      const remaining = this.combatManager.getCooldownRemaining(companionId, ability.id, now);
+      if (remaining > 0) cooldowns.set(ability.id, remaining);
+    }
+
+    const combatState = this.combatManager.getCombatState(companionId);
+    const atbCurrent = combatState?.atb.current ?? 0;
+
+    return {
+      self: {
+        id: companionId,
+        position: companionEntity.position,
+        currentHealth: companionEntity.currentHealth ?? 100,
+        maxHealth: companionEntity.maxHealth ?? 100,
+      },
+      owner: mappedOwner,
+      enemies: mappedEnemies,
+      allies: mappedAllies,
+      abilities,
+      cooldowns,
+      atbCurrent,
+      hasAutoAttackTarget: this.combatManager.hasAutoAttackTarget(companionId),
+    };
+  }
+
+  /**
+   * Execute a companion's chosen ability against a target.
+   * Validates ATB, cooldowns, range — then queues or executes.
+   */
+  private async executeCompanionAbility(
+    companionId: string,
+    zoneId: string,
+    abilityId: string,
+    targetId: string,
+    controller: NPCAIController,
+  ): Promise<void> {
+    const ability = controller.getAbilities().find(a => a.id === abilityId);
+    if (!ability) return;
+
+    const now = Date.now();
+
+    // ATB check
+    if (!ability.isFree && !this.combatManager.canSpendAtb(companionId, ability.atbCost)) return;
+
+    // Cooldown check
+    if (this.combatManager.getCooldownRemaining(companionId, abilityId, now) > 0) return;
+
+    // Spend ATB
+    if (!ability.isFree) {
+      this.combatManager.spendAtb(companionId, ability.atbCost);
+    }
+
+    // Set cooldown
+    this.combatManager.setCooldown(companionId, abilityId, ability.cooldown * 1000, now);
+
+    // Record hostile action
+    this.combatManager.recordHostileAction(companionId, now);
+
+    // Set auto-attack target if not already set
+    if (!ability.healing && !this.combatManager.hasAutoAttackTarget(companionId)) {
+      this.combatManager.setAutoAttackTarget(companionId, targetId);
+    }
+
+    // TODO: Execute ability effect (damage/healing) through DamageCalculator
+    // This will be wired once the full ability execution pipeline is standardized
+    // for both players and companions. For now, log the action.
+    logger.info({
+      companionId,
+      abilityId,
+      abilityName: ability.name,
+      targetId,
+      zoneId,
+    }, '[CompanionCombat] Ability used');
   }
 
   private async handleCombatTimeouts(expired: string[]): Promise<void> {
