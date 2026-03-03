@@ -12,6 +12,7 @@ import { GatewayConnectionManager } from './GatewayConnectionManager';
 import { setupAuth, registerAuthRoutes } from '@/auth';
 import { SpawnPointService } from '@/world/SpawnPointService';
 import { createTileDataRouter } from '@/world/tiles/TileDataRouter';
+import { createCivicAnchorRouter } from '@/world/CivicAnchorRouter';
 
 interface GatewayConfig {
   port: number;
@@ -130,6 +131,9 @@ export class GatewayServer {
 
     // Tile terrain data API (for wildlife sim and other external consumers)
     this.app.use('/api/tiles', createTileDataRouter());
+
+    // Civic anchor / corruption map API
+    this.app.use('/api/map', createCivicAnchorRouter());
 
     this.app.get('/api/servers', async (_req, res) => {
       const servers = await this.zoneRegistry.getActiveServers();

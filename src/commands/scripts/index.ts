@@ -33,6 +33,8 @@ import { companionCommand } from './world/companion';
 import { harvestCommand } from './world/harvest';
 import { unstuckCommand } from './world/unstuck';
 import { villageCommand } from './world/village';
+import { arenaCommand, setArenaManager } from './world/arena-command';
+export { setArenaManager };
 import { marketCommand } from './market/market';
 
 /**
@@ -70,6 +72,7 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(harvestCommand);
   registry.register(unstuckCommand);
   registry.register(villageCommand);
+  registry.register(arenaCommand);
 
   // Market commands
   registry.register(marketCommand);

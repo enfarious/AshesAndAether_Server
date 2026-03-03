@@ -6,7 +6,8 @@ import { ZoneManager } from './ZoneManager';
 import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
 import { NPCAIController, LLMService } from '@/ai';
-import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands } from '@/commands';
+import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands, setArenaManager } from '@/commands';
+import { ArenaManager } from '@/arena/ArenaManager';
 import type { CommandContext, CommandEvent } from '@/commands/types';
 import type { Character, Companion } from '@prisma/client';
 import { StatCalculator } from '@/game/stats/StatCalculator';
@@ -142,6 +143,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private commandParser: CommandParser;
   private commandExecutor: CommandExecutor | null = null;
 
+  // Arena system
+  private arenaManager: ArenaManager;
+
   // ── Loot system ────────────────────────────────────────────────────────────
   /** characterId → socketId for targeted loot messages */
   private _charToSocket: Map<string, string> = new Map();
@@ -235,6 +239,39 @@ export class DistributedWorldManager implements IWildlifeWorld {
     registerAllCommands(this.commandRegistry);
 
     logger.info({ commandCount: this.commandRegistry.getCount() }, 'Command system initialized');
+
+    // Initialize arena system
+    this.arenaManager = new ArenaManager(
+      // broadcast: send an event to specific character IDs via the gateway
+      (instanceId, recipientIds, event, data) => {
+        for (const charId of recipientIds) {
+          const sid = this._charToSocket.get(charId);
+          if (!sid) continue;
+          void this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: charId,
+            socketId: sid,
+            payload: { socketId: sid, event, data },
+            timestamp: Date.now(),
+          });
+        }
+      },
+      // setCombatEnabled: placeholder — ArenaManager.isCombatEnabled() is the
+      // query-side gate; this callback is for future CombatManager integration
+      (_instanceId, _combatantIds, _enabled) => {
+        // TODO: wire into CombatManager PvP gating when that system exists
+      },
+      // setAIActive: toggle NPC AI controllers on/off
+      (entityId, active) => {
+        const controller = this.npcControllers.get(entityId);
+        if (controller) {
+          logger.debug({ entityId, active }, 'Arena toggling AI');
+          // NPCAIController doesn't have pause/resume yet — stub for now
+        }
+      },
+    );
+    setArenaManager(this.arenaManager);
+    logger.info('Arena system initialized');
   }
 
   /**
@@ -312,9 +349,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
             movementSpeed: entitySpeed,
           });
         },
-        onEntityDeath: (entity) => {
+        onEntityDeath: (entity, killerId) => {
           zoneManager.removeWildlife(entity.id);
           void this.broadcastNearbyUpdate(zone.id);
+          // Award loot to the player who killed it
+          if (killerId && this._charToSocket.has(killerId)) {
+            void this._awardWildlifeLoot(entity, killerId);
+          }
         },
       });
       wildlifeManager.setDataProviders({
@@ -1633,7 +1674,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
             context.position,
             plantId,
           );
-          overrideResponse = { success: harvestResult.success, message: harvestResult.message };
+          overrideResponse = { success: harvestResult.success, message: harvestResult.message, data: harvestResult.data };
           break;
         }
         case 'unstuck': {
@@ -2810,7 +2851,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
     target: string
   ): { message: string; data: any } | null {
     const entity = zoneManager.getEntity(target) || zoneManager.findEntityByName(target);
-    if (!entity) return null;
+    if (!entity) {
+      // Plants live in FloraManager, not ZoneManager — check there as fallback
+      return this._describePlantTarget(context, target);
+    }
 
     // Use horizontal distance — consistent with melee range checks and avoids
     // Y-axis drift from differing terrain datasets inflating the displayed range.
@@ -2862,6 +2906,47 @@ export class DistributedWorldManager implements IWildlifeWorld {
       if (entity.notorious) peek.notorious = true;
       if (entity.tag)       peek.tag       = entity.tag;
     }
+
+    return {
+      message,
+      data: {
+        type: 'look',
+        target: peek,
+      },
+    };
+  }
+
+  private _describePlantTarget(
+    context: CommandContext,
+    target: string
+  ): { message: string; data: any } | null {
+    const flora = this.floraManagers.get(context.zoneId);
+    if (!flora) return null;
+
+    const plant = flora.getPlant(target);
+    if (!plant) return null;
+
+    const species = getPlantSpecies(plant.speciesId);
+    const name = species?.name ?? plant.speciesId;
+
+    const dx = plant.position.x - context.position.x;
+    const dz = plant.position.z - context.position.z;
+    const range = Math.round(Math.sqrt(dx * dx + dz * dz) * 100) / 100;
+
+    const header = `${name} is ${range}m away.`;
+    const description = species?.description ?? null;
+    const message = description ? `${header}\n${description}` : header;
+
+    const peek: Record<string, unknown> = {
+      id:          plant.id,
+      name,
+      entityType:  'plant',
+      isAlive:     plant.isAlive,
+      inCombat:    false,
+      range,
+      description,
+      growthStage: plant.currentStage,
+    };
 
     return {
       message,
@@ -4392,7 +4477,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     zoneId: string,
     position: Vector3,
     plantId?: string,
-  ): Promise<{ success: boolean; message: string }> {
+  ): Promise<{ success: boolean; message: string; data?: any }> {
     const flora = this.floraManagers.get(zoneId);
     if (!flora) return { success: false, message: 'No flora in this zone.' };
 
@@ -4407,19 +4492,39 @@ export class DistributedWorldManager implements IWildlifeWorld {
         return da - db;
       });
       targetId = nearby[0]!.id;
+    } else {
+      // Range check for direct-ID harvests (e.g. from target menu)
+      const plant = flora.getPlant(targetId);
+      if (plant) {
+        const dx = plant.position.x - position.x;
+        const dz = plant.position.z - position.z;
+        if (Math.hypot(dx, dz) > 5) {
+          return { success: false, message: 'Too far away to harvest.' };
+        }
+      }
     }
 
     const items = flora.harvest(targetId, characterId);
     if (!items) return { success: false, message: 'That cannot be harvested right now.' };
 
-    // Award items
-    await this._awardHarvestItems(characterId, items);
+    // Items are awarded by the onPlantHarvest callback (fired inside flora.harvest),
+    // which also sends inventory_update — no need to call _awardHarvestItems here.
+
+    // Resolve plant display name from species
+    const plant = flora.getPlant(targetId);
+    const species = plant ? getPlantSpecies(plant.speciesId) : undefined;
+    const plantName = species?.name ?? targetId;
 
     return {
       success: true,
       message: items.length > 0
         ? `You harvest: ${items.map(i => `${i.itemId} ×${i.quantity}`).join(', ')}.`
         : 'You harvest the plant but find nothing useful.',
+      data: {
+        type: 'harvest',
+        plantName,
+        items: items.map(i => ({ name: i.itemId, quantity: i.quantity })),
+      },
     };
   }
 
@@ -4452,6 +4557,54 @@ export class DistributedWorldManager implements IWildlifeWorld {
       });
     } catch (err) {
       logger.warn({ characterId, err }, '[Flora] Failed to send inventory update after harvest');
+    }
+  }
+
+  private async _awardWildlifeLoot(
+    entity: { speciesId: string; name: string },
+    characterId: string,
+  ): Promise<void> {
+    const species = getSpecies(entity.speciesId);
+    if (!species || species.lootTable.length === 0) return;
+
+    // Roll loot from the species definition
+    const items: Array<{ itemId: string; quantity: number }> = [];
+    for (const entry of species.lootTable) {
+      if (Math.random() > entry.chance) continue;
+      const qty = Math.floor(
+        Math.random() * (entry.quantity.max - entry.quantity.min + 1) + entry.quantity.min,
+      );
+      if (qty > 0) items.push({ itemId: entry.itemId, quantity: qty });
+    }
+
+    if (items.length === 0) return;
+
+    // Award via the same path as flora harvesting
+    await this._awardHarvestItems(characterId, items);
+
+    // Notify chat
+    const socketId = this._charToSocket.get(characterId);
+    if (socketId) {
+      const text = `You loot ${entity.name}: ${items.map(i => `${i.itemId} ×${i.quantity}`).join(', ')}.`;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: {
+          socketId,
+          event: 'command_response',
+          data: {
+            success: true,
+            message: text,
+            data: {
+              type: 'harvest',
+              plantName: entity.name,
+              items: items.map(i => ({ name: i.itemId, quantity: i.quantity })),
+            },
+          },
+        } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
     }
   }
 

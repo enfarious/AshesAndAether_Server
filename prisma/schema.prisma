@@ -796,3 +796,44 @@ model VillageStructure {
   @@index([villageId])
   @@map("village_structures")
 }
+
+// ============================================================================
+// CIVIC ANCHOR SYSTEM (Ward Anchors)
+// ============================================================================
+
+model CivicAnchor {
+  id          String   @id @default(uuid())
+  type        String   // TOWNHALL or LIBRARY
+  name        String
+  description String?
+
+  // Real-world coordinates (from OSM)
+  lat Float
+  lon Float
+
+  // Game-world coordinates (derived from lat/lon)
+  worldX Float
+  worldY Float @default(0)
+  worldZ Float
+
+  // Ward effect parameters
+  wardRadius   Float // Meters - radius of full ward protection
+  wardStrength Float // Corruption rate within ward (negative = reduction)
+
+  // Zone association
+  zoneId String
+
+  // OSM provenance
+  osmId   Int    @unique
+  osmType String @default("way") // "node" or "way"
+  metadata Json?
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([zoneId])
+  @@index([type])
+  @@index([lat, lon])
+  @@map("civic_anchors")
+}

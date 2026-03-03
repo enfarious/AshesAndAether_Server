@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ashes & Aether - Corruption Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0a0a; color: #e0e0e0; }
+
+    #map { width: 100vw; height: 100vh; }
+
+    /* Dark map tiles */
+    .leaflet-tile-pane { filter: saturate(0.3) brightness(0.6); }
+    .leaflet-control-attribution { background: rgba(0,0,0,0.7) !important; color: #666 !important; }
+    .leaflet-control-attribution a { color: #888 !important; }
+    .leaflet-control-zoom a {
+      background: rgba(20,20,20,0.9) !important;
+      color: #ccc !important;
+      border-color: #333 !important;
+    }
+
+    /* Title overlay */
+    #title-bar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+      background: linear-gradient(180deg, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0) 100%);
+      padding: 16px 24px 32px; pointer-events: none;
+    }
+    #title-bar h1 {
+      font-size: 18px; font-weight: 600; letter-spacing: 1px;
+      color: #c0a060; text-transform: uppercase;
+    }
+    #title-bar .subtitle { font-size: 12px; color: #777; margin-top: 2px; }
+
+    /* Legend */
+    #legend {
+      position: fixed; bottom: 24px; left: 24px; z-index: 1000;
+      background: rgba(10,10,10,0.92); border: 1px solid #333; border-radius: 8px;
+      padding: 16px; min-width: 200px;
+    }
+    #legend h3 { font-size: 13px; color: #c0a060; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .legend-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 12px; }
+    .legend-swatch {
+      width: 24px; height: 14px; border-radius: 3px; flex-shrink: 0;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .legend-label { color: #bbb; }
+    .legend-rate { color: #777; margin-left: auto; font-family: monospace; font-size: 11px; }
+
+    /* Controls */
+    #controls {
+      position: fixed; bottom: 24px; right: 24px; z-index: 1000;
+      background: rgba(10,10,10,0.92); border: 1px solid #333; border-radius: 8px;
+      padding: 16px;
+    }
+    #controls label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: #bbb; }
+    #controls input[type="checkbox"] { accent-color: #c0a060; }
+    #controls .control-row { margin-bottom: 8px; }
+    #controls .control-row:last-child { margin-bottom: 0; }
+
+    /* Anchor popups */
+    .leaflet-popup-content-wrapper {
+      background: rgba(15,15,15,0.95) !important;
+      color: #ddd !important; border: 1px solid #444 !important;
+      border-radius: 6px !important;
+    }
+    .leaflet-popup-tip { background: rgba(15,15,15,0.95) !important; }
+    .anchor-popup h4 { color: #c0a060; margin-bottom: 6px; font-size: 14px; }
+    .anchor-popup .type-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .anchor-popup .type-badge.townhall { background: rgba(80,180,80,0.2); color: #6c6; }
+    .anchor-popup .type-badge.library { background: rgba(80,140,220,0.2); color: #8ae; }
+    .anchor-popup .detail { font-size: 12px; color: #999; margin-bottom: 3px; }
+    .anchor-popup .detail span { color: #ccc; }
+
+    /* Loading overlay */
+    #loading {
+      position: fixed; inset: 0; z-index: 2000;
+      background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 12px;
+      transition: opacity 0.5s ease;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+    #loading .spinner {
+      width: 32px; height: 32px; border: 3px solid #333;
+      border-top-color: #c0a060; border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    #loading .text { color: #777; font-size: 13px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Anchor marker icons */
+    .anchor-icon {
+      display: flex; align-items: center; justify-content: center;
+      width: 28px; height: 28px; border-radius: 50%;
+      font-size: 14px; font-weight: bold;
+      box-shadow: 0 0 12px rgba(0,0,0,0.5);
+      border: 2px solid rgba(255,255,255,0.3);
+      transition: transform 0.2s;
+    }
+    .anchor-icon:hover { transform: scale(1.2); }
+    .anchor-icon.townhall { background: rgba(40,120,40,0.9); color: #fff; }
+    .anchor-icon.library { background: rgba(40,80,160,0.9); color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div class="spinner"></div>
+    <div class="text">Loading corruption data...</div>
+  </div>
+
+  <div id="title-bar">
+    <h1>Ashes & Aether</h1>
+    <div class="subtitle">Corruption Map - Ward Anchor Visualization</div>
+  </div>
+
+  <div id="map"></div>
+
+  <div id="legend">
+    <h3>Corruption Gradient</h3>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(0,220,80,0.7);"></div>
+      <span class="legend-label">Ward Zone</span>
+      <span class="legend-rate">-0.05/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(200,200,40,0.7);"></div>
+      <span class="legend-label">Wilds</span>
+      <span class="legend-rate">0.00/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(220,140,20,0.7);"></div>
+      <span class="legend-label">Ruins Edge</span>
+      <span class="legend-rate">+0.02/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(200,40,20,0.7);"></div>
+      <span class="legend-label">Old City Core</span>
+      <span class="legend-rate">+0.06/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(100,0,30,0.7);"></div>
+      <span class="legend-label">Deep Zones</span>
+      <span class="legend-rate">+0.12/m</span>
+    </div>
+    <hr style="border-color: #333; margin: 10px 0;">
+    <div class="legend-row">
+      <div class="anchor-icon townhall" style="width:18px;height:18px;font-size:10px;">T</div>
+      <span class="legend-label">Town Hall</span>
+      <span class="legend-rate">500m</span>
+    </div>
+    <div class="legend-row">
+      <div class="anchor-icon library" style="width:18px;height:18px;font-size:10px;">L</div>
+      <span class="legend-label">Library</span>
+      <span class="legend-rate">300m</span>
+    </div>
+  </div>
+
+  <div id="controls">
+    <div class="control-row">
+      <label>
+        <input type="checkbox" id="toggle-night"> Night Mode
+      </label>
+    </div>
+    <div class="control-row">
+      <label>
+        <input type="checkbox" id="toggle-radii" checked> Show Ward Radii
+      </label>
+    </div>
+    <div class="control-row">
+      <label>
+        <input type="checkbox" id="toggle-gradient" checked> Show Corruption
+      </label>
+    </div>
+  </div>
+
+  <script>
+    // ============================================================================
+    // CORRUPTION MAP - Client-side gradient rendering
+    // ============================================================================
+
+    const STEPHENTOWN = [42.5513, -73.3792];
+    const DEFAULT_ZOOM = 14;
+
+    // Color stops for corruption gradient (rate -> [r, g, b, a])
+    // Interpolated based on distance from nearest anchor
+    const COLOR_RAMP = [
+      { t: 0.0, color: [0, 220, 80, 0.45] },   // Ward zone - green
+      { t: 0.25, color: [120, 200, 40, 0.30] },  // Transition
+      { t: 0.4, color: [200, 200, 40, 0.25] },   // Wilds - yellow
+      { t: 0.6, color: [220, 140, 20, 0.35] },   // Ruins edge - orange
+      { t: 0.8, color: [200, 40, 20, 0.45] },    // Old city core - red
+      { t: 1.0, color: [100, 0, 30, 0.55] },     // Deep zones - dark crimson
+    ];
+
+    let map, corruptionLayer, anchors = [], wardCircles = [];
+    let isNight = false;
+
+    // ---- Initialize Map ----
+    function initMap() {
+      map = L.map('map', {
+        center: STEPHENTOWN,
+        zoom: DEFAULT_ZOOM,
+        zoomControl: true,
+        maxZoom: 18,
+        minZoom: 10,
+      });
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors | Ashes & Aether',
+        maxZoom: 19,
+      }).addTo(map);
+    }
+
+    // ---- Fetch Data ----
+    async function fetchAnchors() {
+      try {
+        const res = await fetch('/api/map/anchors');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        return data.anchors || [];
+      } catch (e) {
+        console.warn('Failed to fetch anchors, using fallback data:', e);
+        // Fallback: hardcoded from OSM data for offline/dev use
+        return [
+          {
+            type: 'TOWNHALL', name: 'Stephentown Town Hall',
+            lat: 42.551353, lon: -73.379220,
+            wardRadius: 500, wardStrength: -0.05,
+          },
+          {
+            type: 'LIBRARY', name: 'Stephentown Memorial Library',
+            lat: 42.550698, lon: -73.380773,
+            wardRadius: 300, wardStrength: -0.03,
+          },
+        ];
+      }
+    }
+
+    // ---- Distance Calculation ----
+    // Equirectangular approximation (accurate enough for small areas)
+    function distanceMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const avgLat = (lat1 + lat2) / 2 * Math.PI / 180;
+      const x = dLon * Math.cos(avgLat);
+      return Math.sqrt(dLat * dLat + x * x) * R;
+    }
+
+    // ---- Corruption Value ----
+    // Returns 0.0 (fully warded) to 1.0 (deep corruption) based on distance to nearest anchor
+    function getCorruptionLevel(lat, lon) {
+      let minDist = Infinity;
+      let nearestRadius = 500;
+
+      for (const a of anchors) {
+        const d = distanceMeters(lat, lon, a.lat, a.lon);
+        if (d < minDist) {
+          minDist = d;
+          nearestRadius = a.wardRadius;
+        }
+      }
+
+      if (anchors.length === 0) return 1.0;
+
+      // Distance bands relative to nearest anchor's ward radius
+      const r = nearestRadius;
+      if (minDist <= r) return 0.0;                                    // Ward zone
+      if (minDist <= r * 2) return 0.25 * ((minDist - r) / r);       // Ward -> Wilds
+      if (minDist <= r * 4) return 0.25 + 0.35 * ((minDist - r*2) / (r*2)); // Wilds -> Ruins
+      if (minDist <= r * 8) return 0.6 + 0.3 * ((minDist - r*4) / (r*4));   // Ruins -> Core
+      return 0.9 + 0.1 * Math.min(1, (minDist - r*8) / (r*4));       // Core -> Deep
+    }
+
+    // ---- Color Interpolation ----
+    function getCorruptionColor(t) {
+      // Apply night multiplier
+      if (isNight) {
+        t = Math.min(1.0, t * 1.4);
+      }
+
+      // Find the two stops to interpolate between
+      for (let i = 0; i < COLOR_RAMP.length - 1; i++) {
+        const a = COLOR_RAMP[i];
+        const b = COLOR_RAMP[i + 1];
+        if (t >= a.t && t <= b.t) {
+          const f = (t - a.t) / (b.t - a.t);
+          return [
+            Math.round(a.color[0] + (b.color[0] - a.color[0]) * f),
+            Math.round(a.color[1] + (b.color[1] - a.color[1]) * f),
+            Math.round(a.color[2] + (b.color[2] - a.color[2]) * f),
+            a.color[3] + (b.color[3] - a.color[3]) * f,
+          ];
+        }
+      }
+      const last = COLOR_RAMP[COLOR_RAMP.length - 1];
+      return [...last.color];
+    }
+
+    // ---- Canvas Overlay Layer ----
+    const CorruptionOverlay = L.Layer.extend({
+      onAdd(map) {
+        this._map = map;
+        this._canvas = L.DomUtil.create('canvas', 'corruption-canvas');
+        this._canvas.style.position = 'absolute';
+        this._canvas.style.pointerEvents = 'none';
+        this._canvas.style.zIndex = '250';
+        map.getPanes().overlayPane.appendChild(this._canvas);
+
+        map.on('moveend zoomend resize', this._render, this);
+        this._render();
+      },
+
+      onRemove(map) {
+        map.getPanes().overlayPane.removeChild(this._canvas);
+        map.off('moveend zoomend resize', this._render, this);
+      },
+
+      _render() {
+        if (!this._map) return;
+        const mapSize = this._map.getSize();
+        const canvas = this._canvas;
+
+        // Position canvas to cover the map viewport
+        const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+        L.DomUtil.setPosition(canvas, topLeft);
+        canvas.width = mapSize.x;
+        canvas.height = mapSize.y;
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        // Render at 1/4 resolution for performance
+        const scale = 4;
+        const w = Math.ceil(mapSize.x / scale);
+        const h = Math.ceil(mapSize.y / scale);
+
+        const offscreen = document.createElement('canvas');
+        offscreen.width = w;
+        offscreen.height = h;
+        const offCtx = offscreen.getContext('2d');
+        if (!offCtx) return;
+
+        const imageData = offCtx.createImageData(w, h);
+        const data = imageData.data;
+
+        for (let py = 0; py < h; py++) {
+          for (let px = 0; px < w; px++) {
+            const containerPt = L.point(px * scale, py * scale);
+            const latlng = this._map.containerPointToLatLng(containerPt);
+
+            const corruption = getCorruptionLevel(latlng.lat, latlng.lng);
+            const color = getCorruptionColor(corruption);
+
+            const idx = (py * w + px) * 4;
+            data[idx] = color[0];
+            data[idx + 1] = color[1];
+            data[idx + 2] = color[2];
+            data[idx + 3] = Math.round(color[3] * 255);
+          }
+        }
+
+        offCtx.putImageData(imageData, 0, 0);
+
+        // Scale up to full resolution
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(offscreen, 0, 0, w, h, 0, 0, mapSize.x, mapSize.y);
+      },
+
+      redraw() {
+        this._render();
+      }
+    });
+
+    // ---- Add Anchor Markers ----
+    function addAnchorMarkers() {
+      for (const a of anchors) {
+        const isHall = a.type === 'TOWNHALL';
+        const icon = L.divIcon({
+          className: '',
+          html: `<div class="anchor-icon ${isHall ? 'townhall' : 'library'}">${isHall ? 'T' : 'L'}</div>`,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        });
+
+        const marker = L.marker([a.lat, a.lon], { icon }).addTo(map);
+
+        const meta = a.metadata || {};
+        const addr = [meta['addr:housenumber'], meta['addr:street']].filter(Boolean).join(' ');
+
+        marker.bindPopup(`
+          <div class="anchor-popup">
+            <h4>${a.name}</h4>
+            <div class="type-badge ${isHall ? 'townhall' : 'library'}">${a.type}</div>
+            <div class="detail">Ward Radius: <span>${a.wardRadius}m</span></div>
+            <div class="detail">Ward Strength: <span>${a.wardStrength}/min</span></div>
+            ${addr ? `<div class="detail">Address: <span>${addr}</span></div>` : ''}
+            ${meta.phone ? `<div class="detail">Phone: <span>${meta.phone}</span></div>` : ''}
+            ${meta.opening_hours ? `<div class="detail">Hours: <span>${meta.opening_hours}</span></div>` : ''}
+          </div>
+        `);
+      }
+    }
+
+    // ---- Ward Radius Circles ----
+    function addWardCircles() {
+      for (const a of anchors) {
+        const isHall = a.type === 'TOWNHALL';
+        const circle = L.circle([a.lat, a.lon], {
+          radius: a.wardRadius,
+          color: isHall ? '#4c8' : '#68c',
+          weight: 1.5,
+          opacity: 0.6,
+          fillColor: isHall ? '#4c8' : '#68c',
+          fillOpacity: 0.06,
+          dashArray: '6, 4',
+        }).addTo(map);
+
+        wardCircles.push(circle);
+      }
+    }
+
+    function toggleWardCircles(show) {
+      wardCircles.forEach(c => show ? c.addTo(map) : c.remove());
+    }
+
+    // ---- Controls ----
+    function setupControls() {
+      document.getElementById('toggle-night').addEventListener('change', (e) => {
+        isNight = e.target.checked;
+        if (corruptionLayer) corruptionLayer.redraw();
+
+        // Darken the base tiles at night
+        const tilePane = document.querySelector('.leaflet-tile-pane');
+        if (tilePane) {
+          tilePane.style.filter = isNight
+            ? 'saturate(0.15) brightness(0.35)'
+            : 'saturate(0.3) brightness(0.6)';
+        }
+      });
+
+      document.getElementById('toggle-radii').addEventListener('change', (e) => {
+        toggleWardCircles(e.target.checked);
+      });
+
+      document.getElementById('toggle-gradient').addEventListener('change', (e) => {
+        if (e.target.checked) {
+          corruptionLayer.addTo(map);
+        } else {
+          corruptionLayer.remove();
+        }
+      });
+    }
+
+    // ---- Main ----
+    async function main() {
+      initMap();
+
+      anchors = await fetchAnchors();
+      console.log(`Loaded ${anchors.length} civic anchors`);
+
+      // Add corruption gradient overlay
+      corruptionLayer = new CorruptionOverlay();
+      corruptionLayer.addTo(map);
+
+      // Add markers and ward circles
+      addAnchorMarkers();
+      addWardCircles();
+
+      // Wire up controls
+      setupControls();
+
+      // If we have anchors, fit map to show them all with some padding
+      if (anchors.length > 0) {
+        const bounds = L.latLngBounds(anchors.map(a => [a.lat, a.lon]));
+        map.fitBounds(bounds.pad(0.8));
+      }
+
+      // Hide loading screen
+      const loading = document.getElementById('loading');
+      loading.classList.add('hidden');
+      setTimeout(() => loading.remove(), 600);
+    }
+
+    main();
+  </script>
+</body>
+</html>

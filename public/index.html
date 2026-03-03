@@ -1,159 +1,648 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Ashes & Aether: Life at the Shatterline</title>
-    <style>
-      * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-      }
-      body {
-        font-family:
-          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        background: linear-gradient(
-          135deg,
-          #1a1a2e 0%,
-          #16213e 50%,
-          #0f3460 100%
-        );
-        min-height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: #e8e8e8;
-      }
-      .container {
-        text-align: center;
-        padding: 2rem;
-        max-width: 600px;
-      }
-      h1 {
-        font-size: 2.5rem;
-        margin-bottom: 0.5rem;
-        background: linear-gradient(90deg, #e94560, #f39c12);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-      }
-      .subtitle {
-        font-size: 1.2rem;
-        color: #a8a8a8;
-        margin-bottom: 2rem;
-      }
-      .status {
-        background: rgba(255, 255, 255, 0.1);
-        border-radius: 8px;
-        padding: 1.5rem;
-        margin-bottom: 2rem;
-      }
-      .status h2 {
-        font-size: 1rem;
-        color: #6dd5ed;
-        margin-bottom: 0.5rem;
-      }
-      .status p {
-        color: #ccc;
-      }
-      .btn {
-        display: inline-block;
-        padding: 0.75rem 2rem;
-        background: linear-gradient(90deg, #e94560, #f39c12);
-        color: white;
-        text-decoration: none;
-        border-radius: 4px;
-        font-weight: 600;
-        transition:
-          transform 0.2s,
-          box-shadow 0.2s;
-      }
-      .btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 20px rgba(233, 69, 96, 0.4);
-      }
-      .user-info {
-        margin-top: 2rem;
-        padding: 1rem;
-        background: rgba(255, 255, 255, 0.05);
-        border-radius: 8px;
-      }
-      .user-info img {
-        width: 48px;
-        height: 48px;
-        border-radius: 50%;
-        margin-bottom: 0.5rem;
-      }
-      .hidden {
-        display: none;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>Ashes & Aether</h1>
-      <p class="subtitle">Life at the Shatterline</p>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ashes & Aether: Life at the Shatterline</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #0a0a0a; color: #e0e0e0;
+      overflow: hidden;
+    }
 
-      <div class="status">
-        <h2>Gateway Status</h2>
-        <p id="status">Checking connection...</p>
+    /* ---- Map (full viewport background) ---- */
+    #map { position: fixed; inset: 0; z-index: 0; }
+    .leaflet-tile-pane { filter: saturate(0.3) brightness(0.6); }
+    .leaflet-control-attribution { background: rgba(0,0,0,0.7) !important; color: #666 !important; }
+    .leaflet-control-attribution a { color: #888 !important; }
+    .leaflet-control-zoom a {
+      background: rgba(20,20,20,0.9) !important;
+      color: #ccc !important;
+      border-color: #333 !important;
+    }
+
+    /* ---- Hero Panel (centered overlay) ---- */
+    #hero {
+      position: fixed; z-index: 1000;
+      top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background: rgba(8, 8, 12, 0.88);
+      border: 1px solid rgba(192, 160, 96, 0.25);
+      border-radius: 12px;
+      padding: 40px 48px;
+      text-align: center;
+      min-width: 360px; max-width: 440px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 0 60px rgba(0,0,0,0.6), 0 0 120px rgba(192,160,96,0.05);
+      opacity: 0; transform: translate(-50%, -48%);
+      transition: opacity 0.8s ease, transform 0.8s ease;
+    }
+    #hero.visible {
+      opacity: 1; transform: translate(-50%, -50%);
+    }
+    #hero.minimized {
+      top: 20px; left: 50%; transform: translate(-50%, 0);
+      padding: 12px 24px; min-width: 0;
+      opacity: 0.92;
+    }
+    #hero.minimized .hero-body { display: none; }
+    #hero.minimized h1 { font-size: 14px; margin-bottom: 0; }
+    #hero.minimized .subtitle { display: none; }
+
+    #hero h1 {
+      font-size: 2.2rem; font-weight: 700; margin-bottom: 4px;
+      letter-spacing: 1px;
+      background: linear-gradient(135deg, #c0a060, #e8c878, #c0a060);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    #hero .subtitle {
+      font-size: 0.95rem; color: #776a50; margin-bottom: 28px;
+      letter-spacing: 0.5px;
+    }
+
+    /* Status indicator */
+    .status-row {
+      display: flex; align-items: center; justify-content: center;
+      gap: 8px; margin-bottom: 20px; font-size: 13px; color: #888;
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #555; flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .status-dot.online { background: #4c8; box-shadow: 0 0 6px rgba(68,204,136,0.4); }
+    .status-dot.offline { background: #c44; box-shadow: 0 0 6px rgba(204,68,68,0.4); }
+
+    /* Server info badges */
+    .server-info {
+      display: flex; gap: 12px; justify-content: center;
+      margin-bottom: 24px;
+    }
+    .info-badge {
+      font-size: 11px; color: #666;
+      background: rgba(255,255,255,0.04);
+      padding: 4px 10px; border-radius: 4px;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .info-badge span { color: #aaa; }
+
+    /* Auth buttons */
+    .btn {
+      display: inline-block; padding: 10px 28px;
+      background: linear-gradient(135deg, #c0a060, #a08040);
+      color: #1a1a1a; text-decoration: none;
+      border-radius: 6px; font-weight: 600; font-size: 14px;
+      letter-spacing: 0.5px;
+      transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
+      border: none; cursor: pointer;
+    }
+    .btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 20px rgba(192,160,96,0.3);
+      background: linear-gradient(135deg, #d0b070, #b09050);
+    }
+    .btn-secondary {
+      background: rgba(255,255,255,0.08);
+      color: #999;
+    }
+    .btn-secondary:hover {
+      background: rgba(255,255,255,0.12);
+      box-shadow: none; color: #bbb;
+    }
+
+    .user-info { margin-top: 8px; }
+    .user-info img { width: 40px; height: 40px; border-radius: 50%; margin-bottom: 6px; border: 2px solid rgba(192,160,96,0.3); }
+    .user-info .username { color: #c0a060; font-weight: 600; font-size: 15px; margin-bottom: 12px; }
+
+    .hidden { display: none; }
+
+    /* Minimize/expand toggle */
+    #hero-toggle {
+      position: absolute; top: 8px; right: 12px;
+      background: none; border: none; color: #666;
+      cursor: pointer; font-size: 16px; padding: 4px 8px;
+      border-radius: 4px; transition: color 0.2s;
+    }
+    #hero-toggle:hover { color: #aaa; }
+
+    /* ---- Legend (bottom-left) ---- */
+    #legend {
+      position: fixed; bottom: 24px; left: 24px; z-index: 1000;
+      background: rgba(10,10,10,0.92); border: 1px solid #333; border-radius: 8px;
+      padding: 14px 16px; min-width: 190px;
+      transition: opacity 0.3s, transform 0.3s;
+    }
+    #legend.hidden-panel { opacity: 0; transform: translateY(10px); pointer-events: none; }
+    #legend h3 { font-size: 11px; color: #c0a060; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .legend-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 11px; }
+    .legend-swatch {
+      width: 20px; height: 12px; border-radius: 2px; flex-shrink: 0;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .legend-label { color: #999; }
+    .legend-rate { color: #666; margin-left: auto; font-family: monospace; font-size: 10px; }
+    .legend-divider { border-color: #2a2a2a; margin: 6px 0; }
+
+    /* ---- Controls (bottom-right) ---- */
+    #controls {
+      position: fixed; bottom: 24px; right: 24px; z-index: 1000;
+      background: rgba(10,10,10,0.92); border: 1px solid #333; border-radius: 8px;
+      padding: 14px 16px;
+      transition: opacity 0.3s, transform 0.3s;
+    }
+    #controls.hidden-panel { opacity: 0; transform: translateY(10px); pointer-events: none; }
+    #controls label { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; color: #999; }
+    #controls input[type="checkbox"] { accent-color: #c0a060; }
+    #controls .control-row { margin-bottom: 6px; }
+    #controls .control-row:last-child { margin-bottom: 0; }
+
+    /* ---- Anchor popups ---- */
+    .leaflet-popup-content-wrapper {
+      background: rgba(15,15,15,0.95) !important;
+      color: #ddd !important; border: 1px solid #444 !important;
+      border-radius: 6px !important;
+    }
+    .leaflet-popup-tip { background: rgba(15,15,15,0.95) !important; }
+    .anchor-popup h4 { color: #c0a060; margin-bottom: 6px; font-size: 14px; }
+    .anchor-popup .type-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .anchor-popup .type-badge.townhall { background: rgba(80,180,80,0.2); color: #6c6; }
+    .anchor-popup .type-badge.library { background: rgba(80,140,220,0.2); color: #8ae; }
+    .anchor-popup .detail { font-size: 12px; color: #999; margin-bottom: 3px; }
+    .anchor-popup .detail span { color: #ccc; }
+
+    /* ---- Anchor marker icons ---- */
+    .anchor-icon {
+      display: flex; align-items: center; justify-content: center;
+      width: 28px; height: 28px; border-radius: 50%;
+      font-size: 14px; font-weight: bold;
+      box-shadow: 0 0 12px rgba(0,0,0,0.5);
+      border: 2px solid rgba(255,255,255,0.3);
+      transition: transform 0.2s;
+    }
+    .anchor-icon:hover { transform: scale(1.2); }
+    .anchor-icon.townhall { background: rgba(40,120,40,0.9); color: #fff; }
+    .anchor-icon.library { background: rgba(40,80,160,0.9); color: #fff; }
+
+    /* ---- Loading screen ---- */
+    #loading {
+      position: fixed; inset: 0; z-index: 2000;
+      background: #0a0a0a;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 16px;
+      transition: opacity 0.6s ease;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+    #loading h2 {
+      font-size: 1.6rem; font-weight: 700; letter-spacing: 1px;
+      background: linear-gradient(135deg, #c0a060, #e8c878, #c0a060);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    #loading .spinner {
+      width: 28px; height: 28px; border: 2px solid #222;
+      border-top-color: #c0a060; border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    #loading .text { color: #555; font-size: 12px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <!-- Loading screen -->
+  <div id="loading">
+    <h2>Ashes & Aether</h2>
+    <div class="spinner"></div>
+    <div class="text">Scanning ward anchors...</div>
+  </div>
+
+  <!-- Full-viewport map -->
+  <div id="map"></div>
+
+  <!-- Hero panel (centered) -->
+  <div id="hero">
+    <button id="hero-toggle" title="Minimize">&#x2715;</button>
+    <h1>Ashes & Aether</h1>
+    <div class="subtitle">Life at the Shatterline</div>
+
+    <div class="hero-body">
+      <!-- Status -->
+      <div class="status-row">
+        <div class="status-dot" id="status-dot"></div>
+        <span id="status-text">Connecting...</span>
       </div>
 
+      <div class="server-info" id="server-info" style="display:none;">
+        <div class="info-badge">Zones <span id="zone-count">-</span></div>
+        <div class="info-badge">Players <span id="player-count">-</span></div>
+        <div class="info-badge">Anchors <span id="anchor-count">-</span></div>
+      </div>
+
+      <!-- Auth -->
       <div id="auth-section">
         <div id="logged-out">
-          <a href="/api/login" class="btn">Sign In to Play</a>
+          <a href="/api/login" class="btn">Enter the Shatterline</a>
         </div>
         <div id="logged-in" class="hidden user-info">
           <img id="user-avatar" src="" alt="Avatar" />
-          <p id="user-name"></p>
-          <p style="margin-top: 1rem">
-            <a href="/api/logout" class="btn" style="background: #555"
-              >Sign Out</a
-            >
-          </p>
+          <div class="username" id="user-name"></div>
+          <div style="display: flex; gap: 8px; justify-content: center;">
+            <a href="/api/logout" class="btn btn-secondary" style="padding: 8px 16px; font-size: 12px;">Sign Out</a>
+          </div>
         </div>
       </div>
     </div>
+  </div>
 
-    <script>
-      async function checkStatus() {
-        try {
-          const res = await fetch("/health");
-          const data = await res.json();
-          document.getElementById("status").textContent =
-            `Server: ${data.status} | Redis: ${data.connected ? "Connected" : "Disconnected"}`;
-        } catch (e) {
-          document.getElementById("status").textContent =
-            "Unable to reach server";
-        }
+  <!-- Legend -->
+  <div id="legend" class="hidden-panel">
+    <h3>Corruption</h3>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(0,220,80,0.7);"></div>
+      <span class="legend-label">Ward Zone</span>
+      <span class="legend-rate">-0.05/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(200,200,40,0.7);"></div>
+      <span class="legend-label">Wilds</span>
+      <span class="legend-rate">0.00/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(220,140,20,0.7);"></div>
+      <span class="legend-label">Ruins Edge</span>
+      <span class="legend-rate">+0.02/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(200,40,20,0.7);"></div>
+      <span class="legend-label">Old Core</span>
+      <span class="legend-rate">+0.06/m</span>
+    </div>
+    <div class="legend-row">
+      <div class="legend-swatch" style="background: rgba(100,0,30,0.7);"></div>
+      <span class="legend-label">Deep Zones</span>
+      <span class="legend-rate">+0.12/m</span>
+    </div>
+    <hr class="legend-divider">
+    <div class="legend-row">
+      <div class="anchor-icon townhall" style="width:16px;height:16px;font-size:9px;">T</div>
+      <span class="legend-label">Town Hall</span>
+      <span class="legend-rate">500m</span>
+    </div>
+    <div class="legend-row">
+      <div class="anchor-icon library" style="width:16px;height:16px;font-size:9px;">L</div>
+      <span class="legend-label">Library</span>
+      <span class="legend-rate">300m</span>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div id="controls" class="hidden-panel">
+    <div class="control-row">
+      <label><input type="checkbox" id="toggle-night"> Night Mode</label>
+    </div>
+    <div class="control-row">
+      <label><input type="checkbox" id="toggle-radii" checked> Ward Radii</label>
+    </div>
+    <div class="control-row">
+      <label><input type="checkbox" id="toggle-gradient" checked> Corruption</label>
+    </div>
+  </div>
+
+  <script>
+    // ========================================================================
+    // ASHES & AETHER - Landing Page with Corruption Map
+    // ========================================================================
+
+    const STEPHENTOWN = [42.5513, -73.3792];
+    const DEFAULT_ZOOM = 14;
+
+    const COLOR_RAMP = [
+      { t: 0.0, color: [0, 220, 80, 0.45] },
+      { t: 0.25, color: [120, 200, 40, 0.30] },
+      { t: 0.4, color: [200, 200, 40, 0.25] },
+      { t: 0.6, color: [220, 140, 20, 0.35] },
+      { t: 0.8, color: [200, 40, 20, 0.45] },
+      { t: 1.0, color: [100, 0, 30, 0.55] },
+    ];
+
+    let map, corruptionLayer, anchors = [], wardCircles = [];
+    let isNight = false;
+    let heroMinimized = false;
+
+    // ---- Map ----
+    function initMap() {
+      map = L.map('map', {
+        center: STEPHENTOWN,
+        zoom: DEFAULT_ZOOM,
+        zoomControl: true,
+        maxZoom: 18,
+        minZoom: 10,
+      });
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap | Ashes & Aether',
+        maxZoom: 19,
+      }).addTo(map);
+    }
+
+    // ---- Data Fetching ----
+    async function fetchAnchors() {
+      try {
+        const res = await fetch('/api/map/anchors');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        return data.anchors || [];
+      } catch (e) {
+        console.warn('Anchor API unavailable, using fallback:', e.message);
+        return [
+          { type: 'TOWNHALL', name: 'Stephentown Town Hall', lat: 42.551353, lon: -73.379220, wardRadius: 500, wardStrength: -0.05 },
+          { type: 'LIBRARY', name: 'Stephentown Memorial Library', lat: 42.550698, lon: -73.380773, wardRadius: 300, wardStrength: -0.03 },
+        ];
       }
+    }
 
-      async function checkAuth() {
-        try {
-          const res = await fetch("/api/auth/user");
-          if (res.ok) {
-            const user = await res.json();
-            document.getElementById("logged-out").classList.add("hidden");
-            document.getElementById("logged-in").classList.remove("hidden");
+    async function fetchServerStatus() {
+      try {
+        const [healthRes, infoRes] = await Promise.all([
+          fetch('/health'),
+          fetch('/api/info'),
+        ]);
+        const health = await healthRes.json();
+        const info = await infoRes.json();
 
-            const name =
-              user.claims?.first_name || user.claims?.email || "Player";
-            document.getElementById("user-name").textContent =
-              `Welcome, ${name}!`;
+        const dot = document.getElementById('status-dot');
+        const text = document.getElementById('status-text');
 
-            if (user.claims?.profile_image_url) {
-              document.getElementById("user-avatar").src =
-                user.claims.profile_image_url;
-            }
+        if (health.status === 'ok') {
+          dot.className = 'status-dot online';
+          text.textContent = health.connected ? 'Online' : 'Server up, Redis disconnected';
+        } else {
+          dot.className = 'status-dot offline';
+          text.textContent = 'Offline';
+        }
+
+        document.getElementById('zone-count').textContent = info.zones || 0;
+        document.getElementById('player-count').textContent = info.players || 0;
+        document.getElementById('server-info').style.display = '';
+      } catch (e) {
+        document.getElementById('status-dot').className = 'status-dot offline';
+        document.getElementById('status-text').textContent = 'Unable to reach server';
+      }
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/auth/user');
+        if (res.ok) {
+          const user = await res.json();
+          document.getElementById('logged-out').classList.add('hidden');
+          document.getElementById('logged-in').classList.remove('hidden');
+          const name = user.claims?.first_name || user.claims?.email || 'Survivor';
+          document.getElementById('user-name').textContent = `Welcome back, ${name}`;
+          if (user.claims?.profile_image_url) {
+            document.getElementById('user-avatar').src = user.claims.profile_image_url;
           }
-        } catch (e) {
-          // Not logged in
+        }
+      } catch (e) { /* Not logged in */ }
+    }
+
+    // ---- Corruption Math ----
+    function distanceMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const avgLat = (lat1 + lat2) / 2 * Math.PI / 180;
+      const x = dLon * Math.cos(avgLat);
+      return Math.sqrt(dLat * dLat + x * x) * R;
+    }
+
+    function getCorruptionLevel(lat, lon) {
+      let minDist = Infinity;
+      let nearestRadius = 500;
+      for (const a of anchors) {
+        const d = distanceMeters(lat, lon, a.lat, a.lon);
+        if (d < minDist) { minDist = d; nearestRadius = a.wardRadius; }
+      }
+      if (anchors.length === 0) return 1.0;
+      const r = nearestRadius;
+      if (minDist <= r) return 0.0;
+      if (minDist <= r * 2) return 0.25 * ((minDist - r) / r);
+      if (minDist <= r * 4) return 0.25 + 0.35 * ((minDist - r*2) / (r*2));
+      if (minDist <= r * 8) return 0.6 + 0.3 * ((minDist - r*4) / (r*4));
+      return 0.9 + 0.1 * Math.min(1, (minDist - r*8) / (r*4));
+    }
+
+    function getCorruptionColor(t) {
+      if (isNight) t = Math.min(1.0, t * 1.4);
+      for (let i = 0; i < COLOR_RAMP.length - 1; i++) {
+        const a = COLOR_RAMP[i], b = COLOR_RAMP[i + 1];
+        if (t >= a.t && t <= b.t) {
+          const f = (t - a.t) / (b.t - a.t);
+          return [
+            Math.round(a.color[0] + (b.color[0] - a.color[0]) * f),
+            Math.round(a.color[1] + (b.color[1] - a.color[1]) * f),
+            Math.round(a.color[2] + (b.color[2] - a.color[2]) * f),
+            a.color[3] + (b.color[3] - a.color[3]) * f,
+          ];
         }
       }
+      return [...COLOR_RAMP[COLOR_RAMP.length - 1].color];
+    }
 
-      checkStatus();
-      checkAuth();
-    </script>
-  </body>
+    // ---- Canvas Overlay ----
+    const CorruptionOverlay = L.Layer.extend({
+      onAdd(map) {
+        this._map = map;
+        this._canvas = L.DomUtil.create('canvas', 'corruption-canvas');
+        this._canvas.style.position = 'absolute';
+        this._canvas.style.pointerEvents = 'none';
+        this._canvas.style.zIndex = '250';
+        map.getPanes().overlayPane.appendChild(this._canvas);
+        map.on('moveend zoomend resize', this._render, this);
+        this._render();
+      },
+      onRemove(map) {
+        map.getPanes().overlayPane.removeChild(this._canvas);
+        map.off('moveend zoomend resize', this._render, this);
+      },
+      _render() {
+        if (!this._map) return;
+        const mapSize = this._map.getSize();
+        const canvas = this._canvas;
+        const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+        L.DomUtil.setPosition(canvas, topLeft);
+        canvas.width = mapSize.x;
+        canvas.height = mapSize.y;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        const scale = 4;
+        const w = Math.ceil(mapSize.x / scale);
+        const h = Math.ceil(mapSize.y / scale);
+        const offscreen = document.createElement('canvas');
+        offscreen.width = w; offscreen.height = h;
+        const offCtx = offscreen.getContext('2d');
+        if (!offCtx) return;
+
+        const imageData = offCtx.createImageData(w, h);
+        const data = imageData.data;
+        for (let py = 0; py < h; py++) {
+          for (let px = 0; px < w; px++) {
+            const latlng = this._map.containerPointToLatLng(L.point(px * scale, py * scale));
+            const corruption = getCorruptionLevel(latlng.lat, latlng.lng);
+            const color = getCorruptionColor(corruption);
+            const idx = (py * w + px) * 4;
+            data[idx] = color[0]; data[idx+1] = color[1];
+            data[idx+2] = color[2]; data[idx+3] = Math.round(color[3] * 255);
+          }
+        }
+        offCtx.putImageData(imageData, 0, 0);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(offscreen, 0, 0, w, h, 0, 0, mapSize.x, mapSize.y);
+      },
+      redraw() { this._render(); }
+    });
+
+    // ---- Markers & Circles ----
+    function addAnchorMarkers() {
+      for (const a of anchors) {
+        const isHall = a.type === 'TOWNHALL';
+        const icon = L.divIcon({
+          className: '',
+          html: `<div class="anchor-icon ${isHall ? 'townhall' : 'library'}">${isHall ? 'T' : 'L'}</div>`,
+          iconSize: [28, 28], iconAnchor: [14, 14],
+        });
+        const marker = L.marker([a.lat, a.lon], { icon }).addTo(map);
+        const meta = a.metadata || {};
+        const addr = [meta['addr:housenumber'], meta['addr:street']].filter(Boolean).join(' ');
+        marker.bindPopup(`
+          <div class="anchor-popup">
+            <h4>${a.name}</h4>
+            <div class="type-badge ${isHall ? 'townhall' : 'library'}">${a.type}</div>
+            <div class="detail">Ward Radius: <span>${a.wardRadius}m</span></div>
+            <div class="detail">Ward Strength: <span>${a.wardStrength}/min</span></div>
+            ${addr ? `<div class="detail">Address: <span>${addr}</span></div>` : ''}
+            ${meta.phone ? `<div class="detail">Phone: <span>${meta.phone}</span></div>` : ''}
+            ${meta.opening_hours ? `<div class="detail">Hours: <span>${meta.opening_hours}</span></div>` : ''}
+          </div>
+        `);
+      }
+    }
+
+    function addWardCircles() {
+      for (const a of anchors) {
+        const isHall = a.type === 'TOWNHALL';
+        const circle = L.circle([a.lat, a.lon], {
+          radius: a.wardRadius,
+          color: isHall ? '#4c8' : '#68c',
+          weight: 1.5, opacity: 0.6,
+          fillColor: isHall ? '#4c8' : '#68c',
+          fillOpacity: 0.06,
+          dashArray: '6, 4',
+        }).addTo(map);
+        wardCircles.push(circle);
+      }
+    }
+
+    function toggleWardCircles(show) {
+      wardCircles.forEach(c => show ? c.addTo(map) : c.remove());
+    }
+
+    // ---- Controls ----
+    function setupControls() {
+      document.getElementById('toggle-night').addEventListener('change', (e) => {
+        isNight = e.target.checked;
+        if (corruptionLayer) corruptionLayer.redraw();
+        const tilePane = document.querySelector('.leaflet-tile-pane');
+        if (tilePane) {
+          tilePane.style.filter = isNight
+            ? 'saturate(0.15) brightness(0.35)'
+            : 'saturate(0.3) brightness(0.6)';
+        }
+      });
+
+      document.getElementById('toggle-radii').addEventListener('change', (e) => {
+        toggleWardCircles(e.target.checked);
+      });
+
+      document.getElementById('toggle-gradient').addEventListener('change', (e) => {
+        if (e.target.checked) corruptionLayer.addTo(map);
+        else corruptionLayer.remove();
+      });
+
+      // Hero minimize/expand
+      document.getElementById('hero-toggle').addEventListener('click', () => {
+        const hero = document.getElementById('hero');
+        heroMinimized = !heroMinimized;
+        if (heroMinimized) {
+          hero.classList.add('minimized');
+          document.getElementById('hero-toggle').innerHTML = '&#x25A1;';
+          document.getElementById('hero-toggle').title = 'Expand';
+        } else {
+          hero.classList.remove('minimized');
+          document.getElementById('hero-toggle').innerHTML = '&#x2715;';
+          document.getElementById('hero-toggle').title = 'Minimize';
+        }
+      });
+    }
+
+    // ---- Main ----
+    async function main() {
+      initMap();
+
+      // Fetch all data in parallel
+      const [anchorData] = await Promise.all([
+        fetchAnchors(),
+        fetchServerStatus(),
+        checkAuth(),
+      ]);
+
+      anchors = anchorData;
+      document.getElementById('anchor-count').textContent = anchors.length;
+
+      // Corruption overlay
+      corruptionLayer = new CorruptionOverlay();
+      corruptionLayer.addTo(map);
+
+      // Markers and circles
+      addAnchorMarkers();
+      addWardCircles();
+
+      // Fit to anchors
+      if (anchors.length > 0) {
+        const bounds = L.latLngBounds(anchors.map(a => [a.lat, a.lon]));
+        map.fitBounds(bounds.pad(0.8));
+      }
+
+      // Controls
+      setupControls();
+
+      // Reveal UI
+      const loading = document.getElementById('loading');
+      loading.classList.add('hidden');
+
+      // Show panels with staggered entrance
+      setTimeout(() => {
+        document.getElementById('hero').classList.add('visible');
+      }, 200);
+      setTimeout(() => {
+        document.getElementById('legend').classList.remove('hidden-panel');
+        document.getElementById('controls').classList.remove('hidden-panel');
+      }, 600);
+
+      setTimeout(() => loading.remove(), 800);
+    }
+
+    main();
+  </script>
+</body>
 </html>

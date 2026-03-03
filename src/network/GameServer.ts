@@ -10,6 +10,7 @@ import { db } from '@/database';
 import { ConnectionManager } from './ConnectionManager';
 import { WorldManager } from '@/world/WorldManager';
 import { createTileDataRouter } from '@/world/tiles/TileDataRouter';
+import { createCivicAnchorRouter } from '@/world/CivicAnchorRouter';
 
 interface GameServerConfig {
   port: number;
@@ -94,6 +95,9 @@ export class GameServer {
 
     // Tile terrain data API (for wildlife sim and other external consumers)
     this.app.use('/api/tiles', createTileDataRouter());
+
+    // Civic anchor / corruption map API
+    this.app.use('/api/map', createCivicAnchorRouter());
 
     // API routes placeholder
     this.app.get('/api/info', (_req, res) => {
