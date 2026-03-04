@@ -22,6 +22,17 @@ export enum MessageType {
   // Zone events
   PROXIMITY_UPDATE = 'proximity_update',
   ZONE_STATE_UPDATE = 'zone_state_update',
+  COMPANION_SPAWN = 'companion_spawn',
+
+  // Script editor messages (Gateway -> Zone)
+  EDITOR_ACTION = 'editor_action',
+
+  // Guild events (cross-zone)
+  GUILD_CHAT = 'guild_chat',
+  GUILD_INVITE = 'guild_invite',
+  GUILD_BEACON_STATE = 'guild_beacon_state',
+  LIBRARY_ASSAULT_START = 'library_assault_start',
+  LIBRARY_ASSAULT_RESOLVED = 'library_assault_resolved',
 
   // Client-bound messages (Gateway -> Client)
   CLIENT_MESSAGE = 'client_message',

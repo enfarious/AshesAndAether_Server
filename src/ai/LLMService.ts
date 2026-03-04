@@ -4,11 +4,25 @@ import { logger } from '@/utils/logger';
 import type { Companion } from '@prisma/client';
 import type { ProximityRosterMessage } from '@/network/protocol/types';
 import type { CompanionCombatSettings } from './CompanionCombatSettings';
+import type { BehaviorNode } from './behaviors/BehaviorTreeExecutor';
+import { ALLOWED_ACTIONS, ALLOWED_CONDITIONS } from './behaviors/HarvestBehavior';
 
 interface NPCResponse {
   action: 'chat' | 'emote' | 'none';
   channel?: 'say' | 'shout' | 'emote';
   message?: string;
+}
+
+export interface EngagementContext {
+  companionName: string;
+  archetype: string;
+  personalityType: string;
+  mobName: string;
+  mobFamily: string | null;
+  mobSpecies: string | null;
+  mobLevel: number;
+  companionLevel: number;
+  ownerNearby: boolean;
 }
 
 export interface CombatSettingsContext {
@@ -141,6 +155,64 @@ export class LLMService {
     } catch (error) {
       logger.error({ error, companionId: companion.id, provider: this.provider }, 'LLM generation failed');
       return { action: 'none' };
+    }
+  }
+
+  /**
+   * Generate a companion's reply for the /cc private chat channel.
+   * Uses a simpler prompt that doesn't require SAY:/SHOUT: prefixes —
+   * the companion just responds naturally in character.
+   */
+  async generateCompanionChat(
+    companion: Companion,
+    ownerName: string,
+    recentMessages: { sender: string; channel: string; message: string }[],
+  ): Promise<{ message: string | null }> {
+    if (!this.isConfigured()) {
+      return { message: null };
+    }
+
+    const personality = companion.personalityType || 'loyal companion';
+    const description = companion.description || 'a loyal companion';
+    const traits = (companion.traits as string[] | null)?.join(', ') || 'loyal, curious';
+
+    const systemPrompt =
+      `You are ${companion.name}, ${description}. ` +
+      `Personality: ${personality}. Traits: ${traits}. ` +
+      `You are speaking privately with your owner, ${ownerName}. ` +
+      `Respond in character with 1-2 short sentences. Do not include any prefixes or formatting — just speak naturally.`;
+
+    let conversationPrompt = '';
+    for (const msg of recentMessages.slice(-5)) {
+      conversationPrompt += `${msg.sender}: ${msg.message}\n`;
+    }
+    conversationPrompt += `\nRespond as ${companion.name}:`;
+
+    try {
+      let responseText: string;
+
+      switch (this.provider) {
+        case 'anthropic':
+          responseText = await this.generateAnthropic(companion, systemPrompt, conversationPrompt, []);
+          break;
+        case 'openai-compatible':
+          responseText = await this.generateOpenAICompatible(companion, systemPrompt, conversationPrompt, []);
+          break;
+        default:
+          return { message: null };
+      }
+
+      // Strip any SAY:/SHOUT:/EMOTE: prefix the LLM might still produce
+      let cleaned = responseText.trim();
+      cleaned = cleaned.replace(/^(SAY|SHOUT|EMOTE|NONE):\s*/i, '');
+      // Strip the companion's own name prefix if the LLM echoes it (e.g. "Foo: Hello")
+      const namePrefix = `${companion.name}:`;
+      if (cleaned.startsWith(namePrefix)) cleaned = cleaned.substring(namePrefix.length).trim();
+
+      return { message: cleaned || null };
+    } catch (error) {
+      logger.error({ error, companionId: companion.id }, 'Companion chat generation failed');
+      return { message: null };
     }
   }
 
@@ -356,6 +428,97 @@ Keep responses short (1-2 sentences). Stay in character.`;
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // Engagement Decision (should I fight this?)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Lightweight LLM call: should this companion engage a nearby mob?
+   * Returns 'engage', 'ignore', or null on failure.
+   * Uses very few tokens (~10 max) since it's a binary decision.
+   */
+  async generateEngagementDecision(
+    companion: Companion,
+    ctx: EngagementContext,
+  ): Promise<'engage' | 'ignore' | null> {
+    if (!this.isConfigured()) return null;
+
+    try {
+      const systemPrompt = `You are ${ctx.companionName}, a ${ctx.archetype} companion with a ${ctx.personalityType} personality. When asked about a nearby creature, respond with exactly one word: ENGAGE or IGNORE. Nothing else.`;
+
+      const familyStr = ctx.mobFamily ? ` (${ctx.mobFamily})` : '';
+      const speciesStr = ctx.mobSpecies ? `, species: ${ctx.mobSpecies}` : '';
+      const ownerStr = ctx.ownerNearby ? 'Your owner is nearby.' : 'Your owner is not nearby.';
+      const userPrompt = `A ${ctx.mobName}${familyStr}${speciesStr}, level ${ctx.mobLevel}, is nearby. You are level ${ctx.companionLevel}. ${ownerStr} ENGAGE or IGNORE?`;
+
+      let responseText: string;
+
+      switch (this.provider) {
+        case 'anthropic':
+          responseText = await this.generateEngagementAnthropic(companion, systemPrompt, userPrompt);
+          break;
+        case 'openai-compatible':
+          responseText = await this.generateEngagementOpenAI(companion, systemPrompt, userPrompt);
+          break;
+        default:
+          return null;
+      }
+
+      return this.parseEngagementDecision(responseText);
+    } catch (error) {
+      logger.error({ error, companionId: companion.id }, '[LLM] Engagement decision failed');
+      return null;
+    }
+  }
+
+  private async generateEngagementAnthropic(
+    companion: Companion,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    if (!this.anthropic) throw new Error('Anthropic not initialized');
+
+    const response = await this.anthropic.messages.create({
+      model: companion.llmModel || 'claude-3-5-sonnet-20241022',
+      max_tokens: 10,
+      temperature: 0.3,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    });
+
+    return response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+
+  private async generateEngagementOpenAI(
+    companion: Companion,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    if (!this.openaiClient) throw new Error('OpenAI client not initialized');
+
+    const model = process.env.OPENAI_MODEL || companion.llmModel || 'gpt-4-turbo-preview';
+
+    const response = await this.openaiClient.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 10,
+      temperature: 0.3,
+    });
+
+    return response.choices[0]?.message?.content || '';
+  }
+
+  private parseEngagementDecision(text: string): 'engage' | 'ignore' | null {
+    const upper = text.trim().toUpperCase();
+    if (upper.includes('ENGAGE')) return 'engage';
+    if (upper.includes('IGNORE')) return 'ignore';
+    logger.warn({ text }, '[LLM] Could not parse engagement decision');
+    return null;
+  }
+
   private async generateCombatAnthropic(
     companion: Companion,
     systemPrompt: string,
@@ -485,6 +648,150 @@ Stay in character. A scrappy fighter rarely switches to support. A cautious heal
       return result;
     } catch (e) {
       logger.warn({ text, error: e }, '[LLM] Failed to parse combat settings JSON');
+      return null;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Behavior Tree Generation (for /companion task)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Generate a behavior tree from a natural-language task description.
+   * Returns a BehaviorNode on success, a rejection string if the task is
+   * impossible/unsafe, or null on LLM failure.
+   */
+  async generateBehaviorTree(
+    companion: Companion,
+    taskDescription: string,
+  ): Promise<BehaviorNode | string | null> {
+    if (!this.isConfigured()) return null;
+
+    try {
+      const systemPrompt = this.buildBehaviorTreeSystemPrompt(companion);
+      const userPrompt = taskDescription;
+
+      let responseText: string;
+
+      switch (this.provider) {
+        case 'anthropic':
+          responseText = await this.generateBehaviorTreeAnthropic(companion, systemPrompt, userPrompt);
+          break;
+        case 'openai-compatible':
+          responseText = await this.generateBehaviorTreeOpenAI(companion, systemPrompt, userPrompt);
+          break;
+        default:
+          return null;
+      }
+
+      return this.parseBehaviorTreeResponse(responseText);
+    } catch (error) {
+      logger.error({ error, companionId: companion.id }, '[LLM] Behavior tree generation failed');
+      return null;
+    }
+  }
+
+  private buildBehaviorTreeSystemPrompt(companion: Companion): string {
+    return `You are generating a behavior tree for ${companion.name}, a companion in an MMO.
+Output valid JSON matching the BehaviorNode schema. Do NOT include any text before or after the JSON.
+
+BehaviorNode schema:
+{
+  "type": "sequence" | "selector" | "action" | "condition",
+  "children": [BehaviorNode, ...],   // for sequence/selector
+  "action": string,                   // for action nodes
+  "condition": string,                // for condition nodes
+  "args": { ... }                     // optional arguments
+}
+
+Node types:
+- sequence: runs children in order, fails if any child fails (AND)
+- selector: tries children in order, succeeds on first success (OR)
+- condition: checks a predicate, returns success/failure
+- action: executes a command, returns running then success
+
+Available actions: ${ALLOWED_ACTIONS.join(', ')}
+  /harvest — harvest the nearest harvestable plant
+  /move — move to a target (args: { target: "nearestHarvestablePlant" })
+  /tell — say something (args: { message: "text" })
+  /stop — stop the current task
+
+Available conditions: ${ALLOWED_CONDITIONS.join(', ')}
+  nearHarvestable — any harvestable plant within range (args: { range: number })
+  inventoryNotFull — inventory has room for items
+  hasItem — check inventory for an item (args: { itemTag: string })
+  healthAbove — HP ratio above threshold (args: { threshold: number })
+
+If the task is impossible, unsafe, or out of scope, respond with exactly: REJECT: <reason>`;
+  }
+
+  private async generateBehaviorTreeAnthropic(
+    companion: Companion,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    if (!this.anthropic) throw new Error('Anthropic not initialized');
+
+    const response = await this.anthropic.messages.create({
+      model: companion.llmModel || 'claude-3-5-sonnet-20241022',
+      max_tokens: 500,
+      temperature: 0.4,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    });
+
+    return response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+
+  private async generateBehaviorTreeOpenAI(
+    companion: Companion,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<string> {
+    if (!this.openaiClient) throw new Error('OpenAI client not initialized');
+
+    const model = process.env.OPENAI_MODEL || companion.llmModel || 'gpt-4-turbo-preview';
+
+    const response = await this.openaiClient.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      max_tokens: 500,
+      temperature: 0.4,
+    });
+
+    return response.choices[0]?.message?.content || '';
+  }
+
+  private parseBehaviorTreeResponse(text: string): BehaviorNode | string | null {
+    const trimmed = text.trim();
+
+    // Check for rejection
+    if (trimmed.startsWith('REJECT:')) {
+      return trimmed.substring(7).trim();
+    }
+
+    // Extract JSON
+    const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn({ text }, '[LLM] No JSON found in behavior tree response');
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as BehaviorNode;
+
+      // Basic sanity check
+      if (!parsed.type) {
+        logger.warn({ parsed }, '[LLM] Behavior tree missing type field');
+        return null;
+      }
+
+      return parsed;
+    } catch (e) {
+      logger.warn({ text, error: e }, '[LLM] Failed to parse behavior tree JSON');
       return null;
     }
   }

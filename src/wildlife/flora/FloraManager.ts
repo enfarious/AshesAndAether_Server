@@ -494,6 +494,55 @@ export class FloraManager {
   }
 
   /**
+   * Get harvestable plants in range with enriched info for companion AI.
+   * Returns PlantInfo objects sorted by distance (nearest first).
+   */
+  getHarvestablePlantsInRange(position: Vector3, range: number): Array<{
+    id: string;
+    speciesId: string;
+    position: Vector3;
+    currentStage: string;
+    canHarvest: boolean;
+    yieldMultiplier: number;
+    distance: number;
+  }> {
+    const result: Array<{
+      id: string;
+      speciesId: string;
+      position: Vector3;
+      currentStage: string;
+      canHarvest: boolean;
+      yieldMultiplier: number;
+      distance: number;
+    }> = [];
+
+    for (const plant of this.plants.values()) {
+      if (!plant.isAlive) continue;
+      const dist = this.calculateDistance(position, plant.position);
+      if (dist > range) continue;
+
+      const species = this.getSpeciesForPlant(plant);
+      if (!species) continue;
+
+      const stageConfig = species.growthStages.find(s => s.stage === plant.currentStage);
+      if (!stageConfig?.canHarvest) continue;
+
+      result.push({
+        id: plant.id,
+        speciesId: plant.speciesId,
+        position: plant.position,
+        currentStage: plant.currentStage,
+        canHarvest: true,
+        yieldMultiplier: stageConfig.yieldMultiplier,
+        distance: dist,
+      });
+    }
+
+    result.sort((a, b) => a.distance - b.distance);
+    return result;
+  }
+
+  /**
    * Get plants that wildlife can eat
    */
   getEdiblePlantsForWildlife(): Array<{ id: string; position: Vector3; plantType: string }> {

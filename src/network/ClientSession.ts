@@ -1,7 +1,7 @@
 import { Socket } from 'socket.io';
 import bcrypt from 'bcryptjs';
 import { logger } from '@/utils/logger';
-import { AccountService, CharacterService, ZoneService } from '@/database';
+import { AccountService, CharacterService, CompanionService, ZoneService } from '@/database';
 import { StatCalculator } from '@/game/stats/StatCalculator';
 import { SpawnPointService } from '@/world/SpawnPointService';
 import { WorldManager } from '@/world/WorldManager';
@@ -326,6 +326,37 @@ export class ClientSession {
       cosmetics,
     });
 
+    // Create player companion (use client data or auto-create a default)
+    {
+      const companionInput = data.companion;
+      const companionName = companionInput
+        ? (companionInput.name || '').trim()
+        : `${character.name}'s Companion`;
+
+      try {
+        const companion = await CompanionService.create({
+          name: companionName.length >= 2 && companionName.length <= 24 ? companionName : `${character.name}'s Companion`,
+          ownerAccountId: this.accountId,
+          ownerCharacterId: character.id,
+          zoneId: starterZoneId,
+          positionX: spawn.position.x + 2,
+          positionY: spawn.position.y,
+          positionZ: spawn.position.z,
+          ...(companionInput ? {
+            personalityType: companionInput.personalityType,
+            archetype: companionInput.archetype,
+            traits: companionInput.traits,
+            goals: companionInput.goals,
+            description: companionInput.description,
+            systemPrompt: companionInput.systemPrompt,
+          } : {}),
+        });
+        logger.info({ companionId: companion.id, companionName: companion.name }, 'Created player companion');
+      } catch (companionError) {
+        logger.error({ error: companionError, characterId: character.id }, 'Companion creation failed');
+      }
+    }
+
     this.characterId = character.id;
     logger.info(`Created character: ${character.name} (ID: ${character.id})`);
 
@@ -366,6 +397,7 @@ export class ClientSession {
       return;
     }
 
+    await CompanionService.deleteByOwnerCharacter(characterId);
     await CharacterService.deleteCharacter(characterId);
 
     const characters = await CharacterService.findByAccountId(this.accountId);

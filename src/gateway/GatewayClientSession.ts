@@ -30,6 +30,7 @@ import {
   InteractMessage,
   CombatActionMessage,
   EquipSlot,
+  CompanionCreateData,
 } from '@/network/protocol/types';
 import type { Character } from '@prisma/client';
 import {
@@ -74,8 +75,8 @@ export class GatewayClientSession {
   private clientInfo: ClientInfo | null = null;
   // Pending registration: stores password while awaiting name confirmation
   private pendingRegistration: { username: string; password: string } | null = null;
-  // Pending character creation: stores appearance while awaiting name confirmation
-  private pendingCharacterCreate: { name: string; appearance?: { description: string } } | null = null;
+  // Pending character creation: stores appearance + companion while awaiting name confirmation
+  private pendingCharacterCreate: { name: string; appearance?: { description: string }; companion?: CompanionCreateData } | null = null;
   // Guest session flag - if true, account+character deleted on disconnect
   private isGuestSession: boolean = false;
   // Active weapon set (1 = mainhand/offhand, 2 = mainhand2/offhand2)
@@ -193,6 +194,11 @@ export class GatewayClientSession {
         return;
       }
       this.sendCharacterList();
+    });
+
+    // Graceful logout — leave the world and return to character select
+    this.socket.on('logout', async () => {
+      await this.handleLogout();
     });
 
     // Game messages - route to Zone server
@@ -634,6 +640,36 @@ export class GatewayClientSession {
       await this.handleGuestRegistration(data as { username?: string; email?: string; password?: string });
     });
 
+    // ── Script editor (route to zone via EDITOR_ACTION) ─────────────────────
+
+    this.socket.on('editor_save', async (data: { editorId?: string; source?: string }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const { editorId, source } = data ?? {};
+      if (!editorId || source === undefined) return;
+      await this.routeEditorAction('save', { editorId, source });
+    });
+
+    this.socket.on('editor_compile', async (data: { editorId?: string; source?: string }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const { editorId, source } = data ?? {};
+      if (!editorId || source === undefined) return;
+      await this.routeEditorAction('compile', { editorId, source });
+    });
+
+    this.socket.on('editor_revert', async (data: { editorId?: string }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const { editorId } = data ?? {};
+      if (!editorId) return;
+      await this.routeEditorAction('revert', { editorId });
+    });
+
+    this.socket.on('editor_close', async (data: { editorId?: string }) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const { editorId } = data ?? {};
+      if (!editorId) return;
+      await this.routeEditorAction('close', { editorId });
+    });
+
     // Ping/pong
     this.socket.on('ping', (data) => {
       this.updatePing();
@@ -782,6 +818,25 @@ export class GatewayClientSession {
     });
 
     return true;
+  }
+
+  private async routeEditorAction(action: string, data: Record<string, unknown>): Promise<void> {
+    if (!this.currentZoneId || !this.characterId) return;
+
+    const channel = `zone:${this.currentZoneId}:input`;
+    await this.messageBus.publish(channel, {
+      type: MessageType.EDITOR_ACTION,
+      zoneId: this.currentZoneId,
+      characterId: this.characterId,
+      socketId: this.socket.id,
+      payload: {
+        action,
+        characterId: this.characterId,
+        socketId: this.socket.id,
+        ...data,
+      },
+      timestamp: Date.now(),
+    });
   }
 
   setClientInfo(info: ClientInfo): void {
@@ -1164,7 +1219,7 @@ export class GatewayClientSession {
     }
 
     // Store pending creation and ask for confirmation
-    this.pendingCharacterCreate = { name, appearance: data.appearance };
+    this.pendingCharacterCreate = { name, appearance: data.appearance, companion: data.companion };
 
     const confirmMessage: CharacterConfirmNameMessage['payload'] = {
       name,
@@ -1233,6 +1288,57 @@ export class GatewayClientSession {
         cosmetics,
       });
 
+      // Create player companion (skip for guest sessions)
+      if (!this.isGuestSession) {
+        const companionInput = this.pendingCharacterCreate.companion;
+        const validArchetypes = ['scrappy_fighter', 'cautious_healer', 'opportunist', 'tank'];
+
+        // Use client-provided data or fall back to a default companion
+        const companionName = companionInput
+          ? (companionInput.name || '').trim()
+          : `${character.name}'s Companion`;
+        const useClientData = companionInput &&
+          companionName.length >= 2 && companionName.length <= 24 &&
+          (!companionInput.archetype || validArchetypes.includes(companionInput.archetype)) &&
+          (!companionInput.traits || companionInput.traits.length <= 10) &&
+          (!companionInput.goals || companionInput.goals.length <= 10) &&
+          (!companionInput.systemPrompt || companionInput.systemPrompt.length <= 2000);
+
+        try {
+          const companion = await CompanionService.create({
+            name: companionName.length >= 2 && companionName.length <= 24 ? companionName : `${character.name}'s Companion`,
+            ownerAccountId: this.accountId!,
+            ownerCharacterId: character.id,
+            zoneId: starterZoneId,
+            positionX: spawn.position.x + 2,
+            positionY: spawn.position.y,
+            positionZ: spawn.position.z,
+            ...(useClientData ? {
+              personalityType: companionInput.personalityType,
+              archetype: companionInput.archetype,
+              traits: companionInput.traits,
+              goals: companionInput.goals,
+              description: companionInput.description,
+              systemPrompt: companionInput.systemPrompt,
+            } : {}),
+          });
+          logger.info({ companionId: companion.id, companionName: companion.name, characterId: character.id },
+            'Created player companion');
+
+          // Tell the zone server to register the companion entity
+          const channel = `zone:${starterZoneId}:input`;
+          await this.messageBus.publish(channel, {
+            type: MessageType.COMPANION_SPAWN,
+            zoneId: starterZoneId,
+            characterId: character.id,
+            payload: { companionId: companion.id, zoneId: starterZoneId },
+            timestamp: Date.now(),
+          });
+        } catch (companionError) {
+          logger.error({ error: companionError, characterId: character.id }, 'Companion creation failed (character still created)');
+        }
+      }
+
       this.pendingCharacterCreate = null;
       this.characterId = character.id;
       logger.info(`Created character: ${character.name} (ID: ${character.id})`);
@@ -1278,6 +1384,8 @@ export class GatewayClientSession {
       return;
     }
 
+    // Delete owned companions before the character (foreign key order)
+    await CompanionService.deleteByOwnerCharacter(characterId);
     await CharacterService.deleteCharacter(characterId);
 
     const characters = await CharacterService.findByAccountId(this.accountId);
@@ -1754,6 +1862,38 @@ export class GatewayClientSession {
     this.sendDevAck('inhabit_chat', true);
   }
 
+  /**
+   * Graceful logout — leave the current zone and return to character select.
+   * The socket stays connected and the account stays authenticated so the
+   * player can pick a different character (or the same one) without re-authing.
+   */
+  async handleLogout(): Promise<void> {
+    if (!this.authenticated) return;
+
+    // Leave the zone if currently in-world
+    if (this.characterId && this.currentZoneId) {
+      const channel = `zone:${this.currentZoneId}:input`;
+      await this.messageBus.publish(channel, {
+        type: MessageType.PLAYER_LEAVE_ZONE,
+        zoneId: this.currentZoneId,
+        characterId: this.characterId,
+        socketId: this.socket.id,
+        payload: { characterId: this.characterId, zoneId: this.currentZoneId },
+        timestamp: Date.now(),
+      });
+      await this.zoneRegistry.removePlayer(this.characterId);
+      logger.info({ characterId: this.characterId, zoneId: this.currentZoneId }, 'Player logged out — left zone');
+    }
+
+    // Clear in-world state but keep auth
+    this.characterId = null;
+    this.currentZoneId = null;
+
+    // Send character list + success signal so the client returns to character select
+    await this.sendCharacterList();
+    this.socket.emit('logout_success', { timestamp: Date.now() });
+  }
+
   async disconnect(): Promise<void> {
     this.socket.disconnect(true);
   }
@@ -1784,8 +1924,9 @@ export class GatewayClientSession {
     // Clean up guest session - delete character and account
     if (this.isGuestSession && this.accountId) {
       try {
-        // Delete character first (foreign key constraint)
+        // Delete owned companions, then character, then account (foreign key order)
         if (this.characterId) {
+          await CompanionService.deleteByOwnerCharacter(this.characterId);
           await CharacterService.deleteCharacter(this.characterId);
           logger.info(`Guest character deleted: ${this.characterId}`);
         }

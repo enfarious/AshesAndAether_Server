@@ -9,6 +9,13 @@ const WANDER_SPEED     = 1.4;
 const CHASE_SPEED      = 3.5;
 const RETURN_SPEED     = 3.5;
 
+/**
+ * If the mob is more than this many metres from its chase target (the entity
+ * it's attacking), drop the target.  Separate from LEASH_RADIUS which limits
+ * distance from home.
+ */
+const CHASE_TARGET_MAX_DISTANCE = 100;
+
 /** How far from the home position a mob is allowed to roam while idle (metres). */
 const WANDER_RADIUS    = 50;
 
@@ -129,6 +136,13 @@ interface MobState {
   chaseX: number;
   chaseZ: number;
 }
+
+/**
+ * Optional steering callback passed to update().  Given a position and desired
+ * heading, returns an adjusted heading that avoids obstacles, or null if every
+ * direction is blocked.
+ */
+export type SteerFn = (position: Vector3, heading: number) => number | null;
 
 // ── System ────────────────────────────────────────────────────────────────────
 
@@ -276,7 +290,7 @@ export class MobWanderSystem {
    *                 should end their combat state.  The wander system has
    *                 already transitioned them to 'returning'.
    */
-  update(deltaTime: number): WanderTick {
+  update(deltaTime: number, steerFn?: SteerFn): WanderTick {
     const now           = Date.now();
     const moves:        WanderUpdate[] = [];
     const leashBroken:  string[]       = [];
@@ -285,13 +299,13 @@ export class MobWanderSystem {
     for (const [id, state] of this.states) {
       switch (state.aiState) {
         case 'chasing':
-          this._tickChase(id, state, deltaTime, leashBroken, moves);
+          this._tickChase(id, state, deltaTime, leashBroken, moves, steerFn);
           break;
         case 'returning':
-          this._tickReturn(id, state, deltaTime, now, moves);
+          this._tickReturn(id, state, deltaTime, now, moves, steerFn);
           break;
         default: // 'idle'
-          this._tickIdle(id, state, deltaTime, now, moves, stuckRequests);
+          this._tickIdle(id, state, deltaTime, now, moves, stuckRequests, steerFn);
           break;
       }
     }
@@ -307,6 +321,7 @@ export class MobWanderSystem {
     dt:          number,
     leashBroken: string[],
     moves:       WanderUpdate[],
+    steerFn?:    SteerFn,
   ): void {
     // Leash check — bail out if mob has wandered too far from home
     const homeDistX = state.currentX - state.homeX;
@@ -324,13 +339,34 @@ export class MobWanderSystem {
     const dist = Math.hypot(dx, dz);
     if (dist < ARRIVE_DIST) return; // Right on top of target — wait for it to move
 
-    const step     = Math.min(CHASE_SPEED * dt, dist);
-    state.currentX += (dx / dist) * step;
-    state.currentZ += (dz / dist) * step;
+    // Drop chase target if it's too far away
+    if (dist > CHASE_TARGET_MAX_DISTANCE) {
+      state.aiState = 'returning';
+      state.targetX = null;
+      state.targetZ = null;
+      leashBroken.push(id); // Caller should clear combat state
+      return;
+    }
 
     let heading = Math.atan2(dx, dz) * (180 / Math.PI);
     if (heading < 0) heading += 360;
-    state.heading = heading;
+
+    // Steer around buildings if a steering function is provided
+    if (steerFn) {
+      const pos: Vector3 = { x: state.currentX, y: state.currentY, z: state.currentZ };
+      const steered = steerFn(pos, heading);
+      if (steered !== null) {
+        heading = steered;
+      }
+      // If null (fully enclosed), still try the direct heading — resolveAgainstStructures
+      // will catch it downstream.
+    }
+
+    const headingRad = (heading * Math.PI) / 180;
+    const step       = Math.min(CHASE_SPEED * dt, dist);
+    state.currentX  += Math.sin(headingRad) * step;
+    state.currentZ  += Math.cos(headingRad) * step;
+    state.heading    = heading;
 
     moves.push({
       id,
@@ -340,11 +376,12 @@ export class MobWanderSystem {
   }
 
   private _tickReturn(
-    id:    string,
-    state: MobState,
-    dt:    number,
-    now:   number,
-    moves: WanderUpdate[],
+    id:       string,
+    state:    MobState,
+    dt:       number,
+    now:      number,
+    moves:    WanderUpdate[],
+    steerFn?: SteerFn,
   ): void {
     const dx   = state.homeX - state.currentX;
     const dz   = state.homeZ - state.currentZ;
@@ -359,13 +396,20 @@ export class MobWanderSystem {
       return;
     }
 
-    const step     = Math.min(RETURN_SPEED * dt, dist);
-    state.currentX += (dx / dist) * step;
-    state.currentZ += (dz / dist) * step;
-
     let heading = Math.atan2(dx, dz) * (180 / Math.PI);
     if (heading < 0) heading += 360;
-    state.heading = heading;
+
+    if (steerFn) {
+      const pos: Vector3 = { x: state.currentX, y: state.currentY, z: state.currentZ };
+      const steered = steerFn(pos, heading);
+      if (steered !== null) heading = steered;
+    }
+
+    const headingRad = (heading * Math.PI) / 180;
+    const step       = Math.min(RETURN_SPEED * dt, dist);
+    state.currentX  += Math.sin(headingRad) * step;
+    state.currentZ  += Math.cos(headingRad) * step;
+    state.heading    = heading;
 
     moves.push({
       id,
@@ -381,6 +425,7 @@ export class MobWanderSystem {
     now:          number,
     moves:        WanderUpdate[],
     stuckRequests: string[],
+    steerFn?:     SteerFn,
   ): void {
     // ── Pausing phase ────────────────────────────────────────────────────
     if (state.targetX === null) {
@@ -439,16 +484,23 @@ export class MobWanderSystem {
       state.targetPickedAt = now;
     }
 
-    // Advance toward target by at most one tick's worth of movement
-    const step     = Math.min(WANDER_SPEED * dt, dist);
-    state.currentX += (dx / dist) * step;
-    state.currentZ += (dz / dist) * step;
-
     // Heading: server convention — 0° = North (+Z), 90° = East (+X)
-    // atan2(dx, dz) gives the correct bearing in this convention.
     let heading = Math.atan2(dx, dz) * (180 / Math.PI);
     if (heading < 0) heading += 360;
-    state.heading = heading;
+
+    // Steer around buildings before stepping
+    if (steerFn) {
+      const pos: Vector3 = { x: state.currentX, y: state.currentY, z: state.currentZ };
+      const steered = steerFn(pos, heading);
+      if (steered !== null) heading = steered;
+    }
+
+    // Advance toward target by at most one tick's worth of movement
+    const headingRad = (heading * Math.PI) / 180;
+    const step       = Math.min(WANDER_SPEED * dt, dist);
+    state.currentX  += Math.sin(headingRad) * step;
+    state.currentZ  += Math.cos(headingRad) * step;
+    state.heading    = heading;
 
     moves.push({
       id,

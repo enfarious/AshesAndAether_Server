@@ -88,20 +88,31 @@ export function requiredPreviousTierCount(alreadyUnlockedInTier: number): number
 // ─────────────────────────────────────────
 
 export interface StatBonus {
-  strength?:          number;
-  vitality?:          number;
-  dexterity?:         number;
-  agility?:           number;
-  intelligence?:      number;
-  wisdom?:            number;
-  maxHp?:             number;
-  maxStamina?:        number;
-  maxMana?:           number;
-  attackRating?:      number;
-  defenseRating?:     number;
-  physicalAccuracy?:  number;
-  evasion?:           number;
-  criticalHitChance?: number;
+  strength?:              number;
+  vitality?:              number;
+  dexterity?:             number;
+  agility?:               number;
+  intelligence?:          number;
+  wisdom?:                number;
+  maxHp?:                 number;
+  maxStamina?:            number;
+  maxMana?:               number;
+  attackRating?:          number;
+  defenseRating?:         number;
+  physicalAccuracy?:      number;
+  evasion?:               number;
+  criticalHitChance?:     number;
+  // T1+ passive support
+  damageAbsorption?:      number;
+  magicAttack?:           number;
+  magicDefense?:          number;
+  magicAccuracy?:         number;
+  magicEvasion?:          number;
+  magicAbsorption?:       number;
+  manaRegen?:             number;
+  glancingBlowChance?:    number;
+  penetratingBlowChance?: number;
+  deflectedBlowChance?:   number;
 }
 
 /** Descriptor for what an active node does when activated. */

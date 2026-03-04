@@ -36,11 +36,11 @@ export const PASSIVE_WEB: AbilityNode[] = [
   {
     id: p('tank', 't1'),
     web: 'passive', sector: 'tank', tier: 1,
-    name: 'Iron Hide',
-    description: 'Toughen your body — increased defense and hit points.',
+    name: 'Fortified',
+    description: 'Hardened physique from relentless combat training. +15 max HP, physical damage taken reduced by 3%.',
     cost: TIER_COST[1],
     adjacentTo: [p('support', 't1'), p('phys', 't1'), p('tank', 't2a'), p('tank', 't2b')],
-    statBonus: { defenseRating: 15, maxHp: 50 },
+    statBonus: { maxHp: 15, damageAbsorption: 3 },
   },
 
   {
@@ -90,11 +90,11 @@ export const PASSIVE_WEB: AbilityNode[] = [
   {
     id: p('phys', 't1'),
     web: 'passive', sector: 'phys', tier: 1,
-    name: 'Savage Strength',
-    description: 'Raw power that feeds directly into your attack rating.',
+    name: 'Weapon Mastery',
+    description: 'Years of focused weapon training sharpens accuracy and opens up critical strike windows.',
     cost: TIER_COST[1],
     adjacentTo: [p('tank', 't1'), p('control', 't1'), p('phys', 't2a'), p('phys', 't2b')],
-    statBonus: { attackRating: 10 },
+    statBonus: { attackRating: 8, criticalHitChance: 2 },
   },
 
   {
@@ -144,11 +144,11 @@ export const PASSIVE_WEB: AbilityNode[] = [
   {
     id: p('control', 't1'),
     web: 'passive', sector: 'control', tier: 1,
-    name: 'Focused Mind',
-    description: 'A disciplined mind improves accuracy and intelligence.',
+    name: 'Opportunist',
+    description: '+15% damage vs rooted/stunned/slowed targets. (Requires StatusEffectManager — Day 8)',
     cost: TIER_COST[1],
     adjacentTo: [p('phys', 't1'), p('magic', 't1'), p('control', 't2a'), p('control', 't2b')],
-    statBonus: { physicalAccuracy: 10, intelligence: 5 },
+    statBonus: {}, // Stub — mechanic needs status effect queries on targets
   },
 
   {
@@ -198,11 +198,11 @@ export const PASSIVE_WEB: AbilityNode[] = [
   {
     id: p('magic', 't1'),
     web: 'passive', sector: 'magic', tier: 1,
-    name: 'Arcane Aptitude',
-    description: 'Innate magical talent — improved intelligence and mana pool.',
+    name: 'Spell Power',
+    description: 'Raw arcane attunement. Increases magic attack rating, making all spells hit harder.',
     cost: TIER_COST[1],
     adjacentTo: [p('control', 't1'), p('healer', 't1'), p('magic', 't2a'), p('magic', 't2b')],
-    statBonus: { intelligence: 10, maxMana: 25 },
+    statBonus: { magicAttack: 12 },
   },
 
   {
@@ -252,11 +252,11 @@ export const PASSIVE_WEB: AbilityNode[] = [
   {
     id: p('healer', 't1'),
     web: 'passive', sector: 'healer', tier: 1,
-    name: 'Gentle Touch',
-    description: 'A healer\'s disposition — improved wisdom and mana.',
+    name: 'Steady Hand',
+    description: 'Practiced calm under pressure. +2 mana regen/s. Healing cooldowns reduced by 8% (Day 8 stub).',
     cost: TIER_COST[1],
     adjacentTo: [p('magic', 't1'), p('support', 't1'), p('healer', 't2a'), p('healer', 't2b')],
-    statBonus: { wisdom: 10, maxMana: 25 },
+    statBonus: { manaRegen: 2 }, // CD reduction stubbed until cooldown modifier system
   },
 
   {
@@ -306,11 +306,11 @@ export const PASSIVE_WEB: AbilityNode[] = [
   {
     id: p('support', 't1'),
     web: 'passive', sector: 'support', tier: 1,
-    name: 'Inspiring Presence',
-    description: 'A natural leader — balanced strength and wisdom to back every ally.',
+    name: 'Attunement',
+    description: 'Deep resonance with aetheric flows amplifies buff/debuff potency by 10%. (Day 8 stub)',
     cost: TIER_COST[1],
     adjacentTo: [p('healer', 't1'), p('tank', 't1'), p('support', 't2a'), p('support', 't2b')],
-    statBonus: { strength: 5, wisdom: 5 },
+    statBonus: {}, // Stub — needs buff potency multiplier system (Day 8)
   },
 
   {

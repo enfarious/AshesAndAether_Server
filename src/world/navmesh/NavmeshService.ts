@@ -191,11 +191,16 @@ export class NavmeshService {
 
   private getNeighbors(cell: CellCoord, resolution: number): CellCoord[] {
     const neighbors: CellCoord[] = [];
+    // 8-connected grid: cardinal + diagonal directions
     const deltas = [
-      { row: -1, col: 0 },
-      { row: 1, col: 0 },
-      { row: 0, col: -1 },
-      { row: 0, col: 1 },
+      { row: -1, col:  0 },
+      { row:  1, col:  0 },
+      { row:  0, col: -1 },
+      { row:  0, col:  1 },
+      { row: -1, col: -1 },
+      { row: -1, col:  1 },
+      { row:  1, col: -1 },
+      { row:  1, col:  1 },
     ];
 
     for (const delta of deltas) {
@@ -213,12 +218,23 @@ export class NavmeshService {
     const from = navmesh.cells[fromIndex];
     const to = navmesh.cells[toIndex];
     if (!from || !to) return 1;
-    const cost = (from.cost + to.cost) / 2;
-    return Number.isFinite(cost) ? cost : 1;
+    const baseCost = (from.cost + to.cost) / 2;
+    const cost = Number.isFinite(baseCost) ? baseCost : 1;
+    // Diagonal steps cost √2 times as much (actual distance is longer)
+    const res = navmesh.resolution;
+    const fromRow = Math.floor(fromIndex / res);
+    const fromCol = fromIndex % res;
+    const toRow   = Math.floor(toIndex / res);
+    const toCol   = toIndex % res;
+    const isDiagonal = fromRow !== toRow && fromCol !== toCol;
+    return isDiagonal ? cost * 1.4142 : cost;
   }
 
   private heuristic(a: CellCoord, b: CellCoord): number {
-    return Math.abs(a.row - b.row) + Math.abs(a.col - b.col);
+    // Octile distance — admissible heuristic for 8-connected grid
+    const dr = Math.abs(a.row - b.row);
+    const dc = Math.abs(a.col - b.col);
+    return Math.max(dr, dc) + (1.4142 - 1) * Math.min(dr, dc);
   }
 
   private latLonToCell(lat: number, lon: number, bounds: { north: number; south: number; east: number; west: number }, resolution: number): CellCoord | null {

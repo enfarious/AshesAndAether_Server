@@ -5,13 +5,19 @@ import type { LootSessionStartPayload, LootItemResultPayload, LootSessionEndPayl
 import { ZoneManager } from './ZoneManager';
 import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
-import { NPCAIController, LLMService } from '@/ai';
+import { NPCAIController, LLMService, getBaselineForArchetype, mergePartialSettings } from '@/ai';
+import type { CompanionCombatSettings } from '@/ai';
+import { T1_ABILITIES } from '@/combat/AbilityData';
+import { BehaviorTreeExecutor, type BehaviorNode, type BehaviorAction } from '@/ai/behaviors/BehaviorTreeExecutor';
+import { type ConditionContext, type PlantInfo } from '@/ai/behaviors/ConditionEvaluator';
+import { DEFAULT_HARVEST_TREE } from '@/ai/behaviors/HarvestBehavior';
+import { CompanionTaskService } from '@/ai/CompanionTaskService';
 import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands, setArenaManager, setVaultManager } from '@/commands';
 import { ArenaManager } from '@/arena/ArenaManager';
 import { VaultManager, TEST_VAULT_TEMPLATE } from '@/vault';
 import type { VaultScalingModifiers, VaultTemplateDefinition } from '@/vault';
 import type { CommandContext, CommandEvent } from '@/commands/types';
-import type { Character, Companion } from '@prisma/client';
+import type { Character, Companion, Prisma } from '@prisma/client';
 import { StatCalculator } from '@/game/stats/StatCalculator';
 import {
   unlockAbility,
@@ -20,7 +26,9 @@ import {
   getAbilitySummary,
   getNodeInfo,
   listWebNodes,
+  parsePassiveLoadout,
 } from '@/game/abilities/tree';
+import { PASSIVE_WEB_MAP } from '@/game/abilities/tree/PassiveWeb';
 import { CombatManager } from '@/combat/CombatManager';
 import { AbilitySystem } from '@/combat/AbilitySystem';
 import { DamageCalculator } from '@/combat/DamageCalculator';
@@ -48,6 +56,29 @@ import {
 import { MarketBridge } from '@/market/MarketBridge';
 import { SpawnPointService } from '@/world/SpawnPointService';
 import { VillageService } from '@/village';
+import { ScriptedObjectController, type ScriptedObjectControllerCallbacks } from '@/scripting/ScriptedObjectController';
+import { ScriptedObjectService } from '@/scripting/ScriptedObjectService';
+import { ObjectVerbScriptService } from '@/scripting/ObjectVerbScriptService';
+import {
+  GuildService,
+  GuildBeaconService,
+  LibraryBeaconService,
+  GuildChatBridge,
+  FoundingCeremonyManager,
+  EmberClockSystem,
+  getEmberClockSystem,
+  resetEmberClockSystem,
+  LibraryAssaultSystem,
+  getLibraryAssaultSystem,
+  resetLibraryAssaultSystem,
+  isPointInPolygon,
+  interpolatePolygonTier,
+  distance2D,
+  type BeaconStateChange,
+  type NarrativeStep,
+  type Point2D,
+  type TieredPoint,
+} from '@/guild';
 
 const FEET_TO_METERS = 0.3048;
 const PHYSICS_DEBUG = process.env.PHYSICS_DEBUG === 'true';
@@ -96,9 +127,12 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private characterToZone: Map<string, string> = new Map();
   private companionToZone: Map<string, string> = new Map();
   private npcControllers: Map<string, NPCAIController> = new Map(); // companionId -> controller
+  private companionBehaviorExecutors: Map<string, BehaviorTreeExecutor> = new Map(); // companionId -> task executor
+  private companionTaskService: CompanionTaskService = new CompanionTaskService();
   private llmService: LLMService;
   private wildlifeBridge: WildlifeBridge | null = null;
   private recentChatMessages: Map<string, { sender: string; channel: string; message: string; timestamp: number }[]> = new Map(); // zoneId -> messages
+  private companionChatHistory: Map<string, { sender: string; channel: string; message: string }[]> = new Map(); // companionId -> conversation
   private proximityRosterHashes: Map<string, string> = new Map(); // characterId -> roster hash (for dirty checking - legacy)
   private previousRosters: Map<string, any> = new Map(); // characterId -> previous roster (for delta calculation)
   private combatManager: CombatManager;
@@ -114,6 +148,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private mobWanderSystems: Map<string, MobWanderSystem> = new Map();
   private weatherBridges:  Map<string, WeatherBridge>  = new Map();
   private climateBridges:  Map<string, ClimateBridge>  = new Map();
+  private scriptedObjectControllers: Map<string, ScriptedObjectController> = new Map();
   private partyService: PartyService;
   private partyResourceCache: Map<string, { currentStamina: number; maxStamina: number; currentMana: number; maxMana: number }> = new Map();
   private lastPartyStatusBroadcastAt: number = 0;
@@ -131,6 +166,38 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
   // Market system
   private marketBridge: MarketBridge;
+
+  // ── Guild system ────────────────────────────────────────────────────────
+  private emberClockSystem: EmberClockSystem;
+  private libraryAssaultSystem: LibraryAssaultSystem;
+  private foundingCeremony: FoundingCeremonyManager;
+  private guildChatBridge: GuildChatBridge;
+  /** Cache of lit beacons per zone for beacon check callback. Refreshed on state changes. */
+  private litBeaconCache: Map<string, Array<{ id: string; guildId: string; worldX: number; worldZ: number; tier: number; effectRadius: number }>> = new Map();
+  /** Cache of active guild polygons for corruption check. Refreshed on state changes. */
+  private activePolygonCache: Array<{
+    guildId: string;
+    vertices: Point2D[];
+    beaconTiers: TieredPoint[];
+  }> = [];
+  /** Accumulator for beacon HP/MP regen tick (seconds). */
+  private beaconRegenAccumulator = 0;
+  private static readonly BEACON_REGEN_INTERVAL_S = 5;
+  private static readonly BEACON_HP_REGEN_BASE_PCT = 0.02; // 2% of maxHP per tick
+  private static readonly BEACON_MP_REGEN_BASE_PCT = 0.03; // 3% of maxMana per tick
+
+  /** Passive stamina regen accumulator (seconds). */
+  private staminaRegenAccumulator = 0;
+  private static readonly STAMINA_REGEN_INTERVAL_S = 3;
+  private static readonly STAMINA_REGEN_BASE_PCT = 0.01; // 1% of maxStamina per tick
+
+  /** Cache of civic anchors per zone for regen proximity checks. */
+  private civicAnchorCache: Map<string, Array<{ worldX: number; worldZ: number; wardRadius: number; type: string }>> = new Map();
+  /** Cache of library beacons per zone for regen proximity checks. */
+  private libraryBeaconCache: Map<string, Array<{ worldX: number; worldZ: number; catchmentRadius: number; isOnline: boolean }>> = new Map();
+
+  /** Pending guild invites: targetCharacterId → { guildId, guildName, guildTag, inviterId, inviterName } */
+  private pendingGuildInvites: Map<string, { guildId: string; guildName: string; guildTag: string; inviterId: string; inviterName: string; expiresAt: number }> = new Map();
 
   // ── Village instance system ──────────────────────────────────────────────
   private villageInstances: Map<string, {
@@ -243,6 +310,32 @@ export class DistributedWorldManager implements IWildlifeWorld {
     this.corruptionSystem.setPartySizeCallback(
       (characterId) => this.getCharacterPartySize(characterId)
     );
+    this.corruptionSystem.setBeaconCheckCallback(
+      (characterId, zoneId, position) => this.checkBeaconZone(characterId, zoneId, position)
+    );
+
+    // Initialize guild systems
+    this.foundingCeremony = new FoundingCeremonyManager();
+    this.guildChatBridge = new GuildChatBridge(this.messageBus);
+
+    this.emberClockSystem = getEmberClockSystem();
+    this.emberClockSystem.setStateChangeCallback((change) => this.handleBeaconStateChange(change));
+    this.emberClockSystem.setAnnouncementCallback((announcement) => {
+      void this.broadcastEmberClockAnnouncement(announcement);
+    });
+
+    this.libraryAssaultSystem = getLibraryAssaultSystem();
+    this.libraryAssaultSystem.setAssaultStartCallback((data) => {
+      void this.broadcastLibraryAssaultStart(data);
+    });
+    this.libraryAssaultSystem.setAssaultResolvedCallback((data) => {
+      void this.broadcastLibraryAssaultResolved(data);
+    });
+
+    // Guild chat delivery — forward messages to online members in this server
+    this.guildChatBridge.setDeliveryCallback((guildId, payload) => {
+      void this.deliverGuildChat(guildId, payload);
+    });
 
     // Initialize command system
     this.commandRegistry = new CommandRegistry();
@@ -445,6 +538,54 @@ export class DistributedWorldManager implements IWildlifeWorld {
       floraManager.seedInitialPlants();
       this.floraManagers.set(zone.id, floraManager);
 
+      // Initialize scripted object controller for this zone
+      {
+        const soZoneId = zone.id;
+        const soZoneManager = zoneManager;
+        const soCallbacks: ScriptedObjectControllerCallbacks = {
+          onSay: (objectId, objectName, message, position) => {
+            void this.broadcastScriptedObjectMessage(soZoneId, objectId, objectName, 'say', message, position);
+          },
+          onEmote: (objectId, objectName, message, position) => {
+            void this.broadcastScriptedObjectMessage(soZoneId, objectId, objectName, 'emote', message, position);
+          },
+          onNotifyOwner: (characterId, message) => {
+            void this.sendSystemMessageToCharacter(characterId, message);
+          },
+          getNearbyEntities: (position, rangeMeters) => {
+            const entities = soZoneManager.getEntitiesInRangeForCombat(position, rangeMeters);
+            return entities
+              .filter(e => e.type !== 'scripted_object' && e.type !== 'structure')
+              .map(e => {
+                const dx = e.position.x - position.x;
+                const dy = e.position.y - position.y;
+                const dz = e.position.z - position.z;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                return { id: e.id, name: e.name, type: e.type, distance: Math.round(dist * 100) / 100 };
+              });
+          },
+          getTimeOfDay: () => soZoneManager.getTimeOfDayNormalized(),
+          getWeather: () => soZoneManager.getWeather(),
+          getZoneInfo: () => {
+            const z = soZoneManager.getZone();
+            return { id: z.id, name: z.name, contentRating: z.contentRating || 'T' };
+          },
+        };
+        const soController = new ScriptedObjectController(soZoneId, soCallbacks);
+        void soController.loadFromDatabase().then(() => {
+          // After loading, also register entities in ZoneManager for proximity roster
+          for (const obj of soController['instances'].values()) {
+            soZoneManager.addScriptedObject({
+              id: obj.id,
+              name: obj.name,
+              description: obj.description,
+              position: obj.position,
+            });
+          }
+        });
+        this.scriptedObjectControllers.set(soZoneId, soController);
+      }
+
       // Register all living mobs with the wander system
       const wanderSystem = new MobWanderSystem();
       for (const entity of zoneManager.getAllEntities()) {
@@ -501,6 +642,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Start market bridge for market commands
     await this.marketBridge.start();
 
+    // Load beacon caches and restore expired libraries
+    await this.refreshBeaconCaches();
+    await LibraryBeaconService.checkAndRestoreExpired();
+    logger.info('Guild beacon caches loaded');
+
     logger.info(
       {
         zoneCount: this.zones.size,
@@ -521,6 +667,18 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const controller = new NPCAIController(companion, this.llmService);
       this.npcControllers.set(companion.id, controller);
       this.companionToZone.set(companion.id, zoneId);
+
+      // Resume behavior tree if companion was in TASKED mode with a stored tree
+      if (companion.behaviorState === 'tasked' && companion.behaviorTree) {
+        try {
+          const tree = companion.behaviorTree as unknown as BehaviorNode;
+          this.companionBehaviorExecutors.set(companion.id, new BehaviorTreeExecutor(tree));
+          logger.debug({ companionId: companion.id, task: companion.taskDescription }, 'Companion behavior tree resumed');
+        } catch {
+          logger.warn({ companionId: companion.id }, 'Failed to resume companion behavior tree');
+        }
+      }
+
       logger.debug({ companionId: companion.id, name: companion.name, zone: zoneId }, 'NPC AI controller initialized');
     }
   }
@@ -586,9 +744,80 @@ export class DistributedWorldManager implements IWildlifeWorld {
         }
         break;
       }
+      case MessageType.COMPANION_SPAWN:
+        void this.handleCompanionSpawn(message);
+        break;
+      case MessageType.EDITOR_ACTION:
+        void this.handleEditorAction(message);
+        break;
       default:
         logger.warn({ type: message.type }, 'Unhandled message type');
     }
+  }
+
+  /**
+   * Handle editor messages routed from gateway.
+   */
+  private async handleEditorAction(message: MessageEnvelope): Promise<void> {
+    const { action, editorId, source } = message.payload as {
+      action: string;
+      editorId: string;
+      source?: string;
+    };
+
+    switch (action) {
+      case 'save':
+        await this.handleEditorSave(editorId, source ?? '');
+        break;
+      case 'compile':
+        await this.handleEditorCompile(editorId, source ?? '');
+        break;
+      case 'revert':
+        await this.handleEditorRevert(editorId);
+        break;
+      case 'close':
+        this.handleEditorClose(editorId);
+        break;
+      default:
+        logger.warn({ action, editorId }, 'Unknown editor action');
+    }
+  }
+
+  /**
+   * Dynamically register a newly created player companion in a running zone.
+   */
+  async registerCompanionInZone(companion: Companion, zoneId: string): Promise<void> {
+    const zm = this.zones.get(zoneId);
+    if (!zm) {
+      logger.warn({ companionId: companion.id, zoneId }, 'Cannot register companion — zone not managed');
+      return;
+    }
+
+    zm.addCompanion(companion);
+
+    const controller = new NPCAIController(companion, this.llmService);
+    // Wire any saved abilities from DB
+    if (companion.abilityIds?.length) {
+      const resolved = T1_ABILITIES.filter(a => companion.abilityIds.includes(a.id));
+      if (resolved.length > 0) controller.setAbilities(resolved);
+    }
+    this.npcControllers.set(companion.id, controller);
+    this.companionToZone.set(companion.id, zoneId);
+
+    void this.publishZoneEntities(zoneId, zm);
+    logger.info({ companionId: companion.id, name: companion.name, zoneId }, 'Player companion registered in running zone');
+  }
+
+  private async handleCompanionSpawn(message: MessageEnvelope): Promise<void> {
+    const { companionId, zoneId } = message.payload as { companionId: string; zoneId: string };
+
+    const companion = await CompanionService.findById(companionId);
+    if (!companion) {
+      logger.error({ companionId }, 'Companion not found for spawn');
+      return;
+    }
+
+    await this.registerCompanionInZone(companion, zoneId);
   }
 
   /**
@@ -674,6 +903,31 @@ export class DistributedWorldManager implements IWildlifeWorld {
       this.vaultManager.handlePlayerJoin(character.id);
     }
 
+    // ── Re-spawn owned companion if not already in zone ──
+    // Companions despawn when the owner leaves; re-spawn them at the owner's
+    // position when the owner enters a zone so the companion follows naturally.
+    try {
+      const ownedCompanion = await CompanionService.findByOwnerCharacter(character.id);
+      if (ownedCompanion && !this.npcControllers.has(ownedCompanion.id)) {
+        // Update companion's zone + position in DB to match the owner
+        await CompanionService.updatePosition(ownedCompanion.id, {
+          zoneId: character.zoneId,
+          positionX: character.positionX,
+          positionY: character.positionY,
+          positionZ: character.positionZ,
+        });
+        // Reload the companion to get the updated data
+        const refreshed = await CompanionService.findById(ownedCompanion.id);
+        if (refreshed) {
+          await this.registerCompanionInZone(refreshed, character.zoneId);
+          logger.info({ companionId: refreshed.id, ownerId: character.id, zoneId: character.zoneId },
+            'Companion re-spawned — owner entered zone');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err, characterId: character.id }, 'Failed to re-spawn companion on zone entry');
+    }
+
     logger.info({ characterId: character.id, zoneId: character.zoneId }, 'Player joined zone');
   }
 
@@ -708,10 +962,29 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Remove from registry
     await this.zoneRegistry.removePlayer(characterId);
 
-    // Tell remaining clients to remove this player's entity from their scene
+    // ── Despawn owned companions so they don't follow other players ──
+    const removedIds: string[] = [characterId];
+    for (const [companionId, cZoneId] of this.companionToZone.entries()) {
+      if (cZoneId !== zoneId) continue;
+      const ctrl = this.npcControllers.get(companionId);
+      if (!ctrl) continue;
+      if (ctrl.getCompanion().ownerCharacterId !== characterId) continue;
+
+      // Remove from zone, controller maps, behavior executor, and chat history
+      zoneManager.removeCompanion(companionId);
+      this.npcControllers.delete(companionId);
+      this.companionToZone.delete(companionId);
+      this.companionBehaviorExecutors.delete(companionId);
+      this.companionChatHistory.delete(companionId);
+      removedIds.push(companionId);
+
+      logger.info({ companionId, ownerId: characterId, zoneId }, 'Companion despawned — owner left zone');
+    }
+
+    // Tell remaining clients to remove this player + their companion entities
     const removePayload = {
       timestamp: Date.now(),
-      entities: { removed: [characterId] },
+      entities: { removed: removedIds },
     };
     for (const [charId, charZoneId] of this.characterToZone.entries()) {
       if (charZoneId !== zoneId) continue;
@@ -1205,6 +1478,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
 
+    // Root check: prevent movement if entity is rooted
+    if (speed !== 'stop' && this.combatManager.isRooted(characterId)) {
+      return;
+    }
+
     // Handle stop
     if (speed === 'stop') {
       this.movementSystem.stopMovement({ characterId, zoneId });
@@ -1308,12 +1586,19 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const { characterId, zoneId, channel, text } = message.payload as {
       characterId: string;
       zoneId: string;
-      channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch' | 'party';
+      channel: 'say' | 'shout' | 'emote' | 'cfh' | 'touch' | 'party' | 'companion';
       text: string;
     };
 
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
+
+    // ── Companion chat: private channel to player's companion ────────────
+    if (channel === 'companion') {
+      logger.info({ characterId, zoneId, text, socketId: message.socketId }, '[handlePlayerChat] routing to companion chat');
+      await this.handleCompanionChat(characterId, zoneId, text, message.socketId!);
+      return;
+    }
 
     // Get sender character from database
     const { CharacterService } = await import('@/database');
@@ -1866,6 +2151,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
             targetPosition?: { x: number; y?: number; z: number };
           };
 
+          // Root check: prevent movement if entity is rooted
+          if (this.combatManager.isRooted(context.characterId)) {
+            return {
+              success: false,
+              error: 'You are rooted and cannot move!',
+            };
+          }
+
           // Physics validation: Check if movement is physically possible
           const zoneManager = this.zones.get(context.zoneId);
           if (zoneManager) {
@@ -1938,9 +2231,131 @@ export class DistributedWorldManager implements IWildlifeWorld {
           break;
         }
         case 'companion_command': {
-          // Companion cycling is handled client-side or by airlock control.
+          // Legacy companion cycling — handled client-side or by airlock control.
           break;
         }
+        case 'companion_status': {
+          const statusResult = await this.processCompanionStatus(context.characterId);
+          overrideResponse = statusResult;
+          break;
+        }
+        case 'companion_follow': {
+          await this.processCompanionFollow(context.characterId);
+          break;
+        }
+        case 'companion_detach': {
+          await this.processCompanionDetach(context.characterId);
+          break;
+        }
+        case 'companion_task': {
+          const { description } = event.data as { description: string };
+          const taskResult = await this.processCompanionTask(context.characterId, description);
+          overrideResponse = taskResult;
+          break;
+        }
+        case 'companion_harvest': {
+          const harvestResult = await this.processCompanionHarvest(context.characterId);
+          overrideResponse = harvestResult;
+          break;
+        }
+        case 'companion_recall': {
+          await this.processCompanionRecall(context.characterId);
+          break;
+        }
+        case 'companion_report': {
+          const reportResult = await this.processCompanionReport(context.characterId);
+          overrideResponse = reportResult;
+          break;
+        }
+        case 'companion_set_archetype': {
+          const { archetype } = event.data as { archetype: string };
+          overrideResponse = await this.processCompanionSetArchetype(context.characterId, archetype);
+          break;
+        }
+        case 'companion_configure': {
+          const { settings } = event.data as { settings: Partial<CompanionCombatSettings> };
+          overrideResponse = await this.processCompanionConfigure(context.characterId, settings);
+          break;
+        }
+        case 'companion_set_abilities': {
+          const { abilityIds } = event.data as { abilityIds: string[] };
+          overrideResponse = await this.processCompanionSetAbilities(context.characterId, abilityIds);
+          break;
+        }
+        case 'companion_get_config': {
+          overrideResponse = await this.processCompanionGetConfig(context.characterId);
+          break;
+        }
+
+        // ── Scripted Object commands ──────────────────────────────────────
+        case 'scripted_object_place': {
+          const { name } = event.data as { name: string };
+          overrideResponse = await this.processScriptedObjectPlace(context.characterId, context.zoneId, context.position, name);
+          break;
+        }
+        case 'scripted_object_edit': {
+          const { target } = event.data as { target: string };
+          overrideResponse = await this.processScriptedObjectEdit(context.characterId, target);
+          break;
+        }
+        case 'scripted_object_script': {
+          const { objectId, scriptSource } = event.data as { objectId: string; scriptSource: string };
+          overrideResponse = await this.processScriptedObjectScript(context.characterId, context.zoneId, objectId, scriptSource);
+          break;
+        }
+        case 'scripted_object_pickup': {
+          const { target } = event.data as { target: string };
+          overrideResponse = await this.processScriptedObjectPickup(context.characterId, context.zoneId, target);
+          break;
+        }
+        case 'scripted_object_inspect': {
+          const { target } = event.data as { target: string };
+          overrideResponse = await this.processScriptedObjectInspect(context.characterId, target);
+          break;
+        }
+        case 'scripted_object_list': {
+          overrideResponse = await this.processScriptedObjectList(context.characterId);
+          break;
+        }
+        case 'scripted_object_activate': {
+          const { target } = event.data as { target: string };
+          overrideResponse = await this.processScriptedObjectActivate(context.characterId, context.zoneId, target);
+          break;
+        }
+        case 'scripted_object_deactivate': {
+          const { target } = event.data as { target: string };
+          overrideResponse = await this.processScriptedObjectDeactivate(context.characterId, context.zoneId, target);
+          break;
+        }
+        case 'scripted_object_verbs': {
+          const { target } = event.data as { target: string };
+          overrideResponse = await this.processScriptedObjectVerbs(context.characterId, target);
+          break;
+        }
+        case 'scripted_object_do_verb': {
+          const { target, verb } = event.data as { target: string; verb: string };
+          overrideResponse = await this.processScriptedObjectDoVerb(
+            context.characterId, context.zoneId, target, verb,
+          );
+          break;
+        }
+
+        // ── Script Editor commands ──────────────────────────────────────────
+        case 'editor_open_request': {
+          const { objectRef, verb } = event.data as { objectRef: string; verb: string };
+          overrideResponse = await this.processEditorOpenRequest(
+            context.characterId, context.zoneId, context.socketId, objectRef, verb,
+          );
+          break;
+        }
+        case 'editor_undo_request': {
+          const { objectRef, verb } = event.data as { objectRef: string; verb: string };
+          overrideResponse = await this.processEditorUndoRequest(
+            context.characterId, context.zoneId, context.socketId, objectRef, verb,
+          );
+          break;
+        }
+
         case 'harvest': {
           const { plantId } = event.data as { plantId?: string };
           const harvestResult = await this.processHarvestCommand(
@@ -2531,6 +2946,712 @@ export class DistributedWorldManager implements IWildlifeWorld {
           } catch (err: any) {
             overrideResponse = { success: false, error: err.message };
           }
+          break;
+        }
+
+        // ── Guild events ──────────────────────────────────────────────
+        case 'guild_create_init': {
+          const { name, tag } = event.data as { name: string; tag: string };
+
+          // Validate name and tag
+          const nameCheck = GuildService.validateName(name);
+          if (!nameCheck.valid) return { success: false, error: nameCheck.error! };
+          const tagCheck = GuildService.validateTag(tag);
+          if (!tagCheck.valid) return { success: false, error: tagCheck.error! };
+
+          const nameAvail = await GuildService.isNameAvailable(name);
+          if (!nameAvail) return { success: false, error: `Guild name "${name}" is already taken.` };
+          const tagAvail = await GuildService.isTagAvailable(tag);
+          if (!tagAvail) return { success: false, error: `Guild tag "${tag}" is already taken.` };
+
+          // Check founder isn't already in a guild
+          const existingMembership = await GuildService.getMembership(context.characterId);
+          if (existingMembership) return { success: false, error: 'You are already in a guild.' };
+
+          // Find 2 nearest players as co-founders (within 15m)
+          const allEntities = zoneManager.getAllEntities();
+          const nearbyPlayers = allEntities.filter(e =>
+            e.type === 'player' && e.id !== context.characterId &&
+            distance2D({ x: e.position.x, z: e.position.z }, { x: context.position.x, z: context.position.z }) <= 15
+          );
+          if (nearbyPlayers.length < 2) {
+            return { success: false, error: 'You need 2 other players nearby to found a guild (3 total required).' };
+          }
+
+          // Check co-founders are unguilded
+          const coFounders = nearbyPlayers.slice(0, 2);
+          for (const cf of coFounders) {
+            const cfMembership = await GuildService.getMembership(cf.id);
+            if (cfMembership) return { success: false, error: `${cf.name} is already in a guild.` };
+          }
+
+          // Start ceremony
+          const err = this.foundingCeremony.startCeremony({
+            founderId: context.characterId,
+            founderName: context.characterName,
+            coFounderIds: coFounders.map(cf => cf.id),
+            coFounderNames: coFounders.map(cf => cf.name),
+            guildName: name,
+            guildTag: tag,
+            zoneId: zoneManager.getZone().id,
+          });
+
+          if (err) return { success: false, error: err };
+
+          // Notify co-founders they need to /guild accept
+          for (const cf of coFounders) {
+            const sid = this._charToSocket.get(cf.id);
+            if (sid) {
+              void this.messageBus.publish('gateway:output', {
+                type: MessageType.CLIENT_MESSAGE,
+                characterId: cf.id,
+                socketId: sid,
+                payload: {
+                  socketId: sid,
+                  event: 'guild_founding_narrative',
+                  data: {
+                    step: 0,
+                    totalSteps: 1,
+                    narrative: `${context.characterName} invites you to co-found the guild "${name}" [${tag}]. Type /guild accept to consent.`,
+                  },
+                },
+                timestamp: Date.now(),
+              });
+            }
+          }
+
+          overrideResponse = {
+            success: true,
+            message: `Founding ceremony initiated for "${name}" [${tag}]. Waiting for ${coFounders.map(cf => cf.name).join(' and ')} to /guild accept.`,
+          };
+          break;
+        }
+
+        case 'guild_accept_founding': {
+          const consentResult = this.foundingCeremony.recordConsent(context.characterId);
+
+          if (typeof consentResult === 'string') {
+            return { success: false, error: consentResult };
+          }
+
+          if (consentResult === null) {
+            overrideResponse = { success: true, message: 'Consent recorded. Waiting for remaining co-founders...' };
+            break;
+          }
+
+          // All consented — execute ceremony
+          const ceremony = consentResult;
+          void this.foundingCeremony.executeCeremony(
+            ceremony.founderId,
+            (charIds, step) => {
+              // Narrative callback — send to all founders
+              for (const charId of charIds) {
+                const sid = this._charToSocket.get(charId);
+                if (sid) {
+                  void this.messageBus.publish('gateway:output', {
+                    type: MessageType.CLIENT_MESSAGE,
+                    characterId: charId,
+                    socketId: sid,
+                    payload: {
+                      socketId: sid,
+                      event: 'guild_founding_narrative',
+                      data: { step: step.step, totalSteps: step.totalSteps, narrative: step.narrative },
+                    },
+                    timestamp: Date.now(),
+                  });
+                }
+              }
+            },
+            async (completeResult) => {
+              // Completion callback — send guild update to all founders
+              if (completeResult.success && completeResult.guildId) {
+                const guildInfo = await GuildService.getGuildInfo(completeResult.guildId);
+                for (const charId of completeResult.founderIds) {
+                  const sid = this._charToSocket.get(charId);
+                  if (sid) {
+                    void this.messageBus.publish('gateway:output', {
+                      type: MessageType.CLIENT_MESSAGE,
+                      characterId: charId,
+                      socketId: sid,
+                      payload: {
+                        socketId: sid,
+                        event: 'guild_update',
+                        data: guildInfo,
+                      },
+                      timestamp: Date.now(),
+                    });
+                  }
+                }
+                // Subscribe to guild chat
+                void this.guildChatBridge.subscribeGuild(completeResult.guildId);
+              } else {
+                for (const charId of completeResult.founderIds) {
+                  const sid = this._charToSocket.get(charId);
+                  if (sid) {
+                    void this.messageBus.publish('gateway:output', {
+                      type: MessageType.CLIENT_MESSAGE,
+                      characterId: charId,
+                      socketId: sid,
+                      payload: {
+                        socketId: sid,
+                        event: 'command_response',
+                        data: { success: false, error: completeResult.error ?? 'Guild creation failed.' },
+                      },
+                      timestamp: Date.now(),
+                    });
+                  }
+                }
+              }
+            },
+          );
+
+          overrideResponse = { success: true, message: 'All founders have consented. The ceremony begins...' };
+          break;
+        }
+
+        case 'guild_invite': {
+          const { targetName } = event.data as { targetName: string };
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          // Find target character in any zone
+          let targetId: string | null = null;
+          let targetSocketId: string | null = null;
+          for (const [charId, zId] of this.characterToZone) {
+            const zm = this.zones.get(zId);
+            if (!zm) continue;
+            const entity = zm.getEntity(charId);
+            if (entity && entity.name.toLowerCase() === targetName.toLowerCase()) {
+              targetId = charId;
+              targetSocketId = this._charToSocket.get(charId) ?? null;
+              break;
+            }
+          }
+
+          if (!targetId) return { success: false, error: `Player '${targetName}' is not online.` };
+
+          // Check target isn't already guilded
+          const targetMembership = await GuildService.getMembership(targetId);
+          if (targetMembership) return { success: false, error: `${targetName} is already in a guild.` };
+
+          const guild = await GuildService.findById(membership.guildId);
+          if (!guild) return { success: false, error: 'Guild not found.' };
+
+          // Store invite
+          this.pendingGuildInvites.set(targetId, {
+            guildId: guild.id,
+            guildName: guild.name,
+            guildTag: guild.tag,
+            inviterId: context.characterId,
+            inviterName: context.characterName,
+            expiresAt: Date.now() + 5 * 60 * 1000,
+          });
+
+          // Send invite to target
+          if (targetSocketId) {
+            void this.messageBus.publish('gateway:output', {
+              type: MessageType.CLIENT_MESSAGE,
+              characterId: targetId,
+              socketId: targetSocketId,
+              payload: {
+                socketId: targetSocketId,
+                event: 'guild_invite',
+                data: {
+                  guildId: guild.id,
+                  guildName: guild.name,
+                  guildTag: guild.tag,
+                  inviterName: context.characterName,
+                },
+              },
+              timestamp: Date.now(),
+            });
+          }
+
+          overrideResponse = { success: true, message: `Guild invite sent to ${targetName}.` };
+          break;
+        }
+
+        case 'guild_leave': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const isGM = await GuildService.isGuildmaster(membership.guildId, context.characterId);
+          if (isGM) return { success: false, error: 'Guildmaster cannot leave. Transfer leadership first with /guild promote, or /guild disband.' };
+
+          const removeResult = await GuildService.removeMember(membership.guildId, context.characterId);
+          if (!removeResult.success) return { success: false, error: removeResult.error };
+
+          overrideResponse = { success: true, message: 'You have left the guild.' };
+          break;
+        }
+
+        case 'guild_kick': {
+          const { targetName } = event.data as { targetName: string };
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const isGM = await GuildService.isGuildmaster(membership.guildId, context.characterId);
+          if (!isGM) return { success: false, error: 'Only the Guildmaster can kick members.' };
+
+          // Find target by name in guild members
+          const members = await GuildService.getMembers(membership.guildId);
+          const target = members.find(m => m.characterName.toLowerCase() === targetName.toLowerCase());
+          if (!target) return { success: false, error: `Player '${targetName}' is not in your guild.` };
+          if (target.characterId === context.characterId) return { success: false, error: 'You cannot kick yourself.' };
+
+          const removeResult = await GuildService.removeMember(membership.guildId, target.characterId);
+          if (!removeResult.success) return { success: false, error: removeResult.error };
+
+          // Notify the kicked player
+          const kickedSid = this._charToSocket.get(target.characterId);
+          if (kickedSid) {
+            void this.messageBus.publish('gateway:output', {
+              type: MessageType.CLIENT_MESSAGE,
+              characterId: target.characterId,
+              socketId: kickedSid,
+              payload: {
+                socketId: kickedSid,
+                event: 'guild_update',
+                data: { removed: true, reason: 'kicked' },
+              },
+              timestamp: Date.now(),
+            });
+          }
+
+          overrideResponse = { success: true, message: `${targetName} has been kicked from the guild.` };
+          break;
+        }
+
+        case 'guild_info': {
+          const { targetGuild } = event.data as { targetGuild: string | null };
+          let guildId: string | null = null;
+
+          if (targetGuild) {
+            // Look up by name or tag
+            const byTag = await GuildService.findByTag(targetGuild);
+            if (byTag) guildId = byTag.id;
+            else {
+              const byName = await GuildService.findByName(targetGuild);
+              if (byName) guildId = byName.id;
+            }
+          } else {
+            const membership = await GuildService.getMembership(context.characterId);
+            if (membership) guildId = membership.guildId;
+          }
+
+          if (!guildId) return { success: false, error: targetGuild ? `Guild '${targetGuild}' not found.` : 'You are not in a guild.' };
+
+          const info = await GuildService.getGuildInfo(guildId);
+          if (!info) return { success: false, error: 'Guild not found.' };
+
+          const beaconCount = await GuildBeaconService.getGuildBeaconCount(guildId);
+          const bonuses = await GuildBeaconService.getGuildBeaconBonuses(guildId);
+
+          const g = info.guild;
+          overrideResponse = {
+            success: true,
+            message: [
+              `--- ${g.name} [${g.tag}] ---`,
+              g.motto ? `Motto: "${g.motto}"` : null,
+              g.description ? `Description: ${g.description}` : null,
+              `Members: ${g.memberCount}`,
+              `Guildmaster: ${g.guildmasterId}`,
+              `Beacons: ${beaconCount}/${GuildService.getMaxBeacons(g.memberCount)}`,
+              bonuses.corruptionResistPercent > 0 ? `Corruption Resist: ${bonuses.corruptionResistPercent.toFixed(1)}%` : null,
+              bonuses.xpBonusPercent > 0 ? `XP Bonus: ${bonuses.xpBonusPercent.toFixed(1)}%` : null,
+              `Founded: ${new Date(g.foundedAt).toLocaleDateString()}`,
+            ].filter(Boolean).join('\n'),
+          };
+          break;
+        }
+
+        case 'guild_members': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const members = await GuildService.getMembers(membership.guildId);
+          const guild = await GuildService.findById(membership.guildId);
+          const lines = [`--- ${guild?.name ?? 'Guild'} Members (${members.length}) ---`];
+          for (const m of members) {
+            const charName = m.characterName;
+            const isGM = m.characterId === guild?.guildmasterId;
+            const online = this.characterToZone.has(m.characterId);
+            lines.push(`  ${isGM ? '[GM] ' : ''}${charName}${online ? ' (online)' : ''}`);
+          }
+
+          overrideResponse = { success: true, message: lines.join('\n') };
+          break;
+        }
+
+        case 'guild_transfer_gm': {
+          const { targetName } = event.data as { targetName: string };
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const isGM = await GuildService.isGuildmaster(membership.guildId, context.characterId);
+          if (!isGM) return { success: false, error: 'Only the Guildmaster can transfer leadership.' };
+
+          const members = await GuildService.getMembers(membership.guildId);
+          const target = members.find(m => m.characterName.toLowerCase() === targetName.toLowerCase());
+          if (!target) return { success: false, error: `Player '${targetName}' is not in your guild.` };
+
+          const transferResult = await GuildService.transferGuildmaster(membership.guildId, context.characterId, target.characterId);
+          if (!transferResult.success) return { success: false, error: transferResult.error };
+
+          overrideResponse = { success: true, message: `Guildmaster transferred to ${targetName}.` };
+          break;
+        }
+
+        case 'guild_disband': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const isGM = await GuildService.isGuildmaster(membership.guildId, context.characterId);
+          if (!isGM) return { success: false, error: 'Only the Guildmaster can disband the guild.' };
+
+          // Notify all online members before disbanding
+          const members = await GuildService.getMembers(membership.guildId);
+          const guild = await GuildService.findById(membership.guildId);
+
+          await GuildService.disbandGuild(membership.guildId, context.characterId);
+
+          for (const m of members) {
+            if (m.characterId === context.characterId) continue;
+            const sid = this._charToSocket.get(m.characterId);
+            if (sid) {
+              void this.messageBus.publish('gateway:output', {
+                type: MessageType.CLIENT_MESSAGE,
+                characterId: m.characterId,
+                socketId: sid,
+                payload: {
+                  socketId: sid,
+                  event: 'guild_update',
+                  data: { removed: true, reason: 'disbanded' },
+                },
+                timestamp: Date.now(),
+              });
+            }
+          }
+
+          // Unsubscribe from guild chat
+          void this.guildChatBridge.unsubscribeGuild(membership.guildId);
+
+          // Refresh beacon caches since beacons were extinguished
+          void this.refreshBeaconCaches();
+
+          overrideResponse = { success: true, message: `Guild "${guild?.name ?? 'Unknown'}" has been disbanded.` };
+          break;
+        }
+
+        case 'guild_motto': {
+          const { text } = event.data as { text: string };
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const mottoResult = await GuildService.updateMotto(membership.guildId, text);
+          if (!mottoResult.success) return { success: false, error: mottoResult.error };
+
+          overrideResponse = { success: true, message: `Guild motto set to: "${text}"` };
+          break;
+        }
+
+        case 'guild_description': {
+          const { text } = event.data as { text: string };
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const descResult = await GuildService.updateDescription(membership.guildId, text);
+          if (!descResult.success) return { success: false, error: descResult.error };
+
+          overrideResponse = { success: true, message: 'Guild description updated.' };
+          break;
+        }
+
+        case 'guild_chat': {
+          const { message } = event.data as { message: string };
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const guild = await GuildService.findById(membership.guildId);
+          if (!guild) return { success: false, error: 'Guild not found.' };
+
+          void this.guildChatBridge.publishChat({
+            guildId: guild.id,
+            guildTag: guild.tag,
+            senderId: context.characterId,
+            senderName: context.characterName,
+            message,
+            timestamp: Date.now(),
+          });
+
+          break;
+        }
+
+        // ── Beacon events ──────────────────────────────────────────────
+        case 'beacon_light': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You must be in a guild to light a beacon.' };
+
+          // Check guild hasn't reached max beacons
+          const guild = await GuildService.findById(membership.guildId);
+          if (!guild) return { success: false, error: 'Guild not found.' };
+          const currentCount = await GuildBeaconService.getGuildBeaconCount(membership.guildId);
+          const maxBeacons = GuildService.getMaxBeacons(guild.memberCount);
+          if (currentCount >= maxBeacons) {
+            return { success: false, error: `Your guild has reached its beacon limit (${maxBeacons}). Recruit more members to unlock more.` };
+          }
+
+          // Find nearest world point
+          const zoneId = zoneManager.getZone().id;
+          const nearest = await GuildBeaconService.findNearestWorldPoint(zoneId, context.position, 30);
+          if (!nearest) return { success: false, error: 'No world point nearby. Move to a beacon site and try again.' };
+
+          // Check point is available
+          const isAvailable = await GuildBeaconService.isWorldPointAvailable(nearest.id);
+          if (!isAvailable) return { success: false, error: 'This world point already has an active beacon.' };
+
+          // TODO: Check inventory for Soul Ember + initial fuel wood
+          // For alpha, skip inventory check and use default fuel
+
+          const lightResult = await GuildBeaconService.lightBeacon({
+            guildId: membership.guildId,
+            worldPointId: nearest.id,
+            lightedByCharacterId: context.characterId,
+            initialFuelHours: 12, // Default starting fuel
+          });
+
+          if (!lightResult.success) return { success: false, error: lightResult.error };
+
+          // Recompute polygons and refresh caches
+          void GuildBeaconService.recomputePolygons(membership.guildId);
+          void this.refreshBeaconCaches();
+
+          overrideResponse = {
+            success: true,
+            message: `Beacon lit at ${nearest.name}! Tier ${nearest.tierHint} — ${lightResult.beacon?.fuelRemaining.toFixed(1)}h of fuel remaining.`,
+          };
+          break;
+        }
+
+        case 'beacon_fuel': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You must be in a guild to fuel a beacon.' };
+
+          // Find nearest guild beacon
+          const zoneId = zoneManager.getZone().id;
+          const litBeacons = await GuildBeaconService.findLitBeaconsInZone(zoneId);
+          const guildBeacons = litBeacons.filter(b => b.guildId === membership.guildId);
+
+          let nearestBeacon: typeof guildBeacons[0] | null = null;
+          let nearestDist = Infinity;
+          for (const b of guildBeacons) {
+            const d = distance2D(
+              { x: context.position.x, z: context.position.z },
+              { x: b.worldX, z: b.worldZ }
+            );
+            if (d < nearestDist && d <= 30) {
+              nearestDist = d;
+              nearestBeacon = b;
+            }
+          }
+
+          if (!nearestBeacon) return { success: false, error: 'No guild beacon nearby. Move closer to one of your beacons.' };
+
+          // TODO: Check inventory for fuel wood of correct tier, consume it
+          // For alpha, add default fuel amount
+          const fuelType = 'common_wood';
+          const fuelResult = await GuildBeaconService.fuelBeacon({
+            beaconId: nearestBeacon.id,
+            characterId: context.characterId,
+            fuelType,
+            quantity: 1,
+          });
+
+          if (!fuelResult.success) return { success: false, error: fuelResult.error };
+
+          overrideResponse = {
+            success: true,
+            message: `Fuel added! Beacon now has ${fuelResult.fuelRemaining?.toFixed(1)}h of fuel.`,
+          };
+          break;
+        }
+
+        case 'beacon_info': {
+          const zoneId = zoneManager.getZone().id;
+          const litBeacons = await GuildBeaconService.findLitBeaconsInZone(zoneId);
+
+          let nearestBeacon: typeof litBeacons[0] | null = null;
+          let nearestDist = Infinity;
+          for (const b of litBeacons) {
+            const d = distance2D(
+              { x: context.position.x, z: context.position.z },
+              { x: b.worldX, z: b.worldZ }
+            );
+            if (d < nearestDist) {
+              nearestDist = d;
+              nearestBeacon = b;
+            }
+          }
+
+          if (!nearestBeacon) return { success: false, error: 'No beacons found in this zone.' };
+
+          const info = await GuildBeaconService.getBeaconInfo(nearestBeacon.id);
+          if (!info) return { success: false, error: 'Beacon not found.' };
+
+          overrideResponse = {
+            success: true,
+            message: [
+              `--- Beacon: ${info.worldPointName} ---`,
+              `Guild: [${info.guildTag}]`,
+              `Tier: ${info.tier}`,
+              `Status: ${info.isLit ? 'LIT' : 'DARK'}`,
+              info.isLit ? `Fuel: ${info.fuelRemaining.toFixed(1)}h / ${info.fuelCapacity}h` : null,
+              info.emberClockStartedAt ? `Ember Clock: active (started ${new Date(info.emberClockStartedAt).toLocaleString()})` : null,
+              `Distance: ${nearestDist.toFixed(0)}m`,
+            ].filter(Boolean).join('\n'),
+          };
+          break;
+        }
+
+        case 'beacon_list': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const beacons = await GuildBeaconService.findBeaconsByGuild(membership.guildId);
+          const guild = await GuildService.findById(membership.guildId);
+          const maxBeacons = GuildService.getMaxBeacons(guild?.memberCount ?? 0);
+
+          if (beacons.length === 0) {
+            overrideResponse = { success: true, message: `No beacons lit. (${0}/${maxBeacons} slots)` };
+            break;
+          }
+
+          const lines = [`--- Guild Beacons (${beacons.length}/${maxBeacons}) ---`];
+          for (const b of beacons) {
+            const wp = await GuildBeaconService.findWorldPointById(b.worldPointId);
+            lines.push(`  ${wp?.name ?? 'Unknown'} — T${b.tier} — ${b.isLit ? `${b.fuelRemaining.toFixed(1)}h fuel` : 'DARK'}`);
+          }
+
+          overrideResponse = { success: true, message: lines.join('\n') };
+          break;
+        }
+
+        case 'beacon_extinguish': {
+          const membership = await GuildService.getMembership(context.characterId);
+          if (!membership) return { success: false, error: 'You are not in a guild.' };
+
+          const isGM = await GuildService.isGuildmaster(membership.guildId, context.characterId);
+          if (!isGM) return { success: false, error: 'Only the Guildmaster can extinguish beacons.' };
+
+          // Find nearest guild beacon
+          const zoneId = zoneManager.getZone().id;
+          const litBeacons = await GuildBeaconService.findLitBeaconsInZone(zoneId);
+          const guildBeacons = litBeacons.filter(b => b.guildId === membership.guildId);
+
+          let nearestBeacon: typeof guildBeacons[0] | null = null;
+          let nearestDist = Infinity;
+          for (const b of guildBeacons) {
+            const d = distance2D(
+              { x: context.position.x, z: context.position.z },
+              { x: b.worldX, z: b.worldZ }
+            );
+            if (d < nearestDist && d <= 30) {
+              nearestDist = d;
+              nearestBeacon = b;
+            }
+          }
+
+          if (!nearestBeacon) return { success: false, error: 'No guild beacon nearby to extinguish.' };
+
+          await GuildBeaconService.extinguishBeacon(nearestBeacon.id);
+
+          // Recompute polygons and refresh caches
+          void GuildBeaconService.recomputePolygons(membership.guildId);
+          void this.refreshBeaconCaches();
+
+          overrideResponse = { success: true, message: 'Beacon extinguished.' };
+          break;
+        }
+
+        // ── Library events ──────────────────────────────────────────────
+        case 'library_info': {
+          const zoneId = zoneManager.getZone().id;
+          const libraries = await LibraryBeaconService.findByZoneId(zoneId);
+
+          let nearest: Awaited<ReturnType<typeof LibraryBeaconService.findById>> | null = null;
+          let nearestDist = Infinity;
+          for (const lib of libraries) {
+            const d = distance2D(
+              { x: context.position.x, z: context.position.z },
+              { x: lib.worldX, z: lib.worldZ }
+            );
+            if (d < nearestDist) {
+              nearestDist = d;
+              nearest = lib;
+            }
+          }
+
+          if (!nearest) return { success: false, error: 'No libraries found in this zone.' };
+
+          const info = await LibraryBeaconService.getLibraryInfo(nearest.id);
+          if (!info) return { success: false, error: 'Library not found.' };
+
+          overrideResponse = {
+            success: true,
+            message: [
+              `--- Library: ${info.name} ---`,
+              `Status: ${info.isOnline ? 'ONLINE' : 'OFFLINE'}`,
+              !info.isOnline && info.offlineReason ? `Reason: ${info.offlineReason}` : null,
+              !info.isOnline && info.offlineUntil ? `Restores: ${new Date(info.offlineUntil).toLocaleString()}` : null,
+              `Catchment: ${info.catchmentRadius}m`,
+              `Assaults repelled: ${info.assaultCount - info.failedDefenseCount}`,
+              `Distance: ${nearestDist.toFixed(0)}m`,
+            ].filter(Boolean).join('\n'),
+          };
+          break;
+        }
+
+        case 'library_list': {
+          const zoneId = zoneManager.getZone().id;
+          const libraries = await LibraryBeaconService.findByZoneId(zoneId);
+
+          if (libraries.length === 0) {
+            overrideResponse = { success: true, message: 'No libraries in this zone.' };
+            break;
+          }
+
+          const lines = [`--- Libraries in Zone (${libraries.length}) ---`];
+          for (const lib of libraries) {
+            const d = distance2D(
+              { x: context.position.x, z: context.position.z },
+              { x: lib.worldX, z: lib.worldZ }
+            );
+            lines.push(`  ${lib.name} — ${lib.isOnline ? 'ONLINE' : 'OFFLINE'} — ${d.toFixed(0)}m away`);
+          }
+
+          overrideResponse = { success: true, message: lines.join('\n') };
+          break;
+        }
+
+        case 'library_defend': {
+          const zoneId = zoneManager.getZone().id;
+          const libraries = await LibraryBeaconService.findByZoneId(zoneId);
+
+          // Find the nearest library with an active assault
+          let registered = false;
+          for (const lib of libraries) {
+            const assault = this.libraryAssaultSystem.getActiveAssault(lib.id);
+            if (assault) {
+              registered = this.libraryAssaultSystem.registerDefender(lib.id, context.characterId);
+              break;
+            }
+          }
+
+          if (!registered) {
+            return { success: false, error: 'No active library assault in this zone to defend against.' };
+          }
+
+          overrideResponse = { success: true, message: 'Registered as library defender. Defeat the assault mobs to protect the library!' };
           break;
         }
 
@@ -3679,10 +4800,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
       });
 
       this.combatManager.recordHostileAction(characterId, now);
-      this.combatManager.recordHostileAction(targetId, now);
+      if (ability.targetType === 'enemy') {
+        this.combatManager.recordHostileAction(targetId, now);
+      }
 
       const attackerStarted = this.combatManager.startCombat(characterId, now);
-      const targetStarted = this.combatManager.startCombat(targetId, now);
+      const targetStarted = ability.targetType === 'enemy'
+        ? this.combatManager.startCombat(targetId, now)
+        : false;
 
       if (attackerStarted) {
         zoneManager.setEntityCombatState(characterId, true);
@@ -3742,11 +4867,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     const effectDelayMs = ability.effectDuration ? ability.effectDuration * 1000 : 0;
     this.combatManager.setCooldown(characterId, ability.id, ability.cooldown * 1000 + effectDelayMs, now);
+    const isHostile = ability.targetType === 'enemy';
     this.combatManager.recordHostileAction(characterId, now);
-    this.combatManager.recordHostileAction(targetId, now);
+    if (isHostile) {
+      this.combatManager.recordHostileAction(targetId, now);
+    }
 
     const attackerStarted = this.combatManager.startCombat(characterId, now);
-    const targetStarted = this.combatManager.startCombat(targetId, now);
+    const targetStarted = isHostile
+      ? this.combatManager.startCombat(targetId, now)
+      : false;
 
     if (attackerStarted) {
       zoneManager.setEntityCombatState(characterId, true);
@@ -3780,7 +4910,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
     }
 
     // Always give non-player targets a chance to retaliate, even on auto-attacks.
-    this.maybeRetaliate(targetEntity, attackerEntity);
+    // Only trigger retaliation for hostile (enemy-targeted) abilities.
+    if (isHostile) {
+      this.maybeRetaliate(targetEntity, attackerEntity);
+    }
 
     await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
       eventType: 'combat_action',
@@ -3818,9 +4951,18 @@ export class DistributedWorldManager implements IWildlifeWorld {
           },
         }
         : ability;
-      const baseDamageOverride = (ability.id === 'basic_attack' && weaponData?.baseDamage)
+      let baseDamageOverride = (ability.id === 'basic_attack' && weaponData?.baseDamage)
         ? weaponData.baseDamage
         : undefined;
+
+      // Power Strike: consume next-attack buff and add bonus damage
+      const nextAtkBuff = this.combatManager.consumeNextAttackBuff(characterId);
+      if (nextAtkBuff) {
+        const flatBonus = nextAtkBuff.specialData?.flatBonus ?? 0;
+        const scalingBonus = nextAtkBuff.specialData?.scalingBonus ?? 0;
+        const totalBonus = flatBonus + scalingBonus;
+        baseDamageOverride = (baseDamageOverride ?? ability.damage!.amount) + totalBonus;
+      }
 
       const scalingValue = this.getScalingValue(attackerSnapshot, ability);
       const damageScale = this.getMultiTargetScale(targets.length);
@@ -3882,6 +5024,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
         if (!targetData.isPlayer) {
           zoneManager.setEntityHealth(targetData.entityId, newHp, targetData.maxHealth);
         }
+
+        // Root-break: if target is rooted, check if damage breaks the root
+        this.combatManager.checkRootBreak(target.id, result.amount);
 
         // Record damage for loot resolution (mobs only)
         if (!targetData.isPlayer && !targetData.isWildlife) {
@@ -4074,6 +5219,142 @@ export class DistributedWorldManager implements IWildlifeWorld {
       return { hit: anyHit };
     }
 
+    // ── Healing path ──────────────────────────────────────────────────────────
+    if (ability.healing) {
+      const healSnapshot = await this.getCombatSnapshot(targetId, targetEntity);
+      if (!healSnapshot) return { hit: false };
+
+      const scalingStat = ability.healing.scalingStat;
+      const scalingValue = scalingStat ? (attackerSnapshot.coreStats[scalingStat] ?? 0) : 0;
+      const healAmount = Math.floor(
+        ability.healing.amount + scalingValue * (ability.healing.scalingMultiplier ?? 0)
+      );
+      const newHp = Math.min(healSnapshot.maxHealth, healSnapshot.currentHealth + healAmount);
+      await this.updateHealth(healSnapshot, newHp);
+
+      if (!healSnapshot.isPlayer) {
+        zoneManager.setEntityHealth(targetId, newHp, healSnapshot.maxHealth);
+      }
+
+      if (healSnapshot.isPlayer) {
+        await this.sendCharacterResourcesUpdate(zoneManager, targetId, {
+          health: { current: newHp, max: healSnapshot.maxHealth },
+        });
+      }
+      const targetEntityPos = zoneManager.getEntity(targetId)?.position ?? attackerEntity.position;
+      await this.broadcastEntityHealthUpdate(zoneManager, targetEntityPos, targetId, {
+        current: newHp,
+        max: healSnapshot.maxHealth,
+      });
+
+      const targetName = zoneManager.getEntity(targetId)?.name ?? 'target';
+      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+        eventType: 'combat_heal',
+        timestamp: now,
+        narrative: `${attackerName} heals ${targetName} for ${healAmount} HP.`,
+        eventTypeData: {
+          attackerId: characterId,
+          targetId,
+          abilityId: ability.id,
+          amount: healAmount,
+          floatText: `+${healAmount}`,
+        },
+      });
+
+      return { hit: true };
+    }
+
+    // ── Provoke (taunt) ───────────────────────────────────────────────────────
+    if (ability.id === 'provoke') {
+      this.combatManager.setTaunt(targetId, characterId, 4000, now); // 4 seconds
+      const targetName = zoneManager.getEntity(targetId)?.name ?? 'target';
+      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+        eventType: 'combat_effect',
+        timestamp: now,
+        narrative: `${attackerName} provokes ${targetName}!`,
+        eventTypeData: {
+          attackerId: characterId,
+          targetId,
+          abilityId: ability.id,
+          effectType: 'taunt',
+          duration: 4,
+        },
+      });
+      return { hit: true };
+    }
+
+    // ── Embolden (stat buff) ──────────────────────────────────────────────────
+    if (ability.id === 'embolden') {
+      this.combatManager.addBuff(targetId, {
+        id: 'embolden',
+        sourceId: characterId,
+        expiresAt: now + 10_000, // 10 seconds
+        statMods: { attackRating: 10, magicAttack: 8 },
+      });
+      const targetName = zoneManager.getEntity(targetId)?.name ?? 'target';
+      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+        eventType: 'combat_effect',
+        timestamp: now,
+        narrative: `${attackerName} emboldens ${targetName}!`,
+        eventTypeData: {
+          attackerId: characterId,
+          targetId,
+          abilityId: ability.id,
+          effectType: 'buff',
+          duration: 10,
+          statMods: { attackRating: 10, magicAttack: 8 },
+        },
+      });
+      return { hit: true };
+    }
+
+    // ── Ensnare (root) ────────────────────────────────────────────────────────
+    if (ability.id === 'ensnare') {
+      this.combatManager.setRoot(targetId, 3000, 20, now); // 3s, breaks at 20 damage
+      // Immediately halt any in-progress movement
+      this.movementSystem.stopMovement({ characterId: targetId, zoneId: zoneManager.getZone().id });
+      const targetName = zoneManager.getEntity(targetId)?.name ?? 'target';
+      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+        eventType: 'combat_effect',
+        timestamp: now,
+        narrative: `${attackerName} ensnares ${targetName}!`,
+        eventTypeData: {
+          attackerId: characterId,
+          targetId,
+          abilityId: ability.id,
+          effectType: 'root',
+          duration: 3,
+        },
+      });
+      return { hit: true };
+    }
+
+    // ── Power Strike (next-attack buff) ───────────────────────────────────────
+    if (ability.id === 'power_strike') {
+      const strValue = attackerSnapshot.coreStats.strength ?? 0;
+      this.combatManager.addBuff(characterId, {
+        id: 'power_strike',
+        sourceId: characterId,
+        expiresAt: now + 10_000, // 10 seconds
+        special: 'next_attack_bonus',
+        specialData: { flatBonus: 10, scalingBonus: Math.floor(strValue * 0.5) },
+        consumeOnHit: true,
+      });
+      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+        eventType: 'combat_effect',
+        timestamp: now,
+        narrative: `${attackerName} readies a Power Strike!`,
+        eventTypeData: {
+          attackerId: characterId,
+          targetId: characterId,
+          abilityId: ability.id,
+          effectType: 'buff',
+          duration: 10,
+        },
+      });
+      return { hit: true };
+    }
+
     return { hit: true };
   }
 
@@ -4179,6 +5460,31 @@ export class DistributedWorldManager implements IWildlifeWorld {
         this.combatManager.setWeaponSpeed(entityId, weaponData.speed);
       }
 
+      const baseStats = this.buildCombatStats(derived);
+
+      // Apply passive ability tree bonuses from slotted passive nodes
+      const passiveLoadout = parsePassiveLoadout(character.passiveLoadout);
+      for (const nodeId of passiveLoadout.slots) {
+        if (!nodeId) continue;
+        const node = PASSIVE_WEB_MAP.get(nodeId);
+        if (!node?.statBonus) continue;
+        for (const [key, val] of Object.entries(node.statBonus)) {
+          if (typeof val === 'number' && key in baseStats) {
+            (baseStats as unknown as Record<string, number>)[key] += val;
+          }
+        }
+      }
+
+      // Apply active buff stat modifiers
+      const buffMods = this.combatManager.getBuffStatMods(entityId);
+      if (buffMods) {
+        for (const [key, val] of Object.entries(buffMods)) {
+          if (key in baseStats && typeof val === 'number') {
+            (baseStats as unknown as Record<string, number>)[key] += val;
+          }
+        }
+      }
+
       return {
         entityId,
         isPlayer: true,
@@ -4189,7 +5495,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
         maxStamina: character.maxStamina,
         maxMana: character.maxMana,
         coreStats,
-        stats: this.buildCombatStats(derived),
+        stats: baseStats,
         armorQualityMultipliers,
         weapon: weaponData,
       };
@@ -4211,6 +5517,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const derived = StatCalculator.calculateDerivedStats(coreStats, companion.level);
       this.attackSpeedBonusCache.set(entityId, derived.attackSpeedBonus);
 
+      const compStats = this.buildCombatStats(derived);
+      const compBuffMods = this.combatManager.getBuffStatMods(entityId);
+      if (compBuffMods) {
+        for (const [key, val] of Object.entries(compBuffMods)) {
+          if (key in compStats && typeof val === 'number') {
+            (compStats as unknown as Record<string, number>)[key] += val;
+          }
+        }
+      }
+
       return {
         entityId,
         isPlayer: false,
@@ -4221,7 +5537,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
         maxStamina: 0,
         maxMana: 0,
         coreStats,
-        stats: this.buildCombatStats(derived),
+        stats: compStats,
       };
     }
 
@@ -4397,8 +5713,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
   ): boolean {
     if (ability.targetType === 'self') return true;
 
+    // Abilities with an explicit range > melee use that range directly (e.g. shadow bolt 30 m).
+    // Melee abilities (range <= 2) use weapon reach + body radii + arm reach.
+    const isMelee = !ability.range || ability.range <= 2;
     const weaponReach    = weaponRange ?? UNARMED_RANGE;
-    const effectiveRange = BASE_REACH + ENTITY_RADIUS + ENTITY_RADIUS + weaponReach;
+    const effectiveRange = isMelee
+      ? BASE_REACH + ENTITY_RADIUS + ENTITY_RADIUS + weaponReach
+      : ability.range + ENTITY_RADIUS + ENTITY_RADIUS;
 
     // Use horizontal (XZ) distance for range validation.
     //
@@ -5774,6 +7095,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
    * Trigger NPC AI responses for NPCs in range of the message (ambient speech).
    * Skips NPCs that are player-controlled or currently inhabited by an airlock session.
    */
+  /** Per-NPC cooldown: minimum seconds between LLM ambient chat calls. */
+  private static readonly NPC_CHAT_COOLDOWN_MS = 30_000;
+  /** Per-NPC last-response timestamps. */
+  private npcChatCooldowns: Map<string, number> = new Map();
+
   private async triggerNPCResponses(zoneId: string, messageOrigin: { x: number; y: number; z: number }, range: number): Promise<void> {
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
@@ -5785,6 +7111,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     const nearbyNPCs = await this.getNearbyNPCs(zoneId, messageOrigin, range);
     const redis = this.messageBus.getRedisClient();
+    const now = Date.now();
 
     for (const companion of nearbyNPCs) {
       // Skip player-controlled companions
@@ -5797,9 +7124,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const controller = this.npcControllers.get(companion.id);
       if (!controller) continue;
 
+      // Per-NPC cooldown — prevent spamming LLM on every chat message
+      const lastCall = this.npcChatCooldowns.get(companion.id) ?? 0;
+      if (now - lastCall < DistributedWorldManager.NPC_CHAT_COOLDOWN_MS) continue;
+
       const result = zoneManager.calculateProximityRoster(companion.id);
       if (!result) continue;
 
+      this.npcChatCooldowns.set(companion.id, now);
       this.handleNPCResponse(companion, result.roster, contextMessages, zoneId);
     }
   }
@@ -5828,9 +7160,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Also skip player-controlled companions
     if (this.companionToZone.has(npcId)) return;
 
+    // Per-NPC cooldown (shorter for /talk since it's intentional)
+    const now = Date.now();
+    const lastCall = this.npcChatCooldowns.get(npcId) ?? 0;
+    if (now - lastCall < 10_000) return;
+
     const nearbyNPCs = await this.getNearbyNPCs(zoneId, messageOrigin, range);
     const companion = nearbyNPCs.find(c => c.id === npcId);
     if (!companion) return;
+
+    this.npcChatCooldowns.set(npcId, now);
 
     const recentMessages = this.recentChatMessages.get(zoneId) || [];
     const contextMessages = recentMessages.slice(-5).map(m => ({
@@ -5944,6 +7283,162 @@ export class DistributedWorldManager implements IWildlifeWorld {
         characterId: '',
         socketId,
         payload: clientMessage,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Handle private companion chat — player talks to their own companion via /cc.
+   * The message is sent to the companion's LLM and the reply goes back to the
+   * owner only (not proximity-broadcast).
+   */
+  private async handleCompanionChat(
+    characterId: string,
+    zoneId: string,
+    text: string,
+    socketId: string,
+  ): Promise<void> {
+    logger.info({ characterId, zoneId, text, socketId }, '[CompanionChat] handleCompanionChat entered');
+
+    // ── Find the player's companion in this zone ──────────────────────────
+    let companionId: string | null = null;
+    for (const [cId, cZone] of this.companionToZone.entries()) {
+      if (cZone !== zoneId) continue;
+      const ctrl = this.npcControllers.get(cId);
+      if (!ctrl) continue;
+      if (ctrl.getCompanion().ownerCharacterId === characterId) {
+        companionId = cId;
+        break;
+      }
+    }
+
+    logger.info({ companionId, companionToZoneSize: this.companionToZone.size }, '[CompanionChat] companion lookup result');
+
+    if (!companionId) {
+      // No companion in zone — tell the player
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: {
+          socketId,
+          event: 'chat',
+          data: {
+            channel: 'system',
+            sender: '',
+            senderId: '',
+            message: 'You don\'t have a companion in this zone.',
+            timestamp: Date.now(),
+          },
+        } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    const controller = this.npcControllers.get(companionId)!;
+    const companion = controller.getCompanion();
+
+    // ── Build conversation context ────────────────────────────────────────
+    const history = this.companionChatHistory.get(companionId) ?? [];
+
+    // Add the player's message to history
+    const { CharacterService } = await import('@/database');
+    const sender = await CharacterService.findById(characterId);
+    const senderName = sender?.name ?? 'Player';
+
+    const playerMsg = { sender: senderName, channel: 'companion', message: text };
+    history.push(playerMsg);
+
+    // Cap at 10 entries
+    while (history.length > 10) history.shift();
+    this.companionChatHistory.set(companionId, history);
+
+    // ── Call LLM (dedicated companion chat path — no SAY:/SHOUT: format) ─
+    logger.info({ companionId, companionName: companion.name, historyLen: history.length }, '[CompanionChat] calling LLM');
+    try {
+      const response = await this.llmService.generateCompanionChat(
+        companion,
+        senderName,
+        history,
+      );
+
+      logger.info({ companionId, hasMessage: !!response.message, message: response.message?.slice(0, 80) }, '[CompanionChat] LLM response');
+
+      const ownerSocketId = this._charToSocket.get(characterId) ?? socketId;
+
+      if (!response.message) {
+        // LLM not configured or returned empty — send fallback
+        logger.info({ companionId, characterId, ownerSocketId }, '[CompanionChat] no message, sending fallback');
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId,
+          socketId: ownerSocketId,
+          payload: {
+            socketId: ownerSocketId,
+            event: 'chat',
+            data: {
+              channel: 'companion',
+              sender: companion.name,
+              senderId: companion.id,
+              message: `*${companion.name} looks at you but doesn't seem to know what to say.*`,
+              timestamp: Date.now(),
+            },
+          } as ClientMessagePayload,
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      // Add companion's reply to history
+      history.push({ sender: companion.name, channel: 'companion', message: response.message });
+      while (history.length > 10) history.shift();
+
+      // ── Send response ONLY to the owner ────────────────────────────────
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId: ownerSocketId,
+        payload: {
+          socketId: ownerSocketId,
+          event: 'chat',
+          data: {
+            channel: 'companion',
+            sender: companion.name,
+            senderId: companion.id,
+            message: response.message,
+            timestamp: Date.now(),
+          },
+        } as ClientMessagePayload,
+        timestamp: Date.now(),
+      });
+
+      logger.debug({
+        companionId: companion.id,
+        ownerId: characterId,
+      }, 'Companion replied via /cc');
+
+    } catch (error) {
+      logger.error({ error, companionId: companion.id }, 'Companion chat LLM response failed');
+
+      // Let the player know something went wrong
+      const ownerSocketId = this._charToSocket.get(characterId) ?? socketId;
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId: ownerSocketId,
+        payload: {
+          socketId: ownerSocketId,
+          event: 'chat',
+          data: {
+            channel: 'system',
+            sender: '',
+            senderId: '',
+            message: `${companion.name} seems confused and doesn't respond.`,
+            timestamp: Date.now(),
+          },
+        } as ClientMessagePayload,
         timestamp: Date.now(),
       });
     }
@@ -6370,6 +7865,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
       }
     }
 
+    // Update scripted object controllers (Lua heartbeat, proximity events, timers)
+    for (const controller of this.scriptedObjectControllers.values()) {
+      controller.update(deltaTime, now);
+    }
+
     // Update mob wander / chase / return movement
     for (const [zoneId, wanderSystem] of this.mobWanderSystems) {
       const zm = this.zones.get(zoneId);
@@ -6408,7 +7908,12 @@ export class DistributedWorldManager implements IWildlifeWorld {
       }
 
       // ── 2. Tick the wander / chase / return system ───────────────────────
-      const { moves, leashBroken, stuckRequests } = wanderSystem.update(deltaTime);
+      // Provide a steering callback so mobs navigate around buildings instead
+      // of walking straight into walls and relying solely on wall-push.
+      const physics = zm.getPhysicsSystem();
+      const steerFn = (pos: { x: number; y: number; z: number }, heading: number) =>
+        physics.steerAroundWalls(pos, heading, 4.0, 0.5);
+      const { moves, leashBroken, stuckRequests } = wanderSystem.update(deltaTime, steerFn);
 
       // ── 3. Handle leash breaks — mob chased too far, pull it back ────────
       for (const id of leashBroken) {
@@ -6422,7 +7927,6 @@ export class DistributedWorldManager implements IWildlifeWorld {
       }
 
       // ── 4. Apply position updates (wander, chase, and return all emit moves)
-      const physics = zm.getPhysicsSystem();
       let anyMoved = leashBroken.length > 0; // combat-state change counts as a zone update
       for (const { id, position, heading } of moves) {
         const entity = zm.getEntity(id);
@@ -6457,6 +7961,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // ── Update companion combat AI ────────────────────────────────────────
     void this.tickCompanionCombat(deltaTime);
 
+    // ── Update companion behavior trees (TASKED + ACTIVE following) ──────
+    void this.tickCompanionBehavior(deltaTime);
+
     if (now - this.lastPartyStatusBroadcastAt >= PARTY_STATUS_INTERVAL_MS) {
       void this.broadcastPartyStatus();
       this.lastPartyStatusBroadcastAt = now;
@@ -6490,6 +7997,26 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     // Update corruption system (manages its own tick interval internally)
     this.corruptionSystem.update(this.getZoneCorruptionData());
+
+    // Update ember clock system (guild beacon fuel ticks)
+    this.emberClockSystem.update();
+
+    // Passive stamina regen — ticks every 3s for all players
+    this.staminaRegenAccumulator += deltaTime;
+    if (this.staminaRegenAccumulator >= DistributedWorldManager.STAMINA_REGEN_INTERVAL_S) {
+      this.staminaRegenAccumulator = 0;
+      void this.tickStaminaRegen();
+    }
+
+    // Beacon proximity regen (HP + MP) — ticks every 5s
+    this.beaconRegenAccumulator += deltaTime;
+    if (this.beaconRegenAccumulator >= DistributedWorldManager.BEACON_REGEN_INTERVAL_S) {
+      this.beaconRegenAccumulator = 0;
+      void this.tickBeaconRegen();
+    }
+
+    // Update library assault system (assault trigger checks)
+    this.libraryAssaultSystem.update();
 
     // Tick day/night cycle and weather for each zone; broadcast on change.
     // Also refresh ZoneRegistry every 60 s so joining players always get a
@@ -6715,6 +8242,35 @@ export class DistributedWorldManager implements IWildlifeWorld {
         continue;
       }
 
+      // Clear auto-attack if target is more than 100m away
+      {
+        const tdx = targetEntity.position.x - attackerEntity.position.x;
+        const tdz = targetEntity.position.z - attackerEntity.position.z;
+        if (Math.sqrt(tdx * tdx + tdz * tdz) > 100) {
+          this.combatManager.clearAutoAttackTarget(attackerId);
+          const socketId = zoneManager.getSocketIdForEntity(attackerId);
+          if (socketId) {
+            await this.messageBus.publish('gateway:output', {
+              type: MessageType.CLIENT_MESSAGE,
+              characterId: attackerId,
+              socketId,
+              payload: {
+                socketId,
+                event: 'event',
+                data: {
+                  eventType: 'auto_attack_stopped',
+                  reason: 'target_out_of_range',
+                  narrative: 'Your target is too far away.',
+                  timestamp: Date.now(),
+                },
+              },
+              timestamp: Date.now(),
+            });
+          }
+          continue;
+        }
+      }
+
       // Reset the weapon timer before executing (so next attack waits full duration)
       this.combatManager.resetAutoAttackTimer(attackerId);
 
@@ -6865,45 +8421,89 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const companionEntity = zm.getEntity(companionId);
       if (!companionEntity || !companionEntity.isAlive) continue;
 
-      // Detect if companion should be in combat (hostile entities nearby)
+      // Detect hostile entities nearby
       const nearbyEntities = zm.getEntitiesInRangeForCombat(companionEntity.position, 30, companionId);
-      const enemies = nearbyEntities.filter(e =>
+      const hostiles = nearbyEntities.filter(e =>
         e.isAlive && (e.type === 'mob' || (e.faction === 'hostile'))
       );
 
-      // Combat lifecycle transitions
-      if (enemies.length > 0 && !controller.inCombat) {
-        controller.enterCombat();
-        this.combatManager.startCombat(companionId, Date.now());
-        zm.setEntityCombatState(companionId, true);
-      } else if (enemies.length === 0 && controller.inCombat) {
+      // ── Engagement gate (three-tier: ignore → always-engage → ask LLM) ──
+      if (!controller.inCombat) {
+        if (hostiles.length > 0) {
+          // Check if owner is nearby (for LLM engagement context)
+          const ownerNearby = nearbyEntities.some(e => e.type === 'player' && e.isAlive);
+
+          // Filter through engagement rules
+          const engageable: typeof hostiles = [];
+          for (const enemy of hostiles) {
+            const shouldFight = await controller.shouldEngage(
+              { name: enemy.name, family: enemy.family, species: enemy.species, level: enemy.level },
+              ownerNearby,
+            );
+            if (shouldFight) engageable.push(enemy);
+          }
+
+          if (engageable.length > 0) {
+            controller.enterCombat();
+            this.combatManager.startCombat(companionId, Date.now());
+            zm.setEntityCombatState(companionId, true);
+          }
+        }
+      } else if (hostiles.length === 0) {
+        // No enemies left — exit combat
         controller.exitCombat();
         zm.setEntityCombatState(companionId, false);
-        continue; // Skip tick — just exited combat
-      }
-
-      if (!controller.inCombat) {
-        // Not in combat — run social AI instead (existing behavior)
-        // Social updates are on their own cooldown inside the controller
         continue;
       }
 
+      if (!controller.inCombat) continue;
+
+      // Filter enemies to only those the companion has decided to fight
+      const engagedEnemies = hostiles.filter(e => {
+        // If we're in combat, we already passed the gate — but re-check for new mobs
+        // that wandered in. For performance, only check settings lists (no LLM mid-combat).
+        const s = controller.getCurrentSettings();
+        if (e.species) {
+          if (s.alwaysEngageSpecies.includes(e.species)) return true;
+          if (s.ignoreSpecies.includes(e.species)) return false;
+        }
+        if (e.family) {
+          if (s.alwaysEngageFamily.includes(e.family)) return true;
+          if (s.ignoreFamily.includes(e.family)) return false;
+        }
+        // Unknown mid-combat — engage (already committed to fighting)
+        return true;
+      });
+
       // Build combat context for the behavior tree
       const combatContext = this.buildCompanionCombatContext(
-        companionId, companionEntity, zm, enemies, nearbyEntities,
+        companionId, companionEntity, zm, engagedEnemies, nearbyEntities,
       );
 
       // Tick the behavior tree
       const result = await controller.updateCombat(combatContext, deltaTime);
 
-      // Apply movement output
+      // Apply movement output — steer around buildings first, then wall-resolve
       if (result.movement) {
-        const newPos = {
-          x: companionEntity.position.x + result.movement.x,
-          y: companionEntity.position.y,
-          z: companionEntity.position.z + result.movement.z,
-        };
         const physics = zm.getPhysicsSystem();
+        let mx = result.movement.x;
+        let mz = result.movement.z;
+        const moveDist = Math.sqrt(mx * mx + mz * mz);
+        if (moveDist > 0.001) {
+          let heading = Math.atan2(mx, mz) * (180 / Math.PI);
+          if (heading < 0) heading += 360;
+          const steered = physics.steerAroundWalls(companionEntity.position, heading, 4.0, 0.5);
+          if (steered !== null && steered !== heading) {
+            const rad = (steered * Math.PI) / 180;
+            mx = Math.sin(rad) * moveDist;
+            mz = Math.cos(rad) * moveDist;
+          }
+        }
+        const newPos = {
+          x: companionEntity.position.x + mx,
+          y: companionEntity.position.y,
+          z: companionEntity.position.z + mz,
+        };
         const wallResolved = physics.resolveAgainstStructures(newPos, 0.5);
         const snapped = zm.updateCompanionPosition(companionId, wallResolved, result.heading ?? 0);
         void this.broadcastPositionUpdate(companionId, zoneId, snapped);
@@ -6930,8 +8530,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
   ) {
     const controller = this.npcControllers.get(companionId)!;
 
-    // Find the owner (first player entity in range — simplified for now)
-    const ownerEntity = allNearby.find(e => e.type === 'player' && e.isAlive) ?? null;
+    // Find the owner — must be the actual owner, not just any nearby player
+    const ownerCharId = controller.getCompanion().ownerCharacterId;
+    const ownerEntity = ownerCharId
+      ? (allNearby.find(e => e.id === ownerCharId && e.isAlive) ?? null)
+      : null;
 
     // Find allies (other companions + players)
     const allies = allNearby.filter(e =>
@@ -6950,6 +8553,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
       maxHealth: e.maxHealth,
       level: e.level,
       tag: e.tag,
+      family: e.family,
+      species: e.species,
       faction: e.faction,
     }));
 
@@ -7013,46 +8618,1269 @@ export class DistributedWorldManager implements IWildlifeWorld {
     zoneId: string,
     abilityId: string,
     targetId: string,
-    controller: NPCAIController,
+    _controller: NPCAIController,
   ): Promise<void> {
-    const ability = controller.getAbilities().find(a => a.id === abilityId);
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const companionEntity = zoneManager.getEntity(companionId);
+    const targetEntity = zoneManager.getEntity(targetId);
+    if (!companionEntity?.isAlive || !targetEntity?.isAlive) return;
+
+    // Resolve the ability through AbilitySystem (same path as player abilities)
+    const ability = await this.abilitySystem.getAbility(abilityId);
     if (!ability) return;
 
-    const now = Date.now();
-
-    // ATB check
-    if (!ability.isFree && !this.combatManager.canSpendAtb(companionId, ability.atbCost)) return;
-
-    // Cooldown check
-    if (this.combatManager.getCooldownRemaining(companionId, abilityId, now) > 0) return;
-
-    // Spend ATB
-    if (!ability.isFree) {
-      this.combatManager.spendAtb(companionId, ability.atbCost);
-    }
-
-    // Set cooldown
-    this.combatManager.setCooldown(companionId, abilityId, ability.cooldown * 1000, now);
-
-    // Record hostile action
-    this.combatManager.recordHostileAction(companionId, now);
-
-    // Set auto-attack target if not already set
-    if (!ability.healing && !this.combatManager.hasAutoAttackTarget(companionId)) {
+    // Set auto-attack target if not already set (before executeCombatAction
+    // so companion enters melee loop even if the ability itself is ranged)
+    if (ability.targetType !== 'ally' && !this.combatManager.hasAutoAttackTarget(companionId)) {
       this.combatManager.setAutoAttackTarget(companionId, targetId);
     }
 
-    // TODO: Execute ability effect (damage/healing) through DamageCalculator
-    // This will be wired once the full ability execution pipeline is standardized
-    // for both players and companions. For now, log the action.
-    logger.info({
-      companionId,
-      abilityId,
-      abilityName: ability.name,
-      targetId,
-      zoneId,
-    }, '[CompanionCombat] Ability used');
+    // Delegate to the full combat pipeline (handles ATB, cooldown, range,
+    // damage calc, narrative broadcast, death processing, etc.)
+    await this.executeCombatAction(
+      zoneManager,
+      { id: companionEntity.id, position: companionEntity.position, type: companionEntity.type as 'companion' },
+      { id: targetEntity.id,   position: targetEntity.position,   type: targetEntity.type as 'mob' },
+      ability,
+    );
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Companion Behavior (TASKED + ACTIVE modes)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Tick companion behavior trees (TASKED) and follow logic (ACTIVE).
+   * Called every game tick right after tickCompanionCombat.
+   */
+  private async tickCompanionBehavior(_deltaTime: number): Promise<void> {
+    const now = Date.now();
+
+    for (const [companionId, controller] of this.npcControllers) {
+      // Skip companions currently in combat (combat BT takes priority)
+      if (controller.inCombat) continue;
+
+      const zoneId = this.companionToZone.get(companionId);
+      if (!zoneId) continue;
+
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+
+      const companionEntity = zm.getEntity(companionId);
+      if (!companionEntity || !companionEntity.isAlive) continue;
+
+      const companion = controller.getCompanion();
+      const state = companion.behaviorState ?? 'detached';
+
+      if (state === 'tasked') {
+        await this.tickCompanionTask(companionId, companionEntity, zm, zoneId, now);
+      } else if (state === 'active') {
+        await this.tickCompanionFollow(companionId, companionEntity, zm, zoneId);
+      }
+      // 'detached' — do nothing
+    }
+  }
+
+  /**
+   * Tick a TASKED companion's behavior tree.
+   */
+  private async tickCompanionTask(
+    companionId: string,
+    companionEntity: ReturnType<ZoneManager['getEntity']> & {},
+    zm: ZoneManager,
+    zoneId: string,
+    now: number,
+  ): Promise<void> {
+    const executor = this.companionBehaviorExecutors.get(companionId);
+    if (!executor) {
+      // No executor → reset to detached
+      await CompanionService.updateBehaviorState(companionId, {
+        behaviorState: 'detached',
+        behaviorTree: null,
+        taskDescription: null,
+      });
+      return;
+    }
+
+    // Build condition context for the tree
+    const flora = this.floraManagers.get(zoneId);
+    const nearbyPlants: PlantInfo[] = flora
+      ? flora.getHarvestablePlantsInRange(companionEntity.position, 50)
+      : [];
+
+    const ctx: ConditionContext = {
+      companionId,
+      position: companionEntity.position,
+      zoneId,
+      nearbyPlants,
+      inventoryItemCount: 0, // TODO: wire companion inventory
+      inventoryCapacity: 20,
+      healthRatio: (companionEntity.maxHealth ?? 100) > 0
+        ? (companionEntity.currentHealth ?? 100) / (companionEntity.maxHealth ?? 100)
+        : 1,
+    };
+
+    const result = executor.tick(ctx, now);
+
+    // Process action output
+    if (result.action) {
+      await this.executeCompanionBehaviorAction(companionId, companionEntity, zm, zoneId, result.action, ctx);
+    }
+
+    // Check for completion
+    if (result.status === 'success') {
+      logger.info({ companionId }, '[CompanionBehavior] Task completed successfully');
+      this.companionBehaviorExecutors.delete(companionId);
+      await CompanionService.updateBehaviorState(companionId, {
+        behaviorState: 'detached',
+        behaviorTree: null,
+        taskDescription: null,
+      });
+    } else if (result.status === 'failure') {
+      logger.info({ companionId }, '[CompanionBehavior] Task failed');
+      this.companionBehaviorExecutors.delete(companionId);
+      await CompanionService.updateBehaviorState(companionId, {
+        behaviorState: 'detached',
+        behaviorTree: null,
+        taskDescription: null,
+      });
+    }
+  }
+
+  /**
+   * Execute a behavior tree action output (e.g. /harvest, /move).
+   */
+  private async executeCompanionBehaviorAction(
+    companionId: string,
+    companionEntity: ReturnType<ZoneManager['getEntity']> & {},
+    zm: ZoneManager,
+    zoneId: string,
+    action: BehaviorAction,
+    ctx: ConditionContext,
+  ): Promise<void> {
+    switch (action.command) {
+      case '/harvest': {
+        // Find nearest harvestable plant and harvest it
+        const flora = this.floraManagers.get(zoneId);
+        if (!flora) break;
+
+        const plants = flora.getHarvestablePlantsInRange(companionEntity.position, 10);
+        if (plants.length === 0) break;
+
+        const nearest = plants[0]; // Already sorted by distance
+        const items = flora.harvest(nearest.id, companionId);
+        if (items && items.length > 0) {
+          const totalItems = items.reduce((sum, i) => sum + i.quantity, 0);
+          await CompanionService.updateBehaviorState(companionId, {
+            harvestsCompleted: { increment: 1 },
+            itemsGathered: { increment: totalItems },
+            lastHarvestAt: new Date(),
+          });
+          logger.debug({ companionId, plantId: nearest.id, items }, '[CompanionBehavior] Harvest completed');
+        }
+        break;
+      }
+
+      case '/move': {
+        // Move toward target — for now, move toward nearest harvestable plant
+        const target = action.args?.target as string | undefined;
+        let targetPos: { x: number; y: number; z: number } | null = null;
+
+        if (target === 'nearestHarvestablePlant' && ctx.nearbyPlants.length > 0) {
+          targetPos = ctx.nearbyPlants[0].position;
+        }
+
+        if (targetPos) {
+          const dx = targetPos.x - companionEntity.position.x;
+          const dz = targetPos.z - companionEntity.position.z;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          if (dist > 1.5) {
+            const speed = 5.0 * 0.05; // 5 m/s * ~50ms tick (walk pace for autonomous tasks)
+            const step = Math.min(speed, dist);
+            const physics = zm.getPhysicsSystem();
+
+            // Steer around buildings
+            let heading = Math.atan2(dx / dist, dz / dist) * (180 / Math.PI);
+            if (heading < 0) heading += 360;
+            const steered = physics.steerAroundWalls(companionEntity.position, heading, 4.0, 0.5);
+            if (steered !== null) heading = steered;
+
+            const rad = (heading * Math.PI) / 180;
+            const newPos = {
+              x: companionEntity.position.x + Math.sin(rad) * step,
+              y: companionEntity.position.y,
+              z: companionEntity.position.z + Math.cos(rad) * step,
+            };
+            const resolved = physics.resolveAgainstStructures(newPos, 0.5);
+            const snapped = zm.updateCompanionPosition(companionId, resolved, heading);
+            void this.broadcastPositionUpdate(companionId, zoneId, snapped);
+          }
+        }
+        break;
+      }
+
+      case '/tell': {
+        const message = action.args?.message as string | undefined;
+        if (message) {
+          logger.info({ companionId, message }, '[CompanionBehavior] Companion says');
+          // TODO: broadcast as NPC chat message
+        }
+        break;
+      }
+
+      case '/stop': {
+        // Stop current task
+        this.companionBehaviorExecutors.delete(companionId);
+        await CompanionService.updateBehaviorState(companionId, {
+          behaviorState: 'detached',
+          behaviorTree: null,
+          taskDescription: null,
+        });
+        break;
+      }
+    }
+  }
+
+  /**
+   * Tick ACTIVE companion — follow the owner.
+   */
+  private async tickCompanionFollow(
+    companionId: string,
+    companionEntity: ReturnType<ZoneManager['getEntity']> & {},
+    zm: ZoneManager,
+    zoneId: string,
+  ): Promise<void> {
+    const controller = this.npcControllers.get(companionId);
+    if (!controller) return;
+
+    const companion = controller.getCompanion();
+    const ownerCharId = companion.ownerCharacterId;
+
+    // Find owner entity — only follow the actual owner, never another player
+    if (!ownerCharId) return;
+    const ownerEntity = zm.getEntity(ownerCharId);
+    if (!ownerEntity || !ownerEntity.isAlive) return;
+
+    const dx = ownerEntity.position.x - companionEntity.position.x;
+    const dz = ownerEntity.position.z - companionEntity.position.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (dist > 5.0) {
+      // Slightly faster than owner so the companion catches up instead of drifting behind
+      const ownerSpeed = this.movementSystem.getMovementSpeed(ownerCharId) ?? 5.0;
+      const speed = (ownerSpeed * 1.15) * 0.05; // +15% to close gaps; * ~50ms tick
+      const step = Math.min(speed, dist);
+      const physics = zm.getPhysicsSystem();
+
+      // Steer around buildings
+      let heading = Math.atan2(dx / dist, dz / dist) * (180 / Math.PI);
+      if (heading < 0) heading += 360;
+      const steered = physics.steerAroundWalls(companionEntity.position, heading, 4.0, 0.5);
+      if (steered !== null) heading = steered;
+
+      const rad = (heading * Math.PI) / 180;
+      const newPos = {
+        x: companionEntity.position.x + Math.sin(rad) * step,
+        y: companionEntity.position.y,
+        z: companionEntity.position.z + Math.cos(rad) * step,
+      };
+      const resolved = physics.resolveAgainstStructures(newPos, 0.5);
+      const snapped = zm.updateCompanionPosition(companionId, resolved, heading);
+      void this.broadcastPositionUpdate(companionId, zoneId, snapped);
+    }
+  }
+
+  // ── Companion command handlers ────────────────────────────────────────────
+
+  /** Sync in-memory controller state after a DB write. */
+  private patchControllerState(companionId: string, fields: Partial<Companion>): void {
+    const controller = this.npcControllers.get(companionId);
+    if (controller) controller.patchCompanion(fields);
+  }
+
+  /**
+   * Find the player's companion. Returns the first companion owned by this
+   * character, or the first NPC companion in the character's zone as fallback.
+   */
+  private async findPlayerCompanion(characterId: string): Promise<{ companion: Companion; zoneId: string } | null> {
+    const owned = await CompanionService.findByOwnerCharacter(characterId);
+    if (owned) {
+      const zoneId = this.companionToZone.get(owned.id);
+      if (zoneId) return { companion: owned, zoneId };
+    }
+
+    return null;
+  }
+
+  private async processCompanionStatus(characterId: string): Promise<{ success: boolean; message?: string; data?: unknown }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+    const state = companion.behaviorState ?? 'detached';
+    const parts = [
+      `${companion.name} — Mode: ${state.toUpperCase()}`,
+    ];
+    if (companion.taskDescription) parts.push(`Task: ${companion.taskDescription}`);
+    parts.push(`Harvests: ${companion.harvestsCompleted}, Items gathered: ${companion.itemsGathered}`);
+
+    return {
+      success: true,
+      message: parts.join('\n'),
+      data: {
+        companionId: companion.id,
+        name: companion.name,
+        behaviorState: state,
+        taskDescription: companion.taskDescription,
+        harvestsCompleted: companion.harvestsCompleted,
+        itemsGathered: companion.itemsGathered,
+      },
+    };
+  }
+
+  private async processCompanionFollow(characterId: string): Promise<void> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return;
+
+    const { companion } = found;
+    this.companionBehaviorExecutors.delete(companion.id);
+    await CompanionService.updateBehaviorState(companion.id, {
+      behaviorState: 'active',
+      behaviorTree: null,
+      taskDescription: null,
+    });
+    this.patchControllerState(companion.id, { behaviorState: 'active', behaviorTree: null, taskDescription: null, ownerCharacterId: characterId });
+    logger.info({ companionId: companion.id, characterId }, '[CompanionCommand] Follow');
+  }
+
+  private async processCompanionDetach(characterId: string): Promise<void> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return;
+
+    const { companion } = found;
+    this.companionBehaviorExecutors.delete(companion.id);
+    await CompanionService.updateBehaviorState(companion.id, {
+      behaviorState: 'detached',
+      behaviorTree: null,
+      taskDescription: null,
+    });
+    this.patchControllerState(companion.id, { behaviorState: 'detached', behaviorTree: null, taskDescription: null });
+    logger.info({ companionId: companion.id, characterId }, '[CompanionCommand] Detach');
+  }
+
+  private async processCompanionTask(
+    characterId: string,
+    description: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+    const result = await this.companionTaskService.generateTaskTree(companion, description, this.llmService);
+
+    if (!result.tree) {
+      return { success: false, message: result.rejection };
+    }
+
+    // Store tree and enter TASKED mode
+    const taskAssignedAt = new Date();
+    this.companionBehaviorExecutors.set(companion.id, new BehaviorTreeExecutor(result.tree));
+    await CompanionService.updateBehaviorState(companion.id, {
+      behaviorState: 'tasked',
+      behaviorTree: result.tree as unknown as Prisma.InputJsonValue,
+      taskDescription: description,
+      taskAssignedAt,
+    });
+    this.patchControllerState(companion.id, { behaviorState: 'tasked', taskDescription: description, taskAssignedAt, ownerCharacterId: characterId });
+
+    logger.info({ companionId: companion.id, description }, '[CompanionCommand] Task assigned');
+    return { success: true, message: `${companion.name} is working on: "${description}"` };
+  }
+
+  private async processCompanionHarvest(
+    characterId: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+
+    // Assign default harvest tree (no LLM call)
+    const taskAssignedAt = new Date();
+    this.companionBehaviorExecutors.set(companion.id, new BehaviorTreeExecutor(DEFAULT_HARVEST_TREE));
+    await CompanionService.updateBehaviorState(companion.id, {
+      behaviorState: 'tasked',
+      behaviorTree: DEFAULT_HARVEST_TREE as unknown as Prisma.InputJsonValue,
+      taskDescription: 'Harvesting nearby plants',
+      taskAssignedAt,
+    });
+    this.patchControllerState(companion.id, { behaviorState: 'tasked', taskDescription: 'Harvesting nearby plants', taskAssignedAt, ownerCharacterId: characterId });
+
+    logger.info({ companionId: companion.id }, '[CompanionCommand] Harvest assigned');
+    return { success: true, message: `${companion.name} begins harvesting nearby plants.` };
+  }
+
+  private async processCompanionRecall(characterId: string): Promise<void> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return;
+
+    const { companion } = found;
+    this.companionBehaviorExecutors.delete(companion.id);
+    await CompanionService.updateBehaviorState(companion.id, {
+      behaviorState: 'active',
+      behaviorTree: null,
+      taskDescription: null,
+    });
+    this.patchControllerState(companion.id, { behaviorState: 'active', behaviorTree: null, taskDescription: null, ownerCharacterId: characterId });
+    logger.info({ companionId: companion.id, characterId }, '[CompanionCommand] Recall');
+  }
+
+  private async processCompanionReport(
+    characterId: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+    const state = companion.behaviorState ?? 'detached';
+    // Simple report — LLM-based report deferred to later iteration
+    const report = [
+      `${companion.name} reporting.`,
+      `Current mode: ${state.toUpperCase()}.`,
+      `Harvests completed: ${companion.harvestsCompleted}.`,
+      `Items gathered: ${companion.itemsGathered}.`,
+    ];
+    if (companion.taskDescription) {
+      report.push(`Current task: ${companion.taskDescription}.`);
+    }
+
+    return { success: true, message: report.join(' ') };
+  }
+
+  // ── Companion management (manual / non-LLM) ─────────────────────────────
+
+  private async processCompanionSetArchetype(
+    characterId: string,
+    archetype: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const valid = ['scrappy_fighter', 'cautious_healer', 'opportunist', 'tank'];
+    if (!valid.includes(archetype)) {
+      return { success: false, message: `Invalid archetype. Choose: ${valid.join(', ')}` };
+    }
+
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+    const baseline = getBaselineForArchetype(archetype);
+
+    // Update DB
+    await CompanionService.updateCombatConfig(companion.id, {
+      archetype,
+      combatSettings: baseline as unknown as Prisma.InputJsonValue,
+    });
+
+    // Update in-memory controller
+    const controller = this.npcControllers.get(companion.id);
+    if (controller) {
+      controller.resetToArchetype(archetype);
+      controller.patchCompanion({ archetype } as Partial<Companion>);
+    }
+
+    this._pushCompanionConfig(characterId, { ...companion, archetype });
+    return { success: true, message: `Companion archetype changed to ${archetype}.` };
+  }
+
+  private async processCompanionConfigure(
+    characterId: string,
+    settings: Partial<CompanionCombatSettings>,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+    const controller = this.npcControllers.get(companion.id);
+    if (!controller) return { success: false, message: 'Companion AI not active.' };
+
+    const merged = mergePartialSettings(controller.getCurrentSettings(), settings);
+    controller.applyManualSettings(merged);
+
+    // Persist
+    await CompanionService.updateCombatConfig(companion.id, {
+      combatSettings: merged as unknown as Prisma.InputJsonValue,
+    });
+
+    this._pushCompanionConfig(characterId, companion);
+    return { success: true, message: 'Combat settings updated.' };
+  }
+
+  private async processCompanionSetAbilities(
+    characterId: string,
+    abilityIds: string[],
+  ): Promise<{ success: boolean; message?: string }> {
+    // Validate against T1 ability list
+    const validIds = new Set(T1_ABILITIES.map(a => a.id));
+    const invalid = abilityIds.filter(id => !validIds.has(id));
+    if (invalid.length > 0) {
+      return { success: false, message: `Unknown abilities: ${invalid.join(', ')}` };
+    }
+
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+
+    // Update DB
+    await CompanionService.updateCombatConfig(companion.id, { abilityIds });
+
+    // Update controller
+    const controller = this.npcControllers.get(companion.id);
+    if (controller) {
+      const resolved = T1_ABILITIES.filter(a => abilityIds.includes(a.id));
+      controller.setAbilities(resolved);
+      controller.patchCompanion({ abilityIds } as Partial<Companion>);
+    }
+
+    this._pushCompanionConfig(characterId, { ...companion, abilityIds });
+    return { success: true, message: `Companion abilities updated: ${abilityIds.join(', ') || 'none'}.` };
+  }
+
+  private async processCompanionGetConfig(
+    characterId: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+    this._pushCompanionConfig(characterId, found.companion);
+    return { success: true, message: '' };
+  }
+
+  /** Push full companion config to the owning client via the gateway. */
+  private _pushCompanionConfig(characterId: string, companion: Companion): void {
+    const socketId = this._charToSocket.get(characterId);
+    if (!socketId) return;
+
+    const controller = this.npcControllers.get(companion.id);
+    const combatSettings = controller?.getCurrentSettings() ?? getBaselineForArchetype(companion.archetype ?? 'opportunist');
+    const controllerAbilities = controller?.getAbilities() ?? [];
+
+    // Build the ability manifest: all T1 abilities with enabled flag
+    const enabledSet = new Set(companion.abilityIds ?? []);
+    const abilities = T1_ABILITIES.map(a => ({
+      id:          a.id,
+      name:        a.name,
+      description: a.description ?? '',
+      enabled:     enabledSet.has(a.id),
+      tags:        a.tags ?? [],
+    }));
+
+    const payload = {
+      companionId:       companion.id,
+      name:              companion.name,
+      level:             companion.level,
+      currentHealth:     companion.currentHealth,
+      maxHealth:         companion.maxHealth,
+      isAlive:           companion.isAlive,
+      archetype:         companion.archetype ?? 'opportunist',
+      behaviorState:     companion.behaviorState ?? 'detached',
+      taskDescription:   companion.taskDescription ?? null,
+      combatSettings,
+      abilities,
+      harvestsCompleted: companion.harvestsCompleted,
+      itemsGathered:     companion.itemsGathered,
+    };
+
+    void this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: { socketId, event: 'companion_config', data: payload },
+      timestamp: Date.now(),
+    });
+  }
+
+  // ── Scripted Object process methods ─────────────────────────────────────
+
+  private async broadcastScriptedObjectMessage(
+    zoneId: string,
+    objectId: string,
+    objectName: string,
+    channel: 'say' | 'emote',
+    message: string,
+    position: { x: number; y: number; z: number },
+  ): Promise<void> {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const range = channel === 'emote' ? 45.72 : 6.096; // emote 150ft, say 20ft
+    const nearbySocketIds = zoneManager.getPlayerSocketIdsInRange(position, range);
+
+    const formattedMessage = channel === 'emote'
+      ? `${objectName} ${message}`
+      : message;
+
+    this.trackChatMessage(zoneId, objectName, channel, formattedMessage);
+
+    for (const socketId of nearbySocketIds) {
+      const clientMessage: ClientMessagePayload = {
+        socketId,
+        event: 'chat',
+        data: {
+          channel,
+          sender: objectName,
+          senderId: objectId,
+          senderType: 'scripted_object',
+          message: formattedMessage,
+          timestamp: Date.now(),
+        },
+      };
+
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId: '',
+        socketId,
+        payload: clientMessage,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  private async sendSystemMessageToCharacter(characterId: string, message: string): Promise<void> {
+    const zoneId = this.characterToZone.get(characterId);
+    if (!zoneId) return;
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+    const entity = zoneManager.getEntity(characterId);
+    if (!entity?.socketId) return;
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId: entity.socketId,
+      payload: {
+        socketId: entity.socketId,
+        event: 'chat',
+        data: {
+          channel: 'system',
+          sender: 'System',
+          senderId: '',
+          message,
+          timestamp: Date.now(),
+        },
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Resolve a scripted object by ID or name for the given owner. */
+  private async resolveScriptedObject(
+    characterId: string,
+    target: string,
+  ): Promise<{ success: false; message: string } | { success: true; object: any }> {
+    // Try by ID first
+    const byId = await ScriptedObjectService.findById(target);
+    if (byId) {
+      if (byId.ownerCharacterId !== characterId) {
+        return { success: false, message: 'You do not own that object.' };
+      }
+      return { success: true, object: byId };
+    }
+
+    // Try by name among player's objects
+    const owned = await ScriptedObjectService.findByOwner(characterId);
+    const needle = target.toLowerCase();
+    const byName = owned.find(o => o.name.toLowerCase() === needle);
+    if (byName) return { success: true, object: byName };
+
+    return { success: false, message: `Object "${target}" not found.` };
+  }
+
+  private async processScriptedObjectPlace(
+    characterId: string,
+    zoneId: string,
+    position: { x: number; y: number; z: number },
+    name: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const MAX_OBJECTS_PER_PLAYER = 10;
+    const count = await ScriptedObjectService.countByOwner(characterId);
+    if (count >= MAX_OBJECTS_PER_PLAYER) {
+      return { success: false, message: `You can have at most ${MAX_OBJECTS_PER_PLAYER} scripted objects.` };
+    }
+
+    const obj = await ScriptedObjectService.create({
+      name,
+      ownerCharacterId: characterId,
+      zoneId,
+      positionX: position.x,
+      positionY: position.y,
+      positionZ: position.z,
+    });
+
+    // Add entity to zone
+    const zoneManager = this.zones.get(zoneId);
+    if (zoneManager) {
+      zoneManager.addScriptedObject({
+        id: obj.id,
+        name: obj.name,
+        position: { x: obj.positionX, y: obj.positionY, z: obj.positionZ },
+      });
+    }
+
+    // Register with controller
+    const controller = this.scriptedObjectControllers.get(zoneId);
+    if (controller) {
+      controller.registerObject({
+        id: obj.id,
+        name: obj.name,
+        position: { x: obj.positionX, y: obj.positionY, z: obj.positionZ },
+        ownerCharacterId: obj.ownerCharacterId,
+        scriptSource: obj.scriptSource,
+        stateData: {},
+        isActive: true,
+        errorCount: 0,
+      });
+    }
+
+    logger.info({ objectId: obj.id, name, zoneId, characterId }, '[ScriptedObject] Placed');
+    return { success: true, message: `Placed "${name}" (${obj.id}). Use /object script ${obj.id} <lua> to add a script.` };
+  }
+
+  private async processScriptedObjectEdit(
+    characterId: string,
+    target: string,
+  ): Promise<{ success: boolean; message?: string; data?: any }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    const source = obj.scriptSource || '(empty)';
+    return {
+      success: true,
+      message: `── Script for "${obj.name}" (${obj.id}) ──\n${source}\n── End of script ──`,
+      data: { objectId: obj.id, name: obj.name, scriptSource: obj.scriptSource },
+    };
+  }
+
+  private async processScriptedObjectScript(
+    characterId: string,
+    _zoneId: string,
+    objectId: string,
+    scriptSource: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const obj = await ScriptedObjectService.findById(objectId);
+    if (!obj) return { success: false, message: `Object "${objectId}" not found.` };
+    if (obj.ownerCharacterId !== characterId) return { success: false, message: 'You do not own that object.' };
+
+    // Update in DB
+    await ScriptedObjectService.updateScript(objectId, scriptSource);
+
+    // Recompile in controller
+    const controller = this.scriptedObjectControllers.get(obj.zoneId);
+    if (controller) {
+      const compileResult = controller.recompileObject(objectId, scriptSource);
+      if (!compileResult.success) {
+        return { success: false, message: `Compile error: ${compileResult.error}` };
+      }
+    }
+
+    logger.info({ objectId, characterId }, '[ScriptedObject] Script updated');
+    return { success: true, message: `Script updated for "${obj.name}".` };
+  }
+
+  private async processScriptedObjectPickup(
+    characterId: string,
+    zoneId: string,
+    target: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+
+    // Remove from controller
+    const controller = this.scriptedObjectControllers.get(obj.zoneId);
+    if (controller) controller.removeObject(obj.id);
+
+    // Remove from zone entity list
+    const zoneManager = this.zones.get(obj.zoneId);
+    if (zoneManager) zoneManager.removeScriptedObject(obj.id);
+
+    // Delete from DB
+    await ScriptedObjectService.delete(obj.id);
+
+    logger.info({ objectId: obj.id, name: obj.name, characterId }, '[ScriptedObject] Picked up');
+    return { success: true, message: `Picked up "${obj.name}".` };
+  }
+
+  private async processScriptedObjectInspect(
+    characterId: string,
+    target: string,
+  ): Promise<{ success: boolean; message?: string; data?: any }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    const lines = [
+      `"${obj.name}" (${obj.id})`,
+      `Position: ${obj.positionX.toFixed(1)}, ${obj.positionY.toFixed(1)}, ${obj.positionZ.toFixed(1)}`,
+      `Zone: ${obj.zoneId}`,
+      `Active: ${obj.isActive ? 'Yes' : 'No'}`,
+      `Errors: ${obj.errorCount}`,
+    ];
+    if (obj.lastErrorMsg) lines.push(`Last error: ${obj.lastErrorMsg}`);
+    if (obj.description) lines.push(`Description: ${obj.description}`);
+    lines.push(`Script: ${obj.scriptSource ? `${obj.scriptSource.length} bytes` : '(empty)'}`);
+
+    return { success: true, message: lines.join('\n'), data: obj };
+  }
+
+  private async processScriptedObjectList(
+    characterId: string,
+  ): Promise<{ success: boolean; message?: string; data?: any }> {
+    const objects = await ScriptedObjectService.findByOwner(characterId);
+    if (objects.length === 0) {
+      return { success: true, message: 'You have no scripted objects.' };
+    }
+
+    const lines = objects.map(o =>
+      `  ${o.name} (${o.id}) — ${o.isActive ? 'active' : 'inactive'}${o.errorCount > 0 ? ` [${o.errorCount} errors]` : ''}`
+    );
+    return {
+      success: true,
+      message: `Your scripted objects (${objects.length}):\n${lines.join('\n')}`,
+      data: objects.map(o => ({ id: o.id, name: o.name, isActive: o.isActive, zoneId: o.zoneId })),
+    };
+  }
+
+  private async processScriptedObjectActivate(
+    characterId: string,
+    _zoneId: string,
+    target: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    await ScriptedObjectService.activate(obj.id);
+
+    const controller = this.scriptedObjectControllers.get(obj.zoneId);
+    if (controller) {
+      const activateResult = controller.activateObject(obj.id);
+      if (!activateResult.success) {
+        return { success: false, message: `Activation failed: ${activateResult.error}` };
+      }
+    }
+
+    logger.info({ objectId: obj.id, characterId }, '[ScriptedObject] Activated');
+    return { success: true, message: `"${obj.name}" activated.` };
+  }
+
+  private async processScriptedObjectDeactivate(
+    characterId: string,
+    _zoneId: string,
+    target: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    await ScriptedObjectService.deactivate(obj.id);
+
+    const controller = this.scriptedObjectControllers.get(obj.zoneId);
+    if (controller) controller.deactivateObject(obj.id);
+
+    logger.info({ objectId: obj.id, characterId }, '[ScriptedObject] Deactivated');
+    return { success: true, message: `"${obj.name}" deactivated.` };
+  }
+
+  private async processScriptedObjectVerbs(
+    characterId: string,
+    target: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    const verbScripts = await ObjectVerbScriptService.findByObject(obj.id);
+
+    if (verbScripts.length === 0) {
+      return { success: true, message: `"${obj.name}" has no verb scripts. Use /edit ${obj.name}:<verb> to create one.` };
+    }
+
+    const lines = verbScripts.map(vs =>
+      `  ${vs.verb} (v${vs.version}) — ${vs.source.length} bytes`
+    );
+    return {
+      success: true,
+      message: `Verbs on "${obj.name}" (${verbScripts.length}):\n${lines.join('\n')}`,
+    };
+  }
+
+  private async processScriptedObjectDoVerb(
+    characterId: string,
+    zoneId: string,
+    target: string,
+    verb: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, target);
+    if (!result.success) return result;
+
+    const obj = result.object;
+
+    // Ensure object is in the same zone
+    if (obj.zoneId !== zoneId) {
+      return { success: false, message: 'That object is not in your current zone.' };
+    }
+
+    const controller = this.scriptedObjectControllers.get(zoneId);
+    if (!controller) {
+      return { success: false, message: 'Script engine not available for this zone.' };
+    }
+
+    // Provide actor context to the Lua verb function
+    const zm = this.zones.get(zoneId);
+    const actor = zm?.getEntity(characterId);
+    const actorContext = {
+      actorId: characterId,
+      actorName: actor?.name ?? 'Unknown',
+      actorType: 'player',
+    };
+
+    const callResult = controller.callVerb(obj.id, verb, actorContext);
+    if (!callResult.success) {
+      return { success: false, message: callResult.error };
+    }
+
+    return { success: true, message: '' };
+  }
+
+  // ── Script Editor ─────────────────────────────────────────────────────
+
+  /** Active editor sessions: editorId → session metadata */
+  private editorSessions = new Map<string, {
+    objectId: string;
+    verb: string;
+    characterId: string;
+    socketId: string;
+    verbScriptId: string | null; // null if creating new
+  }>();
+
+  private async processEditorOpenRequest(
+    characterId: string,
+    _zoneId: string,
+    socketId: string,
+    objectRef: string,
+    verb: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, objectRef);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    const readOnly = obj.ownerCharacterId !== characterId;
+
+    // Find existing verb script or prepare blank stub
+    let verbScript = await ObjectVerbScriptService.findByObjectAndVerb(obj.id, verb);
+    let source = '';
+    let version = 0;
+    let verbScriptId: string | null = null;
+
+    if (verbScript) {
+      source = verbScript.source;
+      version = verbScript.version;
+      verbScriptId = verbScript.id;
+    } else if (!readOnly) {
+      // New verb — show blank template
+      source = `function ${verb}(ctx)\n  -- Your code here\nend`;
+      version = 0;
+    } else {
+      return { success: false, message: `Verb "${verb}" does not exist on "${obj.name}".` };
+    }
+
+    // Create editor session
+    const editorId = `ed-${randomUUID()}`;
+    this.editorSessions.set(editorId, {
+      objectId: obj.id,
+      verb,
+      characterId,
+      socketId,
+      verbScriptId,
+    });
+
+    // Send editor_open to client
+    const zoneManager = this.zones.get(obj.zoneId);
+    const entity = zoneManager?.getEntity(characterId);
+    if (entity?.socketId) {
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId: entity.socketId,
+        payload: {
+          socketId: entity.socketId,
+          event: 'editor_open',
+          data: {
+            editorId,
+            objectId: obj.id,
+            objectName: obj.name,
+            verb,
+            source,
+            language: 'lua',
+            readOnly,
+            version,
+            origin: 'edit',
+          },
+        },
+        timestamp: Date.now(),
+      });
+    }
+
+    return { success: true, message: verbScript ? `Editing ${obj.name}:${verb}` : `Creating new verb "${verb}" on "${obj.name}"` };
+  }
+
+  private async processEditorUndoRequest(
+    characterId: string,
+    _zoneId: string,
+    socketId: string,
+    objectRef: string,
+    verb: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const result = await this.resolveScriptedObject(characterId, objectRef);
+    if (!result.success) return result;
+
+    const obj = result.object;
+    if (obj.ownerCharacterId !== characterId) {
+      return { success: false, message: 'You do not own that object.' };
+    }
+
+    const verbScript = await ObjectVerbScriptService.findByObjectAndVerb(obj.id, verb);
+    if (!verbScript) {
+      return { success: false, message: `Verb "${verb}" does not exist on "${obj.name}".` };
+    }
+
+    const restored = await ObjectVerbScriptService.undo(verbScript.id);
+    if (!restored) {
+      return { success: false, message: `No previous version to restore for ${obj.name}:${verb}` };
+    }
+
+    // Hot-swap in controller
+    const controller = this.scriptedObjectControllers.get(obj.zoneId);
+    if (controller) {
+      const compileResult = controller.recompileVerb(obj.id, verb, restored.source);
+      if (!compileResult.success) {
+        return { success: false, message: `Undo succeeded but recompile failed: ${compileResult.error}` };
+      }
+    }
+
+    // Send editor_open with the restored source so player can see it
+    const zoneManager = this.zones.get(obj.zoneId);
+    const entity = zoneManager?.getEntity(characterId);
+    if (entity?.socketId) {
+      const editorId = `ed-${randomUUID()}`;
+      this.editorSessions.set(editorId, {
+        objectId: obj.id,
+        verb,
+        characterId,
+        socketId: entity.socketId,
+        verbScriptId: restored.id,
+      });
+
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId: entity.socketId,
+        payload: {
+          socketId: entity.socketId,
+          event: 'editor_open',
+          data: {
+            editorId,
+            objectId: obj.id,
+            objectName: obj.name,
+            verb,
+            source: restored.source,
+            language: 'lua',
+            readOnly: false,
+            version: restored.version,
+            origin: 'undo',
+          },
+        },
+        timestamp: Date.now(),
+      });
+    }
+
+    logger.info({ objectId: obj.id, verb, characterId }, '[ScriptEditor] Undo');
+    return { success: true, message: `Rolled back ${obj.name}:${verb} to v${restored.version}. Editor opened with restored source.` };
+  }
+
+  /**
+   * Handle editor_save from client (routed via gateway).
+   * Compiles, persists with history, and hot-swaps.
+   */
+  async handleEditorSave(editorId: string, source: string): Promise<void> {
+    const session = this.editorSessions.get(editorId);
+    if (!session) return;
+
+    const { objectId, verb, characterId, socketId, verbScriptId } = session;
+
+    // Compile-check first
+    const controller = this.scriptedObjectControllers.get(
+      (await ScriptedObjectService.findById(objectId))?.zoneId ?? '',
+    );
+
+    const compileResult = controller
+      ? controller.checkCompileVerb(objectId, verb, source)
+      : { success: true, errors: [], warnings: [] };
+
+    if (!compileResult.success) {
+      // Send error result
+      await this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: {
+          socketId,
+          event: 'editor_result',
+          data: {
+            editorId,
+            success: false,
+            errors: compileResult.errors,
+            warnings: compileResult.warnings,
+          },
+        },
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    // Persist with version history
+    let updatedScript;
+    if (verbScriptId) {
+      updatedScript = await ObjectVerbScriptService.saveWithHistory(verbScriptId, source, characterId);
+    } else {
+      // Create new verb script
+      updatedScript = await ObjectVerbScriptService.create({
+        objectId,
+        verb,
+        source,
+        authorId: characterId,
+      });
+      session.verbScriptId = updatedScript.id;
+    }
+
+    // Hot-swap in controller
+    if (controller) {
+      controller.recompileVerb(objectId, verb, source);
+    }
+
+    // Send success result
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'editor_result',
+        data: {
+          editorId,
+          success: true,
+          version: updatedScript.version,
+          errors: [],
+          warnings: compileResult.warnings,
+        },
+      },
+      timestamp: Date.now(),
+    });
+
+    logger.info({ objectId, verb, characterId, version: updatedScript.version }, '[ScriptEditor] Save');
+  }
+
+  /**
+   * Handle editor_compile from client (compile-check only, no persist).
+   */
+  async handleEditorCompile(editorId: string, source: string): Promise<void> {
+    const session = this.editorSessions.get(editorId);
+    if (!session) return;
+
+    const { objectId, verb, characterId, socketId } = session;
+
+    const obj = await ScriptedObjectService.findById(objectId);
+    const controller = obj ? this.scriptedObjectControllers.get(obj.zoneId) : null;
+
+    const compileResult = controller
+      ? controller.checkCompileVerb(objectId, verb, source)
+      : { success: true, errors: [], warnings: [] };
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'editor_result',
+        data: {
+          editorId,
+          success: compileResult.success,
+          errors: compileResult.errors,
+          warnings: compileResult.warnings,
+        },
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Handle editor_revert from client — send back the last-saved source.
+   */
+  async handleEditorRevert(editorId: string): Promise<void> {
+    const session = this.editorSessions.get(editorId);
+    if (!session) return;
+
+    const { objectId, verb, characterId, socketId, verbScriptId } = session;
+
+    let source = '';
+    let version = 0;
+    if (verbScriptId) {
+      const vs = await ObjectVerbScriptService.findById(verbScriptId);
+      if (vs) {
+        source = vs.source;
+        version = vs.version;
+      }
+    } else {
+      source = `function ${verb}(ctx)\n  -- Your code here\nend`;
+    }
+
+    const obj = await ScriptedObjectService.findById(objectId);
+
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'editor_open',
+        data: {
+          editorId,
+          objectId,
+          objectName: obj?.name ?? 'Unknown',
+          verb,
+          source,
+          language: 'lua',
+          readOnly: false,
+          version,
+          origin: 'edit',
+        },
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Handle editor_close from client — clean up session.
+   */
+  handleEditorClose(editorId: string): void {
+    this.editorSessions.delete(editorId);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
 
   private async handleCombatTimeouts(expired: string[]): Promise<void> {
     for (const entityId of expired) {
@@ -7105,11 +9933,17 @@ export class DistributedWorldManager implements IWildlifeWorld {
     for (const [zoneId, zoneManager] of this.zones.entries()) {
       const corruptionTag = this.zoneCorruptionTags.get(zoneId) || 'WILDS';
       const characterIds: string[] = [];
+      const characterPositions = new Map<string, { x: number; z: number }>();
 
       // Get all player character IDs in this zone
       for (const [charId, charZoneId] of this.characterToZone.entries()) {
         if (charZoneId === zoneId) {
           characterIds.push(charId);
+          // Collect positions for beacon zone checks
+          const entity = zoneManager.getEntity(charId);
+          if (entity) {
+            characterPositions.set(charId, { x: entity.position.x, z: entity.position.z });
+          }
         }
       }
 
@@ -7118,6 +9952,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
           zoneId,
           corruptionTag,
           characterIds,
+          characterPositions,
         });
       }
     }
@@ -7272,6 +10107,454 @@ export class DistributedWorldManager implements IWildlifeWorld {
     return this.corruptionSystem;
   }
 
+  // ── Guild System Helpers ────────────────────────────────────────────────
+
+  /**
+   * Check if a character position is within a beacon zone or polygon for corruption purposes.
+   */
+  private checkBeaconZone(
+    _characterId: string,
+    zoneId: string,
+    position: { x: number; z: number },
+  ): {
+    inBeaconRadius: boolean;
+    inPolygon: boolean;
+    polygonEffectiveTier: number;
+    guildCorruptionResistPercent: number;
+  } {
+    const result = {
+      inBeaconRadius: false,
+      inPolygon: false,
+      polygonEffectiveTier: 0,
+      guildCorruptionResistPercent: 0,
+    };
+
+    // Check lit beacons in this zone
+    const beacons = this.litBeaconCache.get(zoneId);
+    if (beacons) {
+      for (const b of beacons) {
+        const d = distance2D(position, { x: b.worldX, z: b.worldZ });
+        if (d <= b.effectRadius) {
+          result.inBeaconRadius = true;
+          break;
+        }
+      }
+    }
+
+    // Check active polygons
+    for (const poly of this.activePolygonCache) {
+      if (isPointInPolygon(position, poly.vertices)) {
+        result.inPolygon = true;
+        result.polygonEffectiveTier = interpolatePolygonTier(position, poly.beaconTiers);
+        break;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Passive stamina regen — all living players, always, regardless of location.
+   * 1% of maxStamina every 3s ≈ 20%/min.
+   */
+  private async tickStaminaRegen(): Promise<void> {
+    for (const [characterId, zoneId] of this.characterToZone) {
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+
+      const entity = zm.getEntity(characterId);
+      if (!entity || !entity.isAlive) continue;
+
+      const character = await CharacterService.findById(characterId);
+      if (!character || !character.isAlive) continue;
+      if (character.currentStamina >= character.maxStamina) continue;
+
+      const regenAmount = Math.ceil(character.maxStamina * DistributedWorldManager.STAMINA_REGEN_BASE_PCT);
+      const newStamina = Math.min(character.maxStamina, character.currentStamina + regenAmount);
+      if (newStamina === character.currentStamina) continue;
+
+      await CharacterService.updateResources(characterId, { currentStamina: newStamina });
+
+      await this.sendCharacterResourcesUpdate(zm, characterId, {
+        health: { current: character.currentHp, max: character.maxHp },
+        stamina: { current: newStamina, max: character.maxStamina },
+        mana: { current: character.currentMana, max: character.maxMana },
+      });
+    }
+  }
+
+  /**
+   * Periodic beacon regen tick — restores HP and MP for players within range
+   * of a lit guild beacon, civic townhall (T3), or library beacon (T2).
+   * Regen scales with the highest effective tier found:
+   *   tier 1 = 1x, tier 2 = 1.5x, tier 3 = 2x, tier 4 = 2.5x, tier 5 = 3x
+   */
+  private async tickBeaconRegen(): Promise<void> {
+    for (const [characterId, zoneId] of this.characterToZone) {
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+
+      const entity = zm.getEntity(characterId);
+      if (!entity || !entity.isAlive) continue;
+
+      // ── Find highest effective tier from any regen source ──
+      let bestTier = 0;
+
+      // 1. Guild beacons (use their actual tier)
+      const beacons = this.litBeaconCache.get(zoneId);
+      if (beacons) {
+        for (const b of beacons) {
+          const dx = entity.position.x - b.worldX;
+          const dz = entity.position.z - b.worldZ;
+          if (dx * dx + dz * dz <= b.effectRadius * b.effectRadius && b.tier > bestTier) {
+            bestTier = b.tier;
+          }
+        }
+      }
+
+      // 2. Townhalls count as T3, libraries count as T2
+      const anchors = this.civicAnchorCache.get(zoneId);
+      if (anchors) {
+        for (const a of anchors) {
+          const dx = entity.position.x - a.worldX;
+          const dz = entity.position.z - a.worldZ;
+          if (dx * dx + dz * dz <= a.wardRadius * a.wardRadius) {
+            const anchorTier = a.type === 'TOWNHALL' ? 3 : 2;
+            if (anchorTier > bestTier) bestTier = anchorTier;
+          }
+        }
+      }
+
+      // 3. Library beacons (online only) count as T2
+      const libs = this.libraryBeaconCache.get(zoneId);
+      if (libs) {
+        for (const lib of libs) {
+          if (!lib.isOnline) continue;
+          const dx = entity.position.x - lib.worldX;
+          const dz = entity.position.z - lib.worldZ;
+          if (dx * dx + dz * dz <= lib.catchmentRadius * lib.catchmentRadius) {
+            if (2 > bestTier) bestTier = 2;
+          }
+        }
+      }
+
+      if (bestTier === 0) continue;
+
+      // Read current resources from DB
+      const character = await CharacterService.findById(characterId);
+      if (!character || !character.isAlive) continue;
+
+      const hpFull = character.currentHp >= character.maxHp;
+      const mpFull = character.currentMana >= character.maxMana;
+      if (hpFull && mpFull) continue;
+
+      // Scale: tier 1 → 1x, tier 5 → 3x
+      const tierMultiplier = 0.5 + bestTier * 0.5;
+
+      let newHp = character.currentHp;
+      let newMana = character.currentMana;
+
+      if (!hpFull) {
+        const hpRegen = Math.ceil(character.maxHp * DistributedWorldManager.BEACON_HP_REGEN_BASE_PCT * tierMultiplier);
+        newHp = Math.min(character.maxHp, character.currentHp + hpRegen);
+      }
+
+      if (!mpFull) {
+        const mpRegen = Math.ceil(character.maxMana * DistributedWorldManager.BEACON_MP_REGEN_BASE_PCT * tierMultiplier);
+        newMana = Math.min(character.maxMana, character.currentMana + mpRegen);
+      }
+
+      if (newHp === character.currentHp && newMana === character.currentMana) continue;
+
+      // Persist to DB
+      await CharacterService.updateResources(characterId, {
+        currentHp: newHp,
+        currentMana: newMana,
+      });
+
+      // Update in-memory entity health
+      zm.setEntityHealth(characterId, newHp, character.maxHp);
+
+      // Notify the player's client
+      await this.sendCharacterResourcesUpdate(zm, characterId, {
+        health: { current: newHp, max: character.maxHp },
+        stamina: { current: character.currentStamina, max: character.maxStamina },
+        mana: { current: newMana, max: character.maxMana },
+      });
+
+      // Broadcast health to nearby players
+      await this.broadcastEntityHealthUpdate(zm, entity.position, characterId, {
+        current: newHp,
+        max: character.maxHp,
+      });
+    }
+  }
+
+  /**
+   * Refresh cached lit beacons and polygons. Called on beacon state changes.
+   */
+  private async refreshBeaconCaches(): Promise<void> {
+    // Refresh lit beacons per zone
+    this.litBeaconCache.clear();
+    for (const zoneId of this.zones.keys()) {
+      const beacons = await GuildBeaconService.findLitBeaconsInZone(zoneId);
+      this.litBeaconCache.set(zoneId, beacons.map(b => ({
+        id: b.id,
+        guildId: b.guildId,
+        worldX: b.worldX,
+        worldZ: b.worldZ,
+        tier: b.tier,
+        effectRadius: b.effectRadius,
+      })));
+    }
+
+    // Refresh polygon cache
+    const polygons = await GuildBeaconService.getActivePolygons();
+    this.activePolygonCache = polygons.map(p => ({
+      guildId: p.guildId,
+      vertices: (p.vertices as any) as Point2D[],
+      beaconTiers: ((p as any).beaconTiers ?? []) as TieredPoint[],
+    }));
+
+    // Refresh civic anchor cache (townhalls + libraries) for regen
+    this.civicAnchorCache.clear();
+    for (const zoneId of this.zones.keys()) {
+      const anchors = await prisma.civicAnchor.findMany({
+        where: { zoneId, isActive: true },
+        select: { worldX: true, worldZ: true, wardRadius: true, type: true },
+      });
+      if (anchors.length > 0) {
+        this.civicAnchorCache.set(zoneId, anchors);
+      }
+    }
+
+    // Refresh library beacon cache for regen
+    this.libraryBeaconCache.clear();
+    for (const zoneId of this.zones.keys()) {
+      const libs = await LibraryBeaconService.findByZoneId(zoneId);
+      if (libs.length > 0) {
+        this.libraryBeaconCache.set(zoneId, libs.map(l => ({
+          worldX: l.worldX,
+          worldZ: l.worldZ,
+          catchmentRadius: l.catchmentRadius,
+          isOnline: l.isOnline,
+        })));
+      }
+    }
+  }
+
+  /**
+   * Handle beacon state change (lit → dark or dark → lit).
+   */
+  private handleBeaconStateChange(change: BeaconStateChange): void {
+    logger.info(
+      { beaconId: change.beaconId, guildId: change.guildId, newState: change.newState },
+      'Beacon state changed'
+    );
+
+    // Refresh cached data
+    void this.refreshBeaconCaches();
+
+    // Broadcast beacon alert to guild members
+    void (async () => {
+      const members = await GuildService.getMembers(change.guildId);
+      const alertType = change.newState === 'DARK' ? 'EXTINGUISHED' : 'RELIT';
+      const message = change.newState === 'DARK'
+        ? `A guild beacon has gone dark!`
+        : `A guild beacon has been relit!`;
+
+      for (const m of members) {
+        const sid = this._charToSocket.get(m.characterId);
+        if (sid) {
+          void this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: m.characterId,
+            socketId: sid,
+            payload: {
+              socketId: sid,
+              event: 'beacon_alert',
+              data: {
+                alertType,
+                beaconId: change.beaconId,
+                message,
+                timestamp: Date.now(),
+              },
+            },
+            timestamp: Date.now(),
+          });
+        }
+      }
+    })();
+  }
+
+  /**
+   * Broadcast ember clock announcement to appropriate scope.
+   */
+  private async broadcastEmberClockAnnouncement(announcement: {
+    beaconId: string;
+    guildId: string;
+    hoursRemaining: number;
+    message: string;
+    scope: 'guild' | 'zone' | 'zone_wide' | 'server_wide';
+  }): Promise<void> {
+    const recipients: string[] = [];
+
+    switch (announcement.scope) {
+      case 'guild': {
+        const members = await GuildService.getMembers(announcement.guildId);
+        for (const m of members) {
+          if (this._charToSocket.has(m.characterId)) {
+            recipients.push(m.characterId);
+          }
+        }
+        break;
+      }
+      case 'zone':
+      case 'zone_wide':
+      case 'server_wide': {
+        // For zone+ scope, broadcast to all online characters
+        for (const charId of this.characterToZone.keys()) {
+          if (this._charToSocket.has(charId)) {
+            recipients.push(charId);
+          }
+        }
+        break;
+      }
+    }
+
+    for (const charId of recipients) {
+      const sid = this._charToSocket.get(charId);
+      if (sid) {
+        void this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId: sid,
+          payload: {
+            socketId: sid,
+            event: 'beacon_alert',
+            data: {
+              alertType: announcement.hoursRemaining <= 1 ? 'CRITICAL_FUEL' : 'LOW_FUEL',
+              beaconId: announcement.beaconId,
+              hoursRemaining: announcement.hoursRemaining,
+              message: announcement.message,
+              timestamp: Date.now(),
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Deliver guild chat message to online guild members on this server.
+   */
+  private async deliverGuildChat(
+    guildId: string,
+    payload: { guildId: string; guildTag: string; senderId: string; senderName: string; message: string; timestamp: number },
+  ): Promise<void> {
+    const members = await GuildService.getMembers(guildId);
+    for (const m of members) {
+      const sid = this._charToSocket.get(m.characterId);
+      if (sid) {
+        void this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: m.characterId,
+          socketId: sid,
+          payload: {
+            socketId: sid,
+            event: 'chat',
+            data: {
+              channel: 'guild',
+              sender: payload.senderName,
+              senderId: payload.senderId,
+              guildTag: payload.guildTag,
+              message: payload.message,
+              timestamp: payload.timestamp,
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Broadcast library assault start to zone players.
+   */
+  private async broadcastLibraryAssaultStart(data: {
+    libraryId: string;
+    libraryName: string;
+    assaultType: string;
+    zoneId: string;
+    position: { x: number; y: number; z: number };
+    message: string;
+  }): Promise<void> {
+    for (const [charId, zId] of this.characterToZone) {
+      if (zId !== data.zoneId) continue;
+      const sid = this._charToSocket.get(charId);
+      if (sid) {
+        void this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId: sid,
+          payload: {
+            socketId: sid,
+            event: 'library_assault',
+            data: {
+              phase: 'started',
+              libraryId: data.libraryId,
+              libraryName: data.libraryName,
+              assaultType: data.assaultType,
+              message: data.message,
+              timestamp: Date.now(),
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Broadcast library assault resolution.
+   */
+  private async broadcastLibraryAssaultResolved(data: {
+    libraryId: string;
+    libraryName: string;
+    assaultType: string;
+    wasDefended: boolean;
+    offlineHours: number;
+    message: string;
+  }): Promise<void> {
+    // Broadcast to all online players (assault resolution is server-wide news)
+    for (const charId of this.characterToZone.keys()) {
+      const sid = this._charToSocket.get(charId);
+      if (sid) {
+        void this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId: sid,
+          payload: {
+            socketId: sid,
+            event: 'library_assault',
+            data: {
+              phase: 'resolved',
+              libraryId: data.libraryId,
+              libraryName: data.libraryName,
+              assaultType: data.assaultType,
+              wasDefended: data.wasDefended,
+              offlineHours: data.offlineHours,
+              message: data.message,
+              timestamp: Date.now(),
+            },
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
   /**
    * Publish authoritative entity positions for a zone to Redis.
    * Excludes players (they move too frequently and are tracked separately).
@@ -7334,6 +10617,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Clear corruption system
     this.corruptionSystem.clear();
 
+    // Clear guild systems
+    resetEmberClockSystem();
+    resetLibraryAssaultSystem();
+    await this.guildChatBridge.cleanup();
+    this.litBeaconCache.clear();
+    this.activePolygonCache = [];
+    this.pendingGuildInvites.clear();
+
     // Clear all active movements (persists final positions)
     this.movementSystem.clearAll();
 
@@ -7353,6 +10644,12 @@ export class DistributedWorldManager implements IWildlifeWorld {
     this.companionToZone.clear();
     this.wildlifeManagers.clear();
     this.zoneCorruptionTags.clear();
+
+    // Flush scripted object state and destroy VMs
+    for (const controller of this.scriptedObjectControllers.values()) {
+      await controller.destroy();
+    }
+    this.scriptedObjectControllers.clear();
 
     void this.wildlifeBridge?.stop();
     this.wildlifeBridge = null;

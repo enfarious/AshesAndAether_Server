@@ -13,7 +13,7 @@ import type {
   ProximityEntity,
   ProximityEntityDelta
 } from '@/network/protocol/types';
-import type { Character, Zone, Mob } from '@prisma/client';
+import type { Character, Zone, Mob, Companion } from '@prisma/client';
 
 interface Vector3 {
   x: number;
@@ -26,7 +26,7 @@ type MovementProfile = 'terrestrial' | 'amphibious' | 'aquatic';
 interface Entity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' | 'structure';
+  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' | 'structure' | 'scripted_object';
   description?: string; // Displayed when a player examines this entity
   position: Vector3;
   socketId?: string; // For players only
@@ -40,6 +40,8 @@ interface Entity {
   // Mob-specific fields (used by client for display and color coding)
   tag?: string;          // e.g. "mob.rat.1" — stable identifier for mob type
   level?: number;
+  family?: string;       // e.g. "hare", "canine" — broad taxonomy for engagement rules + wiki
+  species?: string;      // e.g. "snow_hare", "spiral_fox" — specific variant
   faction?: string;      // e.g. "hostile", "neutral" — drives client nameplate color
   aiType?: string;       // e.g. "passive", "aggressive" — server-side AI behaviour
   notorious?: boolean;   // Notorious Monster: client shows "??" for level + special marker
@@ -386,6 +388,8 @@ export class ZoneManager {
         movementProfile: 'terrestrial',
         tag:           mob.tag           ?? undefined,
         level:         mob.level         ?? undefined,
+        family:        mob.family        ?? undefined,
+        species:       mob.species       ?? undefined,
         faction:       mob.faction       ?? undefined,
         aiType:        mob.aiType        ?? undefined,
         notorious:     mob.notorious     ?? false,
@@ -1133,9 +1137,9 @@ export class ZoneManager {
    */
   getAllEntities(): Array<{
     id: string; name: string; type: string; position: Vector3; isAlive: boolean;
-    description?: string; tag?: string; level?: number; faction?: string;
-    aiType?: string; notorious?: boolean; currentHealth?: number; maxHealth?: number;
-    speciesId?: string; sprite?: string; heading?: number;
+    description?: string; tag?: string; level?: number; family?: string; species?: string;
+    faction?: string; aiType?: string; notorious?: boolean; currentHealth?: number;
+    maxHealth?: number; speciesId?: string; sprite?: string; heading?: number;
   }> {
     return Array.from(this.entities.values());
   }
@@ -1192,6 +1196,51 @@ export class ZoneManager {
   }
 
   /**
+   * Dynamically add a player companion to the zone at runtime.
+   */
+  addCompanion(companion: Companion): void {
+    const position = this.physicsSystem.applyGravity({
+      x: companion.positionX,
+      y: companion.positionY,
+      z: companion.positionZ,
+    });
+
+    const entity = {
+      id: companion.id,
+      name: companion.name,
+      type: 'companion' as const,
+      description: companion.description ?? undefined,
+      position,
+      inCombat: false,
+      isMachine: true,
+      isAlive: companion.isAlive ?? true,
+      movementProfile: 'terrestrial' as MovementProfile,
+    };
+
+    this.entities.set(companion.id, entity);
+    this.physicsSystem.registerEntity({
+      id: companion.id,
+      position: entity.position,
+      boundingVolume: PhysicsSystem.createBoundingSphere(entity.position, 0.5),
+      type: 'dynamic',
+      collisionLayer: CollisionLayer.ENTITIES,
+    });
+    logger.debug({ companionId: companion.id, name: companion.name, zoneId: this.zone.id }, 'Player companion spawned');
+  }
+
+  /**
+   * Remove a companion entity from the zone (called when owner disconnects).
+   */
+  removeCompanion(companionId: string): void {
+    const entity = this.entities.get(companionId);
+    if (entity && entity.type === 'companion') {
+      this.entities.delete(companionId);
+      this.physicsSystem.unregisterEntity(companionId);
+      logger.debug({ companionId, zoneId: this.zone.id }, 'Companion despawned');
+    }
+  }
+
+  /**
    * Remove a mob entity from the zone (called on death before respawn timer).
    */
   removeMob(mobId: string): void {
@@ -1222,6 +1271,8 @@ export class ZoneManager {
       movementProfile: 'terrestrial',
       tag:           mob.tag           ?? undefined,
       level:         mob.level         ?? undefined,
+      family:        mob.family        ?? undefined,
+      species:       mob.species       ?? undefined,
       faction:       mob.faction       ?? undefined,
       aiType:        mob.aiType        ?? undefined,
       notorious:     mob.notorious     ?? false,
@@ -1268,6 +1319,37 @@ export class ZoneManager {
   removeStructure(entityId: string): void {
     const entity = this.entities.get(entityId);
     if (entity && entity.type === 'structure') {
+      this.entities.delete(entityId);
+      this.physicsSystem.unregisterEntity(entityId);
+    }
+  }
+
+  /** Add a scripted object entity to the zone. */
+  addScriptedObject(data: { id: string; name: string; description?: string; position: Vector3 }): void {
+    const position = this.physicsSystem.applyGravity(data.position);
+    const entity: Entity = {
+      id: data.id,
+      name: data.name,
+      type: 'scripted_object',
+      description: data.description,
+      position,
+      isMachine: true,
+      isAlive: true,
+    };
+    this.entities.set(data.id, entity);
+    this.physicsSystem.registerEntity({
+      id: data.id,
+      position,
+      boundingVolume: PhysicsSystem.createBoundingSphere(position, 0.5),
+      type: 'static',
+      collisionLayer: CollisionLayer.ENTITIES,
+    });
+  }
+
+  /** Remove a scripted object entity from the zone. */
+  removeScriptedObject(entityId: string): void {
+    const entity = this.entities.get(entityId);
+    if (entity && entity.type === 'scripted_object') {
       this.entities.delete(entityId);
       this.physicsSystem.unregisterEntity(entityId);
     }

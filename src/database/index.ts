@@ -15,3 +15,4 @@ export { ZoneService } from './services/ZoneService';
 export { InventoryService } from './services/InventoryService';
 export { LootService } from './services/LootService';
 export { WalletService } from './services/WalletService';
+export { ScriptedObjectService } from '../scripting/ScriptedObjectService';

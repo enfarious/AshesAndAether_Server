@@ -258,6 +258,8 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
         positionX: townHall.x + Math.cos(angle) * distance,
         positionY: townHall.y,
         positionZ: townHall.z + Math.sin(angle) * distance,
+        family: 'beast',
+        species: 'rat',
         aiType: 'wildlife_rat',
         aggroRadius: 10,
         respawnTime: 120,
@@ -290,6 +292,8 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
       positionX: fourFatFoulPos.x,
       positionY: fourFatFoulPos.y,
       positionZ: fourFatFoulPos.z,
+      family: 'beast',
+      species: 'rabid_dog',
       aiType: 'wildlife_dog',
       aggroRadius: 20,
       respawnTime: 180,
@@ -318,6 +322,8 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
       positionX: postOfficePos.x - 30,
       positionY: postOfficePos.y - 40,
       positionZ: postOfficePos.z,
+      family: 'beast',
+      species: 'dire_toad',
       aiType: 'wildlife_toad',
       aggroRadius: 15,
       respawnTime: 150,
@@ -695,7 +701,302 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
 
   console.log('Γ£ô Added starting equipment to test character');
 
-  console.log('\nΓ£à Database seeded successfully!');
+  // ── Guild system seed data ──────────────────────────────────────────
+  console.log('\nSeeding guild system data...');
+
+  // Additional item tags for fuel/materials
+  const guildTagNames = ['material', 'fuel', 'wood', 'beacon'];
+  for (const name of guildTagNames) {
+    const tag = await prisma.itemTag.upsert({
+      where: { name },
+      update: {},
+      create: { name },
+    });
+    tags.set(name, tag);
+  }
+
+  // Wood fuel item templates (5 tiers)
+  const commonWood = await prisma.itemTemplate.create({
+    data: {
+      name: 'Common Wood',
+      description: 'Rough-cut firewood gathered from fallen branches. Burns quickly but serves for basic beacon fuel.',
+      itemType: 'material',
+      properties: {
+        fuelTier: 1,
+        fuelHours: 4,
+        beaconFuel: true,
+      },
+      value: 5,
+      stackable: true,
+      maxStackSize: 50,
+      tags: {
+        create: [
+          { tagId: tags.get('material')!.id },
+          { tagId: tags.get('fuel')!.id },
+          { tagId: tags.get('wood')!.id },
+        ],
+      },
+    },
+  });
+
+  const seasonedWood = await prisma.itemTemplate.create({
+    data: {
+      name: 'Seasoned Wood',
+      description: 'Carefully dried hardwood that burns longer and steadier. Suitable for Tier 2 beacons.',
+      itemType: 'material',
+      properties: {
+        fuelTier: 2,
+        fuelHours: 4,
+        beaconFuel: true,
+      },
+      value: 15,
+      stackable: true,
+      maxStackSize: 50,
+      tags: {
+        create: [
+          { tagId: tags.get('material')!.id },
+          { tagId: tags.get('fuel')!.id },
+          { tagId: tags.get('wood')!.id },
+        ],
+      },
+    },
+  });
+
+  const darkwood = await prisma.itemTemplate.create({
+    data: {
+      name: 'Darkwood',
+      description: 'Timber from corrupted groves, dense and slow-burning. Fuels Tier 3 beacons.',
+      itemType: 'material',
+      properties: {
+        fuelTier: 3,
+        fuelHours: 4,
+        beaconFuel: true,
+      },
+      value: 40,
+      stackable: true,
+      maxStackSize: 50,
+      tags: {
+        create: [
+          { tagId: tags.get('material')!.id },
+          { tagId: tags.get('fuel')!.id },
+          { tagId: tags.get('wood')!.id },
+        ],
+      },
+    },
+  });
+
+  const emberedWood = await prisma.itemTemplate.create({
+    data: {
+      name: 'Embered Wood',
+      description: 'Rare wood infused with latent heat, glowing faintly at the grain. Fuels Tier 4 beacons.',
+      itemType: 'material',
+      properties: {
+        fuelTier: 4,
+        fuelHours: 4,
+        beaconFuel: true,
+      },
+      value: 100,
+      stackable: true,
+      maxStackSize: 50,
+      tags: {
+        create: [
+          { tagId: tags.get('material')!.id },
+          { tagId: tags.get('fuel')!.id },
+          { tagId: tags.get('wood')!.id },
+        ],
+      },
+    },
+  });
+
+  const voidTimber = await prisma.itemTemplate.create({
+    data: {
+      name: 'Void Timber',
+      description: 'Wood that has passed through the deepest corruption and emerged transformed. Fuels Tier 5 beacons.',
+      itemType: 'material',
+      properties: {
+        fuelTier: 5,
+        fuelHours: 4,
+        beaconFuel: true,
+      },
+      value: 250,
+      stackable: true,
+      maxStackSize: 50,
+      tags: {
+        create: [
+          { tagId: tags.get('material')!.id },
+          { tagId: tags.get('fuel')!.id },
+          { tagId: tags.get('wood')!.id },
+        ],
+      },
+    },
+  });
+
+  // Soul Ember — required to light a beacon
+  const soulEmber = await prisma.itemTemplate.create({
+    data: {
+      name: 'Soul Ember',
+      description: 'A crystallized ember pulsing with faint warmth. Required to ignite a guild beacon at a world point.',
+      itemType: 'material',
+      properties: {
+        beaconIgniter: true,
+      },
+      value: 200,
+      stackable: true,
+      maxStackSize: 10,
+      tags: {
+        create: [
+          { tagId: tags.get('material')!.id },
+          { tagId: tags.get('beacon')!.id },
+        ],
+      },
+    },
+  });
+
+  console.log(`  Created fuel items: ${commonWood.name}, ${seasonedWood.name}, ${darkwood.name}, ${emberedWood.name}, ${voidTimber.name}, ${soulEmber.name}`);
+
+  // Guild world points in Stephentown (5 points at varied tier hints)
+  const churchLat = 42.5520;
+  const churchLon = -73.3770;
+  const churchPos = latLonToLocalMeters(churchLat, churchLon);
+
+  const parkLat = 42.5508;
+  const parkLon = -73.3800;
+  const parkPos = latLonToLocalMeters(parkLat, parkLon);
+
+  const cemeteryLat = 42.5530;
+  const cemeteryLon = -73.3750;
+  const cemeteryPos = latLonToLocalMeters(cemeteryLat, cemeteryLon);
+
+  const mountainLat = 42.5570;
+  const mountainLon = -73.3700;
+  const mountainPos = latLonToLocalMeters(mountainLat, mountainLon);
+
+  const worldPoints = await Promise.all([
+    prisma.guildWorldPoint.create({
+      data: {
+        name: 'Stephentown Town Hall',
+        description: 'The civic anchor of Stephentown — a well-worn wooden building.',
+        lat: townHallLat,
+        lon: townHallLon,
+        worldX: townHall.x,
+        worldY: townHall.y,
+        worldZ: townHall.z,
+        zoneId: crossroads.id,
+        tierHint: 1,
+      },
+    }),
+    prisma.guildWorldPoint.create({
+      data: {
+        name: 'Stephentown Park',
+        description: 'A small green space with old oaks and a rusted bench.',
+        lat: parkLat,
+        lon: parkLon,
+        worldX: parkPos.x,
+        worldY: elevationService?.getElevationMeters(parkLat, parkLon) ?? townHallElevation,
+        worldZ: parkPos.z,
+        zoneId: crossroads.id,
+        tierHint: 1,
+      },
+    }),
+    prisma.guildWorldPoint.create({
+      data: {
+        name: 'St. Joseph\'s Church',
+        description: 'A weathered white church on a gentle hill, steeple visible for miles.',
+        lat: churchLat,
+        lon: churchLon,
+        worldX: churchPos.x,
+        worldY: elevationService?.getElevationMeters(churchLat, churchLon) ?? townHallElevation,
+        worldZ: churchPos.z,
+        zoneId: crossroads.id,
+        tierHint: 2,
+      },
+    }),
+    prisma.guildWorldPoint.create({
+      data: {
+        name: 'Garfield Cemetery',
+        description: 'An old cemetery with mossy headstones. The ground hums with latent energy.',
+        lat: cemeteryLat,
+        lon: cemeteryLon,
+        worldX: cemeteryPos.x,
+        worldY: elevationService?.getElevationMeters(cemeteryLat, cemeteryLon) ?? townHallElevation,
+        worldZ: cemeteryPos.z,
+        zoneId: crossroads.id,
+        tierHint: 3,
+      },
+    }),
+    prisma.guildWorldPoint.create({
+      data: {
+        name: 'Berlin Mountain Overlook',
+        description: 'A rocky outcrop near the summit of Berlin Mountain, overlooking the valley.',
+        lat: mountainLat,
+        lon: mountainLon,
+        worldX: mountainPos.x,
+        worldY: elevationService?.getElevationMeters(mountainLat, mountainLon) ?? (townHallElevation + 200),
+        worldZ: mountainPos.z,
+        zoneId: crossroads.id,
+        tierHint: 4,
+      },
+    }),
+  ]);
+  console.log(`  Created ${worldPoints.length} guild world points`);
+
+  // Library beacons (2 in Stephentown)
+  const libraryLat = 42.5505;
+  const libraryLon = -73.3785;
+  const libraryPos = latLonToLocalMeters(libraryLat, libraryLon);
+
+  const hancockLat = 42.5488;
+  const hancockLon = -73.3720;
+  const hancockPos = latLonToLocalMeters(hancockLat, hancockLon);
+
+  const libraryBeacons = await Promise.all([
+    prisma.libraryBeacon.create({
+      data: {
+        name: 'Stephentown Public Library',
+        description: 'A small but well-stocked library serving the community. Its beacon provides services and protection to the surrounding area.',
+        worldX: libraryPos.x,
+        worldY: elevationService?.getElevationMeters(libraryLat, libraryLon) ?? townHallElevation,
+        worldZ: libraryPos.z,
+        zoneId: crossroads.id,
+        catchmentRadius: 500,
+        isOnline: true,
+      },
+    }),
+    prisma.libraryBeacon.create({
+      data: {
+        name: 'Hancock Library',
+        description: 'A sturdy stone library on the eastern edge of Stephentown, built to withstand the encroaching darkness.',
+        worldX: hancockPos.x,
+        worldY: elevationService?.getElevationMeters(hancockLat, hancockLon) ?? townHallElevation,
+        worldZ: hancockPos.z,
+        zoneId: crossroads.id,
+        catchmentRadius: 400,
+        isOnline: true,
+      },
+    }),
+  ]);
+  console.log(`  Created ${libraryBeacons.length} library beacons`);
+
+  // Give test character some fuel and a soul ember for testing
+  await prisma.inventoryItem.create({
+    data: {
+      characterId: testCharacter.id,
+      itemTemplateId: commonWood.id,
+      quantity: 10,
+      equipped: false,
+    },
+  });
+  await prisma.inventoryItem.create({
+    data: {
+      characterId: testCharacter.id,
+      itemTemplateId: soulEmber.id,
+      quantity: 2,
+      equipped: false,
+    },
+  });
+  console.log('  Added fuel items to test character inventory');
+
+  console.log('\nDatabase seeded successfully!');
   console.log('\nSeeded data:');
   console.log(`  - 1 zone: ${crossroads.name}`);
   console.log(`  - 1 account: ${testAccount.username}`);
@@ -703,9 +1004,11 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
   console.log(`  - 3 NPCs: ${merchant.name}, ${swordsman.name}, ${bowman.name}`);
   console.log(`  - 7 mobs: 5 rats, ${rabidDog.name}, ${direToad.name}`);
   console.log(`  - 1 ability (basic_attack)`);
-  console.log(`  - 9 item templates`);
+  console.log(`  - 15 item templates (9 gear + 5 wood fuels + 1 soul ember)`);
+  console.log(`  - ${worldPoints.length} guild world points (T1-T4)`);
+  console.log(`  - ${libraryBeacons.length} library beacons`);
   console.log(`  - Character equipped with ${rustySword.name} and 5x ${healthPotion.name}`);
-  console.log(`  - Character inventory includes ${fireStaff.name}, ${steelBreastplate.name}, ${leatherJerkin.name}, ${silkRobe.name}`);
+  console.log(`  - Character inventory includes fuel items for beacon testing`);
   console.log('\nYou can now connect with:');
   console.log(`  Email: ${testAccount.email}`);
   console.log(`  Character: ${testCharacter.name}`);

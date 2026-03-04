@@ -1,6 +1,6 @@
 # TODO - Ashes & Aether Server
 
-Last updated: 2026-01-20
+Last updated: 2026-03-04
 
 ## Vision
 
@@ -8,9 +8,9 @@ Last updated: 2026-01-20
 
 See [docs/LORE.md](docs/LORE.md) for complete world background.
 
-## Current Status - January 2026
+## Current Status - March 2026
 
-**MILESTONE: Distributed architecture & text client working. Airlock ready for NPC context integration. Wildlife sim in Rust prototype.**
+**MILESTONE: Distributed architecture solid. Companion system with behavior trees and LLM-driven combat live. Ability trees defined. Scripting engine (Lua) functional. Wildlife/flora sim connected.**
 
 **Architecture:**
 
@@ -33,17 +33,23 @@ See [docs/LORE.md](docs/LORE.md) for complete world background.
 - Proximity roster optimization (dirty tracking - 70-90% reduction in network traffic)
 - **Text Client (MUD-Like)** - C# .NET client with movement ring, proximity roster, auto-attack UI
 - **Airlock Protocol** - LLM client control with inhabit/release/chat flow
-- NPC/Companion system with database schema ready for LLM integration
 - LLMService (Anthropic + OpenAI-compatible API support)
-- **Wildlife Simulation** (Rust) - Flora/fauna with hunger/thirst/reproduction, climate, behavior trees
 - Stat system (core + derived stats) with ability loadouts
 - Basic auto-attack mechanics with +/- hit feedback
+- **Companion System** - Behavior tree ("motor cortex"), 4 combat archetypes (scrappy_fighter, cautious_healer, opportunist, tank), LLM-driven combat settings, engagement gate with species/family overrides, follow/detach/task/harvest/recall commands
+- **Companion Task System** - LLM generates behavior trees from natural language, throttled execution, harvest tasks working
+- **Wildlife/Flora Simulation** - Connected to game server. Flora growth stages, harvesting, wildlife consumption, respawning. Integrates with companion harvest tasks
+- **Ability Trees** - Two webs (Active/Passive), 4 tiers, 6 sectors (66 nodes). T1 abilities defined: Provoke, Mend, Shadow Bolt, Embolden, Ensnare. AP pool shared across webs
+- **NPC AI** - Social layer (chat/emote via LLM) + combat layer (behavior tree + LLM triggers). Engagement gate functional
+- **Scripting Engine** - Fengari Lua VM with sandboxed world API. Scripted objects, verb callbacks, NPC dialogue trees
+- **Villages, Market, Arena, Vault** systems in various stages (recent commits)
 
 **Partially Done:**
 
-- Combat system (ATB design complete, basic auto-attack working, missing: cooldown system, action queue, status effects)
-- NPC AI control (Airlock connected, but needs: context items, intent generation, action validation)
-- World content (no OSM integration yet, no NPC placement)
+- Combat system (ATB gauge + cooldowns implemented, T1 abilities defined; missing: status effect execution, taunt/root wiring, AoE damage, action queue with cast times)
+- Airlock Protocol (connected but needs revisit — companions are now real entities, NPCs need user inhabitation flow reworked)
+- World content (no live zone generation yet, no OSM integration)
+- Companion task system (harvest works; hasItem condition stubbed, limited action/condition set)
 
 **Setting:**
 
@@ -64,127 +70,83 @@ See [docs/LORE.md](docs/LORE.md) for complete world background.
 
 All clients connect to the same server, see the same world, interact with same players.
 
-## Recommended Next Steps
+## MVP Critical Path
 
-### Phase 1: Complete Core Systems (Weeks 1-2)
+These are the remaining blockers to a playable world.
 
-1. **NPC Context & Intent System**
-   - Expand Companion schema with personality context items (traits, goals, relationships)
-   - Add action sets (abilities, dialogue trees, movement patterns)
-   - Implement intent parsing (convert LLM responses to zone commands)
-   - Wire NPCAIController to actually call LLMService
-   - **Unblocks:** Airlock NPC control, dynamic NPC behavior
+### 1. Combat System Completion
 
-2. **Combat System Completion**
-   - Finish cooldown system and action queue
-   - Add status effects and effect duration tracking
-   - Implement multi-target scaling and AoE targeting
-   - Wire all combat events (hit/miss/effect/death)
-   - **Unblocks:** Full tactical gameplay, ability testing
+The ATB gauge, cooldown tracking, and T1 ability definitions are in place. What remains:
 
-3. **World Content Foundation**
-   - OpenStreetMap integration for Stephentown region
-   - Zone generation from real geography
-   - Basic NPC placement (merchants, guards, quest-givers)
-   - **Unblocks:** Real world exploration, content iteration
+- [ ] Wire taunt mechanic (Provoke forces target switch)
+- [ ] Wire root mechanic (Ensnare prevents movement)
+- [ ] Implement status effect execution (buff/debuff apply + tick + expire)
+- [ ] Action queue with cast times
+- [ ] AoE and multi-target damage
+- [ ] Death handling and respawn flow
+- [ ] Integration test: player vs NPC/wildlife end-to-end
 
-### Phase 2: Expand Features (Weeks 3-4)
+**Unblocks:** Full tactical gameplay, ability testing, companion combat validation
 
-1. **Text Client Enhancement**
-   - Command improvements (examine, inspect, detailed look)
-   - Combat UI refinement
-   - Macro system expansion
-   - Test with live combat
+### 2. Airlock Revisit
 
-2. **Wildlife Sim Integration**
-   - Wire Rust sim to game server via Redis
-   - Visibility in proximity rosters
-   - Player hunting mechanics
-   - Respawn system
+The Airlock protocol works but was built before companions became real entities. Needs rework:
 
-3. **Basic Quest System**
-   - Quest database schema
-   - Simple quest generation
-   - Objective tracking
-   - Rewards system
+- [ ] Rethink inhabit/release flow for companion NPCs vs world NPCs
+- [ ] Wire NPC intent system (LLM response → zone commands: move/attack/interact)
+- [ ] Context injection (companion personality, nearby entities, combat state, quest state)
+- [ ] Action validation (can this NPC actually do what the LLM says?)
+- [ ] Test end-to-end: user inhabits NPC → speaks/moves/fights via natural language
 
-### Phase 3: Polish & Clients (Months 2-3)
+**Unblocks:** LLM-driven NPC gameplay, natural language client experience
 
-1. **LLM Narrator System**
-   - Context-aware narration for critical moments
-   - Dice integration (failed = vague, success = detailed)
-   - Personality tone consistency
+### 3. Live Zone Generation
 
-2. **2D Web Client**
-   - Browser-based isometric/top-down view
-   - Point-and-click interface
-   - Shared protocol with text client
+Zones need to generate dynamically from real geography, not be hand-seeded:
 
-3. **Documentation & Tooling**
-   - Quest creation tools
-   - NPC personality templates
-   - World editing utilities
+- [ ] OSM data pipeline for Stephentown region
+- [ ] Dynamic zone generation from geographic features (roads, buildings, terrain)
+- [ ] Zone boundary calculation and navmesh generation
+- [ ] Auto-populate with NPCs, flora, wildlife based on biome/terrain
+- [ ] Hot-loading: generate new zones as players explore outward
 
-## Technical Implementation Priority
+**Unblocks:** Real world exploration, scalable content, no manual seeding
 
-### Critical Path to Playable World
+## Next Priorities (Post-MVP)
 
-1. **NPC Intent System** (3-4 days)
-   - [ ] Extend Companion schema with context items
-   - [ ] Implement intent parser (chat/emote/move/action)
-   - [ ] Wire NPCAIController.update() → LLMService → intent execution
-   - [ ] Test Airlock → NPC interaction end-to-end
+### Companion System Polish
+- [ ] CC ability detection in BehaviorTree (currently stubbed)
+- [ ] Wire hasItem condition to InventoryService
+- [ ] Expand task LLM with more conditions (enemies nearby, zone type) and actions (combat, trade)
+- [ ] Multi-companion support/testing
 
-2. **Combat Completion** (5-7 days)
-   - [ ] Implement action queue with cast times
-   - [ ] Add cooldown system with stat scaling
-   - [ ] Implement status effects (buffs/debuffs/DoT)
-   - [ ] Add AoE and multi-target damage
-   - [ ] All combat events: hit/miss/effect/death
-   - [ ] Integration test: player vs NPC/wildlife
+### Ability System Expansion
+- [ ] T2-T4 ability definitions
+- [ ] Quest gates for T4 capstones
+- [ ] Depth-gate enforcement (must unlock prior tier)
+- [ ] Balance pass on stat scaling
 
-3. **OSM Integration** (4-5 days)
-   - [ ] Load OSM data for Stephentown region
-   - [ ] Generate zones from locations
-   - [ ] Create zone boundaries and navmesh
-   - [ ] Seed basic NPCs and props
+### Text Client Enhancement
+- Command improvements (examine, inspect, detailed look)
+- Combat UI refinement for new ability system
+- Macro system expansion
+- Test with live combat
 
-4. **Wildlife Integration** (2-3 days)
-   - [ ] Wire wildlife_sim to game server via Redis
-   - [ ] Visibility in proximity rosters
-   - [ ] Player hunting/loot mechanics
-   - [ ] Spawn respawn system
+### Basic Quest System
+- Quest database schema
+- Simple quest generation
+- Objective tracking
+- Rewards system
 
-### Full Development Timeline
+### LLM Narrator System
+- Context-aware narration for critical moments
+- Dice integration (failed = vague, success = detailed)
+- Personality tone consistency
 
-**Week 1-2:**
-
-- [ ] NPC Intent system complete
-- [ ] Combat system finished
-- [ ] Text client combat UI polish
-- [ ] Basic end-to-end test (create char → move → fight NPC → damage/heal)
-
-**Week 3-4:**
-
-- [ ] OSM integration
-- [ ] Wildlife integration  
-- [ ] Basic quest system
-- [ ] World content (5+ starter zones)
-
-**Month 2:**
-
-- [ ] 2D web client (basic)
-- [ ] LLM narrator system
-- [ ] Advanced NPC behaviors (wandering, routines)
-- [ ] Faction reputation system
-
-**Month 3+:**
-
-- [ ] 3D client (Unity)
-- [ ] Advanced combat features
-- [ ] Crafting system
-- [ ] Housing/bases
-- [ ] PvP/faction wars
+### 2D Web Client
+- Browser-based isometric/top-down view
+- Point-and-click interface
+- Shared protocol with text client
 
 ## Quick Start
 

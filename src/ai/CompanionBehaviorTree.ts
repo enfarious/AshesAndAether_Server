@@ -47,7 +47,9 @@ export interface CombatEntity {
   currentHealth?: number;
   maxHealth?: number;
   level?: number;
-  tag?: string;      // e.g. "mob.rat.1" — used for enemy type identification
+  tag?: string;      // e.g. "mob.rat.1" — stable identifier for mob instance
+  family?: string;   // e.g. "hare", "canine" — broad taxonomy
+  species?: string;  // e.g. "snow_hare", "spiral_fox" — specific variant
   faction?: string;  // e.g. "hostile", "neutral"
 }
 

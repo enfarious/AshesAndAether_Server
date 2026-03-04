@@ -36,12 +36,31 @@ export type CommunityCheckCallback = (characterId: string, zoneId: string) => bo
 export type PartySizeCallback = (characterId: string) => Promise<number>;
 
 /**
+ * Callback for checking if a character is within a guild beacon zone or polygon.
+ * Used to apply corruption reduction from guild beacons.
+ */
+export type BeaconCheckCallback = (
+  characterId: string,
+  zoneId: string,
+  position: { x: number; z: number },
+) => {
+  inBeaconRadius: boolean;
+  inPolygon: boolean;
+  /** IDW-interpolated effective tier (0 if not in polygon, else float 1–5). */
+  polygonEffectiveTier: number;
+  /** Passive guild-wide corruption resist bonus from lit beacons (percent). */
+  guildCorruptionResistPercent: number;
+};
+
+/**
  * Interface for zone data needed for corruption processing
  */
 export interface ZoneCorruptionData {
   zoneId: string;
   corruptionTag: string;
   characterIds: string[];
+  /** Character positions for beacon zone checks — { characterId: {x, z} } */
+  characterPositions?: Map<string, { x: number; z: number }>;
 }
 
 /**
@@ -57,6 +76,7 @@ export class CorruptionSystem {
   private broadcastCallback: CorruptionBroadcastCallback | null = null;
   private communityCheckCallback: CommunityCheckCallback | null = null;
   private partySizeCallback: PartySizeCallback | null = null;
+  private beaconCheckCallback: BeaconCheckCallback | null = null;
 
   // Cache for character isolation tracking (characterId -> isInCommunity)
   private communityCache: Map<string, boolean> = new Map();
@@ -91,6 +111,13 @@ export class CorruptionSystem {
    */
   setPartySizeCallback(callback: PartySizeCallback): void {
     this.partySizeCallback = callback;
+  }
+
+  /**
+   * Set callback for checking guild beacon zone coverage
+   */
+  setBeaconCheckCallback(callback: BeaconCheckCallback): void {
+    this.beaconCheckCallback = callback;
   }
 
   /**
@@ -195,6 +222,7 @@ export class CorruptionSystem {
 
     for (const character of characters) {
       const partySize = partySizes.get(character.id) ?? 1;
+      const position = zone.characterPositions?.get(character.id) ?? null;
 
       const update = this.calculateCharacterDelta(
         character.id,
@@ -206,7 +234,8 @@ export class CorruptionSystem {
         character.contributionBuffExpires,
         tickMinutes,
         partySize,
-        isNight
+        isNight,
+        position
       );
 
       if (update) {
@@ -233,24 +262,56 @@ export class CorruptionSystem {
     contributionBuffExpires: Date | null,
     tickMinutes: number,
     partySize: number = 1,
-    isNight: boolean = false
+    isNight: boolean = false,
+    position: { x: number; z: number } | null = null
   ): CorruptionUpdate | null {
     const config = getCorruptionConfig();
     const reasons: string[] = [];
+
+    // ── Beacon zone check ─────────────────────────────────────────────
+    // If the character is inside a guild beacon radius, override zone rate
+    // to a strong negative (corruption reduction). If inside a polygon,
+    // scale the reduction by the IDW-interpolated effective tier.
+    let beaconOverride = false;
+    let beaconReduction = 0;
+    let guildResistPercent = 0;
+
+    if (this.beaconCheckCallback && position) {
+      const beacon = this.beaconCheckCallback(characterId, zoneId, position);
+      guildResistPercent = beacon.guildCorruptionResistPercent;
+
+      if (beacon.inBeaconRadius) {
+        // Full safe zone effect — strong corruption reduction (like WARD_ZONE)
+        beaconOverride = true;
+        beaconReduction = -0.5 * tickMinutes; // Strong negative: clears ~0.5 per tick-minute
+        reasons.push(`beacon_radius: ${beaconReduction.toFixed(3)}`);
+      } else if (beacon.inPolygon && beacon.polygonEffectiveTier > 0) {
+        // Polygon clearing — scaled by effective tier via IDW.
+        // T5 gets full WARD_ZONE reduction, T1 gets 20% of it.
+        const tierFraction = beacon.polygonEffectiveTier / 5;
+        beaconOverride = true;
+        beaconReduction = -0.5 * tierFraction * tickMinutes;
+        reasons.push(`polygon(T${beacon.polygonEffectiveTier.toFixed(1)}): ${beaconReduction.toFixed(3)}`);
+      }
+    }
 
     // Get party field reduction multiplier (1.0 = no reduction, 0.3 = 70% reduction)
     const partyMultiplier = getPartyFieldReductionMultiplier(partySize);
     const hasPartyReduction = partyMultiplier < 1.0;
 
     // 1. Zone corruption gain (affected by party reduction)
-    let zoneGain = zoneRate * tickMinutes;
-    if (hasPartyReduction && zoneGain > 0) {
-      zoneGain *= partyMultiplier;
-    }
-    if (zoneGain !== 0) {
-      const nightStr = isNight ? ', night' : '';
-      const partyStr = hasPartyReduction ? `, party:${partySize}` : '';
-      reasons.push(`zone(${zoneTag}${nightStr}${partyStr}): ${zoneGain > 0 ? '+' : ''}${zoneGain.toFixed(3)}`);
+    //    If in beacon zone, skip zone gain entirely (replaced by beacon reduction)
+    let zoneGain = 0;
+    if (!beaconOverride) {
+      zoneGain = zoneRate * tickMinutes;
+      if (hasPartyReduction && zoneGain > 0) {
+        zoneGain *= partyMultiplier;
+      }
+      if (zoneGain !== 0) {
+        const nightStr = isNight ? ', night' : '';
+        const partyStr = hasPartyReduction ? `, party:${partySize}` : '';
+        reasons.push(`zone(${zoneTag}${nightStr}${partyStr}): ${zoneGain > 0 ? '+' : ''}${zoneGain.toFixed(3)}`);
+      }
     }
 
     // 2. Isolation gain (affected by party reduction)
@@ -277,8 +338,16 @@ export class CorruptionSystem {
       }
     }
 
-    // Total delta
-    const totalDelta = zoneGain + isolationGain + wealthGain;
+    // Total delta (beacon reduction replaces zone gain when active)
+    let totalDelta = beaconReduction + zoneGain + isolationGain + wealthGain;
+
+    // 4. Guild passive corruption resist — reduces positive delta only
+    if (guildResistPercent > 0 && totalDelta > 0) {
+      const resistMultiplier = 1 - guildResistPercent / 100;
+      const beforeResist = totalDelta;
+      totalDelta *= resistMultiplier;
+      reasons.push(`guild_resist(${guildResistPercent.toFixed(1)}%): ${(totalDelta - beforeResist).toFixed(3)}`);
+    }
 
     // Skip if no change (common for characters in WILDS with low isolation/wealth)
     if (Math.abs(totalDelta) < 0.0001) {
@@ -303,6 +372,9 @@ export class CorruptionSystem {
         partyReductionApplied: partyMultiplier < 1.0,
         partyReductionPercent: Math.round((1 - partyMultiplier) * 100),
         isNight,
+        beaconOverride,
+        beaconReduction,
+        guildResistPercent,
       },
     };
   }

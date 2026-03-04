@@ -556,36 +556,38 @@ async function handleStall(stall: MarketStall): Promise<CommandResult> {
 }
 
 /**
- * Parse list command arguments
- * Supports: "Item Name" 100 [world]
+ * Parse list command arguments.
+ *
+ * The CommandParser tokenizer already strips quotes, so multi-word item names
+ * arrive as a single token (e.g., `"Iron Sword"` → token `Iron Sword`).
+ * We work directly on the token array instead of re-joining + regex.
+ *
+ * Expected patterns (all tokens, quotes already stripped):
+ *   <itemName> <price>
+ *   <itemName> <price> <world|regional>
  */
 function parseListArgs(
   args: string[]
 ): { itemName: string; price: number; scope: 'REGIONAL' | 'WORLD' } | null {
   if (args.length < 2) return null;
 
-  // Join args and re-parse to handle quoted strings
-  const joined = args.join(' ');
-
-  // Match: "item name" price [scope] OR item price [scope]
-  const quotedMatch = joined.match(/^"([^"]+)"\s+(\d+)(?:\s+(world|regional))?$/i);
-  if (quotedMatch) {
-    return {
-      itemName: quotedMatch[1],
-      price: parseInt(quotedMatch[2], 10),
-      scope: quotedMatch[3]?.toUpperCase() === 'WORLD' ? 'WORLD' : 'REGIONAL',
-    };
+  // Check if the last token is a scope qualifier
+  let scope: 'REGIONAL' | 'WORLD' = 'REGIONAL';
+  let priceIdx = args.length - 1;
+  const lastArg = args[args.length - 1]!.toLowerCase();
+  if (lastArg === 'world' || lastArg === 'regional') {
+    scope = lastArg === 'world' ? 'WORLD' : 'REGIONAL';
+    priceIdx = args.length - 2;
   }
 
-  // Simple: item price [scope] (single-word item name)
-  const simpleMatch = joined.match(/^(\S+)\s+(\d+)(?:\s+(world|regional))?$/i);
-  if (simpleMatch) {
-    return {
-      itemName: simpleMatch[1],
-      price: parseInt(simpleMatch[2], 10),
-      scope: simpleMatch[3]?.toUpperCase() === 'WORLD' ? 'WORLD' : 'REGIONAL',
-    };
-  }
+  if (priceIdx < 1) return null;
 
-  return null;
+  const price = parseInt(args[priceIdx]!, 10);
+  if (isNaN(price) || price < 1) return null;
+
+  // Everything before the price token is the item name
+  const itemName = args.slice(0, priceIdx).join(' ');
+  if (!itemName) return null;
+
+  return { itemName, price, scope };
 }

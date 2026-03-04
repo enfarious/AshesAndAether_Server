@@ -3,12 +3,20 @@
  *
  * Between triggers, the companion runs on the last decision. This keeps token
  * usage bounded: a handful of LLM calls per dungeon fight, not per tick.
- * A typical fight might produce 3–6 setting updates.
+ *
+ * Triggers:
+ * - combat_start                — first tick in combat (bypasses debounce)
+ * - player_command              — player issues a directive (bypasses debounce)
+ * - companion_health_threshold  — companion HP crosses 75/50/25% bands
+ * - ally_health_threshold       — any ally HP crosses 50/25% bands
+ * - status_effect_change        — buff/debuff applied or expired (placeholder)
+ *
+ * Removed (noisy/pointless):
+ * - combat_end      — just reset to baseline, no LLM needed
+ * - new_enemy_type  — handled by engagement gate before combat entry
  */
 
 export interface CombatSnapshot {
-  /** Enemy entity IDs currently engaged, mapped to their tag/type string. */
-  enemyTypes: Map<string, string>;
   /** Ally entity IDs mapped to their HP ratio (0–1). */
   allyHealthRatios: Map<string, number>;
   /** This companion's HP ratio (0–1). */
@@ -17,42 +25,42 @@ export interface CombatSnapshot {
   playerCommand: string | null;
   /** Whether combat just started this tick. */
   combatJustStarted: boolean;
-  /** Whether combat just ended this tick. */
-  combatJustEnded: boolean;
+  /** Whether a status effect changed this tick (placeholder — always false for now). */
+  statusEffectsChanged: boolean;
 }
 
 /** Describes why the trigger fired, for logging/debugging. */
 export type TriggerReason =
   | 'combat_start'
-  | 'combat_end'
-  | 'new_enemy_type'
-  | 'ally_health_critical'
+  | 'ally_health_threshold'
   | 'companion_health_threshold'
   | 'player_command'
-  | 'enemy_phase_shift';
+  | 'status_effect_change';
 
-const DEBOUNCE_MS = 3_000;        // Minimum 3s between LLM calls
-const ALLY_CRITICAL_RATIO = 0.3;  // Trigger if any ally drops below 30%
-const MAX_CALLS_PER_FIGHT = 12;   // Hard cap on LLM calls per fight
+const DEBOUNCE_MS = 10_000;       // Minimum 10s between LLM calls
+const MAX_CALLS_PER_FIGHT = 6;    // Hard cap on LLM calls per fight
+
+// HP bands that trigger a settings update when crossed downward
+const COMPANION_HP_BANDS = [0.75, 0.50, 0.25];
+const ALLY_HP_BANDS = [0.50, 0.25];
 
 export class CompanionCombatTrigger {
   private lastTriggerAt = 0;
   private callsThisFight = 0;
-  private knownEnemyTypes = new Set<string>();
-  private previousAllyHealthAboveCritical = new Map<string, boolean>();
-  private previousCompanionAboveThreshold = true;
-  private retreatThreshold = 0.25;
+
+  /** Companion HP bands already crossed (e.g. 75, 50). */
+  private companionBandsCrossed = new Set<number>();
+  /** Per-ally HP bands already crossed. Map<allyId, Set<band>>. */
+  private allyBandsCrossed = new Map<string, Set<number>>();
 
   /**
    * Reset state for a new fight.
    */
-  startFight(retreatThreshold: number): void {
+  startFight(): void {
     this.lastTriggerAt = 0;
     this.callsThisFight = 0;
-    this.knownEnemyTypes.clear();
-    this.previousAllyHealthAboveCritical.clear();
-    this.previousCompanionAboveThreshold = true;
-    this.retreatThreshold = retreatThreshold;
+    this.companionBandsCrossed.clear();
+    this.allyBandsCrossed.clear();
   }
 
   /**
@@ -63,12 +71,9 @@ export class CompanionCombatTrigger {
     // Hard cap
     if (this.callsThisFight >= MAX_CALLS_PER_FIGHT) return null;
 
-    // Combat start/end always trigger (bypass debounce)
+    // Combat start always triggers (bypass debounce)
     if (snapshot.combatJustStarted) {
       return this.fire('combat_start', now);
-    }
-    if (snapshot.combatJustEnded) {
-      return this.fire('combat_end', now);
     }
 
     // Player command always triggers (bypass debounce)
@@ -79,32 +84,34 @@ export class CompanionCombatTrigger {
     // Debounce check for remaining triggers
     if (now - this.lastTriggerAt < DEBOUNCE_MS) return null;
 
-    // New enemy type enters combat
-    for (const [_id, enemyType] of snapshot.enemyTypes) {
-      if (!this.knownEnemyTypes.has(enemyType)) {
-        this.knownEnemyTypes.add(enemyType);
-        return this.fire('new_enemy_type', now);
+    // Companion HP band crossings (edge-triggered — each band fires once)
+    for (const band of COMPANION_HP_BANDS) {
+      if (!this.companionBandsCrossed.has(band) && snapshot.companionHealthRatio < band) {
+        this.companionBandsCrossed.add(band);
+        return this.fire('companion_health_threshold', now);
       }
     }
 
-    // Ally health drops below critical threshold (edge trigger — only fires once per ally crossing)
+    // Ally HP band crossings (edge-triggered per ally)
     for (const [allyId, ratio] of snapshot.allyHealthRatios) {
-      const wasAbove = this.previousAllyHealthAboveCritical.get(allyId) ?? true;
-      const isAbove = ratio >= ALLY_CRITICAL_RATIO;
-      this.previousAllyHealthAboveCritical.set(allyId, isAbove);
+      let allyBands = this.allyBandsCrossed.get(allyId);
+      if (!allyBands) {
+        allyBands = new Set<number>();
+        this.allyBandsCrossed.set(allyId, allyBands);
+      }
 
-      if (wasAbove && !isAbove) {
-        return this.fire('ally_health_critical', now);
+      for (const band of ALLY_HP_BANDS) {
+        if (!allyBands.has(band) && ratio < band) {
+          allyBands.add(band);
+          return this.fire('ally_health_threshold', now);
+        }
       }
     }
 
-    // Companion's own health crosses retreat threshold (edge trigger)
-    const companionAboveThreshold = snapshot.companionHealthRatio >= this.retreatThreshold;
-    if (this.previousCompanionAboveThreshold && !companionAboveThreshold) {
-      this.previousCompanionAboveThreshold = companionAboveThreshold;
-      return this.fire('companion_health_threshold', now);
+    // Status effect changes (placeholder — wired when status system exists)
+    if (snapshot.statusEffectsChanged) {
+      return this.fire('status_effect_change', now);
     }
-    this.previousCompanionAboveThreshold = companionAboveThreshold;
 
     return null;
   }

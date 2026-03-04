@@ -57,6 +57,26 @@ export interface CombatAbilityDefinition {
   };
   // For DoTs/buffs/debuffs: cooldown triggers AFTER effect duration ends
   effectDuration?: number; // seconds - if set, cooldown starts after this duration
+  // Tags for ability categorization (e.g., 'healing' for Steady Hand CD reduction)
+  tags?: string[];
+}
+
+// ─── Buff / Debuff Tracking ───
+
+export interface ActiveBuff {
+  id: string;           // e.g., 'embolden', 'power_strike'
+  sourceId: string;     // Who applied it
+  expiresAt: number;    // Timestamp (ms)
+  /** Additive stat modifications while active */
+  statMods?: Partial<CombatStats>;
+  /** Mechanic key: 'next_attack_bonus', 'taunt', 'root', etc. */
+  special?: string;
+  /** Extra numeric data for the mechanic (e.g., { flatBonus: 10, scalingBonus: 5 }) */
+  specialData?: Record<string, number>;
+  /** If set, buff breaks when single-hit damage >= this amount */
+  breakOnDamage?: number;
+  /** If true, consumed on next successful weapon attack */
+  consumeOnHit?: boolean;
 }
 
 export interface CombatantState {
@@ -70,6 +90,17 @@ export interface CombatantState {
   autoAttackTimer: number;     // Time accumulated toward next auto-attack (seconds)
   weaponSpeed: number;         // Seconds between auto-attacks (lower = faster)
   specialCharges: Map<string, number>; // [chargeType] -> count (max 5 per type)
+
+  // ─── Buff / Debuff / CC Tracking ───
+  activeBuffs: ActiveBuff[];
+  /** Entity ID that forced this combatant's target via taunt */
+  tauntedBy?: string;
+  tauntExpiresAt?: number;
+  /** Movement-prevention root */
+  rooted?: boolean;
+  rootExpiresAt?: number;
+  /** Damage threshold that breaks the root (single hit) */
+  rootBreakThreshold?: number;
 }
 
 // ATB costs are ability-dependent (defined per ability in DB/definitions)

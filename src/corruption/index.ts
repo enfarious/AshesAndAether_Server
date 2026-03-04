@@ -46,6 +46,7 @@ export {
   type CorruptionBroadcastCallback,
   type CommunityCheckCallback,
   type PartySizeCallback,
+  type BeaconCheckCallback,
   type ZoneCorruptionData,
 
   // System class and singleton

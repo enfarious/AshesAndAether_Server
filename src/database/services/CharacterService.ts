@@ -99,11 +99,33 @@ export class CharacterService {
         positionZ: data.positionZ,
         heading: 0, // Facing north
 
-        // Progression (empty)
+        // Progression — all T1 abilities unlocked and slotted for testing
         unlockedFeats: [],
-        unlockedAbilities: [],
-        activeLoadout: [],
-        passiveLoadout: [],
+        unlockedAbilities: {
+          activeNodes: [
+            'active_tank_t1', 'active_phys_t1', 'active_control_t1',
+            'active_magic_t1', 'active_healer_t1', 'active_support_t1',
+          ],
+          passiveNodes: [
+            'passive_tank_t1', 'passive_phys_t1', 'passive_control_t1',
+            'passive_magic_t1', 'passive_healer_t1', 'passive_support_t1',
+          ],
+          apSpent: 12, // 6 active + 6 passive, 1 AP each
+        },
+        activeLoadout: {
+          slots: [
+            'active_tank_t1', 'active_phys_t1', 'active_control_t1',
+            'active_magic_t1', 'active_healer_t1', 'active_support_t1',
+            null, null,
+          ],
+        },
+        passiveLoadout: {
+          slots: [
+            'passive_tank_t1', 'passive_phys_t1', 'passive_control_t1',
+            'passive_magic_t1', 'passive_healer_t1', 'passive_support_t1',
+            null, null,
+          ],
+        },
         specialLoadout: [],
 
         // Cosmetics (stored in supernaturalData until a dedicated profile schema exists)

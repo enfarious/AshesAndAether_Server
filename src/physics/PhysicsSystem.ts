@@ -722,6 +722,90 @@ export class PhysicsSystem {
   }
 
   /**
+   * Find a heading that avoids building walls using 2D ray feelers in the XZ
+   * plane.  If the desired heading is clear, returns it unchanged.  Otherwise
+   * tries progressively wider left/right offsets and returns the first clear
+   * heading.  Returns `null` only when every tested direction is blocked
+   * (entity is fully enclosed).
+   *
+   * @param position   Current entity position (only x/z used).
+   * @param heading    Desired heading in degrees (0°=North/+Z, 90°=East/+X).
+   * @param lookAhead  How far ahead to probe (metres).  3–5 m works well for
+   *                   companion / mob speeds.
+   * @param radius     Entity collision radius (ray origin offset).
+   */
+  steerAroundWalls(
+    position: Vector3,
+    heading: number,
+    lookAhead: number,
+    radius: number,
+  ): number | null {
+    // Offsets to try: straight ahead, then alternating left/right
+    const offsets = [0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180];
+
+    for (const offset of offsets) {
+      const testHeading = (heading + offset + 360) % 360;
+      if (!this._isHeadingBlockedByWalls(position, testHeading, lookAhead, radius)) {
+        return testHeading;
+      }
+    }
+
+    return null; // Fully enclosed
+  }
+
+  /**
+   * Cast a 2D ray in the XZ plane from `position` along `heading` and check
+   * whether it intersects any registered WallSegment within `distance` metres.
+   * The ray is offset `radius` metres along the heading so it tests where the
+   * entity's edge would be, not its centre.
+   */
+  private _isHeadingBlockedByWalls(
+    position: Vector3,
+    heading: number,
+    distance: number,
+    radius: number,
+  ): boolean {
+    const rad = (heading * Math.PI) / 180;
+    // Direction unit vector: 0°=+Z, 90°=+X (matches game convention)
+    const dirX = Math.sin(rad);
+    const dirZ = Math.cos(rad);
+
+    // Cast 3 parallel feeler rays: center, left shoulder, right shoulder.
+    // A single center ray misses walls that only clip the entity's sides.
+    const perpX = dirZ;  // perpendicular in XZ plane (rotated 90° CW)
+    const perpZ = -dirX;
+
+    const origins = [
+      { x: position.x + dirX * radius,              z: position.z + dirZ * radius },                // center
+      { x: position.x + dirX * radius + perpX * radius, z: position.z + dirZ * radius + perpZ * radius }, // left shoulder
+      { x: position.x + dirX * radius - perpX * radius, z: position.z + dirZ * radius - perpZ * radius }, // right shoulder
+    ];
+
+    for (const entity of this.staticEntities.values()) {
+      const vol = entity.boundingVolume;
+      if (!('ax' in vol)) continue;
+
+      const wall = vol as WallSegment;
+      const wdx = wall.bx - wall.ax;
+      const wdz = wall.bz - wall.az;
+
+      const denom = dirX * wdz - dirZ * wdx;
+      if (Math.abs(denom) < 1e-10) continue; // Parallel
+
+      for (const o of origins) {
+        const t = ((wall.ax - o.x) * wdz - (wall.az - o.z) * wdx) / denom;
+        const s = ((wall.ax - o.x) * dirZ - (wall.az - o.z) * dirX) / denom;
+
+        if (t >= 0 && t <= distance && s >= 0 && s <= 1) {
+          return true; // Hit a wall
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * Nudge an entity that is embedded in or pressed against building geometry to
    * a nearby clear position so physics can resume normally.
    *

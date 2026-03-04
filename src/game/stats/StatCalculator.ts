@@ -48,6 +48,7 @@ export interface EquipmentBonuses {
   physicalAccuracy?: number;
   evasion?: number;
   damageAbsorption?: number;
+  magicAttack?: number;
   magicDefense?: number;
   magicAccuracy?: number;
   magicEvasion?: number;
@@ -88,7 +89,7 @@ export class StatCalculator {
       deflectedBlowChance: this.calculateDeflectedBlowChance(core.dexterity, equipment.deflectedBlowChance),
 
       // Magic Combat
-      magicAttack: this.calculateMagicAttack(core.intelligence, equipment.attackRating),
+      magicAttack: this.calculateMagicAttack(core.intelligence, equipment.magicAttack),
       magicDefense: this.calculateMagicDefense(core.wisdom, equipment.magicDefense),
       magicAccuracy: this.calculateMagicAccuracy(core.intelligence, equipment.magicAccuracy),
       magicEvasion: this.calculateMagicEvasion(core.wisdom, equipment.magicEvasion),

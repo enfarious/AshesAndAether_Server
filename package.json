@@ -44,6 +44,8 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "express-session": "^1.18.2",
+    "fengari": "^0.1.5",
+    "fengari-interop": "^0.1.4",
     "ioredis": "^5.4.2",
     "jsonwebtoken": "^9.0.2",
     "memoizee": "^0.4.17",

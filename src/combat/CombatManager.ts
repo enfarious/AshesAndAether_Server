@@ -1,4 +1,4 @@
-import { CombatantState, ATB_DEFAULT_MAX, ATB_ABSOLUTE_MAX, SPECIAL_CHARGE_MAX, QueuedCombatAction } from './types';
+import { CombatantState, ATB_DEFAULT_MAX, ATB_ABSOLUTE_MAX, SPECIAL_CHARGE_MAX, QueuedCombatAction, ActiveBuff, CombatStats } from './types';
 
 const DEFAULT_ATB_BASE_RATE = 10; // gauge per second
 const DEFAULT_COMBAT_TIMEOUT_MS = 15000;
@@ -28,6 +28,7 @@ export class CombatManager {
         autoAttackTimer: 0,
         weaponSpeed: DEFAULT_WEAPON_SPEED,
         specialCharges: new Map(),
+        activeBuffs: [],
       };
       this.combatants.set(entityId, state);
     }
@@ -70,6 +71,29 @@ export class CombatManager {
           state.autoAttackTimer = 0;
           expired.push(state.entityId);
         }
+      }
+
+      // Expire buffs
+      if (state.activeBuffs.length > 0) {
+        state.activeBuffs = state.activeBuffs.filter(b => b.expiresAt > now);
+      }
+
+      // Expire taunt
+      if (state.tauntedBy && state.tauntExpiresAt && now >= state.tauntExpiresAt) {
+        state.tauntedBy = undefined;
+        state.tauntExpiresAt = undefined;
+      }
+
+      // Enforce taunt: override auto-attack target
+      if (state.tauntedBy && state.autoAttackTarget !== state.tauntedBy) {
+        state.autoAttackTarget = state.tauntedBy;
+      }
+
+      // Expire root
+      if (state.rooted && state.rootExpiresAt && now >= state.rootExpiresAt) {
+        state.rooted = false;
+        state.rootExpiresAt = undefined;
+        state.rootBreakThreshold = undefined;
       }
     }
 
@@ -375,5 +399,135 @@ export class CombatManager {
 
   clearQueuedActionsForEntity(entityId: string): void {
     this.queuedActions = this.queuedActions.filter(action => action.attackerId !== entityId);
+  }
+
+  // ========== Buff / Debuff Methods ==========
+
+  addBuff(entityId: string, buff: ActiveBuff): void {
+    const state = this.ensureCombatant(entityId, Date.now());
+    state.activeBuffs.push(buff);
+  }
+
+  removeBuff(entityId: string, buffId: string): void {
+    const state = this.combatants.get(entityId);
+    if (!state) return;
+    state.activeBuffs = state.activeBuffs.filter(b => b.id !== buffId);
+  }
+
+  getBuffs(entityId: string): ActiveBuff[] {
+    const state = this.combatants.get(entityId);
+    return state?.activeBuffs ?? [];
+  }
+
+  hasBuff(entityId: string, buffId: string): boolean {
+    const state = this.combatants.get(entityId);
+    if (!state) return false;
+    return state.activeBuffs.some(b => b.id === buffId);
+  }
+
+  /**
+   * Sum all active buff stat modifications for an entity.
+   * Used to overlay temporary buffs on combat stat snapshots.
+   */
+  getBuffStatMods(entityId: string): Partial<CombatStats> {
+    const state = this.combatants.get(entityId);
+    if (!state) return {};
+    const mods: Record<string, number> = {};
+    const now = Date.now();
+    for (const buff of state.activeBuffs) {
+      if (buff.expiresAt <= now || !buff.statMods) continue;
+      for (const [key, value] of Object.entries(buff.statMods)) {
+        if (typeof value === 'number') {
+          mods[key] = (mods[key] ?? 0) + value;
+        }
+      }
+    }
+    return mods as Partial<CombatStats>;
+  }
+
+  /**
+   * Consume and return a "next attack" buff (Power Strike pattern).
+   * Returns the buff if found and removes it, or undefined if none exists.
+   */
+  consumeNextAttackBuff(entityId: string): ActiveBuff | undefined {
+    const state = this.combatants.get(entityId);
+    if (!state) return undefined;
+    const now = Date.now();
+    const idx = state.activeBuffs.findIndex(
+      b => b.consumeOnHit && b.expiresAt > now
+    );
+    if (idx === -1) return undefined;
+    const [buff] = state.activeBuffs.splice(idx, 1);
+    return buff;
+  }
+
+  // ========== Taunt Methods ==========
+
+  setTaunt(entityId: string, taunterId: string, durationMs: number, now: number): void {
+    const state = this.ensureCombatant(entityId, now);
+    state.tauntedBy = taunterId;
+    state.tauntExpiresAt = now + durationMs;
+    // Force auto-attack to taunter immediately
+    state.autoAttackTarget = taunterId;
+  }
+
+  clearTaunt(entityId: string): void {
+    const state = this.combatants.get(entityId);
+    if (!state) return;
+    state.tauntedBy = undefined;
+    state.tauntExpiresAt = undefined;
+  }
+
+  getTauntedBy(entityId: string): string | undefined {
+    const state = this.combatants.get(entityId);
+    if (!state || !state.tauntedBy) return undefined;
+    if (state.tauntExpiresAt && Date.now() >= state.tauntExpiresAt) {
+      state.tauntedBy = undefined;
+      state.tauntExpiresAt = undefined;
+      return undefined;
+    }
+    return state.tauntedBy;
+  }
+
+  // ========== Root Methods ==========
+
+  setRoot(entityId: string, durationMs: number, breakThreshold: number, now: number): void {
+    const state = this.ensureCombatant(entityId, now);
+    state.rooted = true;
+    state.rootExpiresAt = now + durationMs;
+    state.rootBreakThreshold = breakThreshold;
+  }
+
+  clearRoot(entityId: string): void {
+    const state = this.combatants.get(entityId);
+    if (!state) return;
+    state.rooted = false;
+    state.rootExpiresAt = undefined;
+    state.rootBreakThreshold = undefined;
+  }
+
+  isRooted(entityId: string): boolean {
+    const state = this.combatants.get(entityId);
+    if (!state?.rooted) return false;
+    if (state.rootExpiresAt && Date.now() >= state.rootExpiresAt) {
+      state.rooted = false;
+      state.rootExpiresAt = undefined;
+      state.rootBreakThreshold = undefined;
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Check if incoming damage breaks a root. Returns true if root was broken.
+   */
+  checkRootBreak(entityId: string, damageAmount: number): boolean {
+    const state = this.combatants.get(entityId);
+    if (!state?.rooted) return false;
+    if (state.rootBreakThreshold && damageAmount >= state.rootBreakThreshold) {
+      this.clearRoot(entityId);
+      return true;
+    }
+    return false;
   }
 }

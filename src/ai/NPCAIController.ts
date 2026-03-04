@@ -8,6 +8,14 @@ import { CompanionCombatMetrics, type FightMetrics } from './CompanionCombatMetr
 import { type CompanionCombatSettings, getBaselineForArchetype, mergePartialSettings, cloneSettings } from './CompanionCombatSettings';
 import { LLMService, type CombatSettingsContext } from './LLMService';
 
+/** Minimal info needed for the engagement gate. */
+export interface EngagementTarget {
+  name: string;
+  family?: string | null;
+  species?: string | null;
+  level?: number;
+}
+
 /**
  * Controls NPC/Companion AI behavior — social + combat.
  *
@@ -35,9 +43,16 @@ export class NPCAIController {
   private _inCombat = false;
   private fightStartedAt = 0;
   private pendingPlayerCommand: string | null = null;
+  /** Global LLM throttle — no more than one call per 15s across all call types. */
+  private lastLlmCallAt = 0;
+  private static readonly LLM_GLOBAL_COOLDOWN_MS = 15_000;
 
   /** Abilities available to this companion (curated per archetype). */
   private abilities: CombatAbilityDefinition[] = [];
+
+  // ── Engagement gate ────────────────────────────────────────────────────
+  /** Cached engage/ignore decisions keyed by species (or family if no species). */
+  private engagementCache = new Map<string, 'engage' | 'ignore'>();
 
   constructor(companion: Companion, llmService: LLMService) {
     this.companion = companion;
@@ -86,6 +101,53 @@ export class NPCAIController {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // Engagement gate (three-tier: ignore → always-engage → ask LLM)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Should this companion engage a nearby enemy?
+   *
+   * Resolution order (species overrides family):
+   * 1. species in alwaysEngageSpecies → engage
+   * 2. species in ignoreSpecies       → ignore
+   * 3. family in alwaysEngageFamily   → engage
+   * 4. family in ignoreFamily         → ignore
+   * 5. cache hit                      → return cached answer
+   * 6. Archetype fallback             → aggressive types engage, others ignore
+   */
+  async shouldEngage(enemy: EngagementTarget, _ownerNearby: boolean): Promise<boolean> {
+    const { species, family } = enemy;
+    const s = this.currentSettings;
+
+    // Species-level overrides (highest priority)
+    if (species) {
+      if (s.alwaysEngageSpecies.includes(species)) return true;
+      if (s.ignoreSpecies.includes(species)) return false;
+    }
+
+    // Family-level rules
+    if (family) {
+      if (s.alwaysEngageFamily.includes(family)) return true;
+      if (s.ignoreFamily.includes(family)) return false;
+    }
+
+    // Cache check — keyed by species if available, else family, else mob name
+    const cacheKey = species ?? family ?? enemy.name;
+    const cached = this.engagementCache.get(cacheKey);
+    if (cached) return cached === 'engage';
+
+    // Default: all companions engage hostile mobs. The ignore lists above
+    // handle specific exclusions. No LLM call needed.
+    this.engagementCache.set(cacheKey, 'engage');
+    logger.debug({
+      companionId: this.companion.id,
+      mob: enemy.name,
+      cacheKey,
+    }, '[CompanionAI] Engagement decision (default engage)');
+    return true;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // Combat update (in combat)
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -129,7 +191,7 @@ export class NPCAIController {
 
     this._inCombat = true;
     this.fightStartedAt = Date.now();
-    this.combatTrigger.startFight(this.currentSettings.retreatThreshold);
+    this.combatTrigger.startFight();
     this.combatMetrics.startFight();
 
     logger.info({
@@ -147,8 +209,11 @@ export class NPCAIController {
     const metrics = this.combatMetrics.endFight();
 
     // Reset settings to baseline (personality reasserts after combat)
-    const archetype = (this.companion as any).archetype ?? 'opportunist';
+    const archetype = this.companion.archetype ?? 'opportunist';
     this.currentSettings = getBaselineForArchetype(archetype);
+
+    // Clear engagement cache — re-evaluate next time
+    this.engagementCache.clear();
 
     logger.info({
       companionId: this.companion.id,
@@ -200,11 +265,18 @@ export class NPCAIController {
     context: CombatContext,
     triggerReason: TriggerReason,
   ): Promise<void> {
+    // Global LLM throttle — player_command bypasses, everything else respects cooldown
+    const now = Date.now();
+    if (triggerReason !== 'player_command' && now - this.lastLlmCallAt < NPCAIController.LLM_GLOBAL_COOLDOWN_MS) {
+      return;
+    }
+    this.lastLlmCallAt = now;
+
     this.combatMetrics.recordLlmCall();
 
     const combatCtx: CombatSettingsContext = {
       companionName: this.companion.name,
-      archetype: (this.companion as any).archetype ?? 'opportunist',
+      archetype: this.companion.archetype ?? 'opportunist',
       personalityType: this.companion.personalityType,
       companionHealthRatio: context.self.maxHealth > 0
         ? context.self.currentHealth / context.self.maxHealth
@@ -238,11 +310,6 @@ export class NPCAIController {
   // ── Combat snapshot for trigger evaluation ───────────────────────────────
 
   private buildCombatSnapshot(context: CombatContext): CombatSnapshot {
-    const enemyTypes = new Map<string, string>();
-    for (const enemy of context.enemies) {
-      enemyTypes.set(enemy.id, enemy.tag ?? enemy.name);
-    }
-
     const allyHealthRatios = new Map<string, number>();
     if (context.owner) {
       allyHealthRatios.set(
@@ -258,14 +325,13 @@ export class NPCAIController {
     }
 
     return {
-      enemyTypes,
       allyHealthRatios,
       companionHealthRatio: context.self.maxHealth > 0
         ? context.self.currentHealth / context.self.maxHealth
         : 1,
       playerCommand: this.pendingPlayerCommand,
       combatJustStarted: false, // Set by caller when entering combat
-      combatJustEnded: false,   // Set by caller when exiting combat
+      statusEffectsChanged: false, // Placeholder — wired when status system exists
     };
   }
 
@@ -303,6 +369,22 @@ export class NPCAIController {
 
   getCompanion(): Companion {
     return this.companion;
+  }
+
+  /** Patch the in-memory companion with updated fields (e.g. after a DB write). */
+  patchCompanion(fields: Partial<Companion>): void {
+    Object.assign(this.companion, fields);
+  }
+
+  /** Reset settings to a new archetype baseline. Called when player manually changes archetype. */
+  resetToArchetype(archetype: string): void {
+    this.currentSettings = getBaselineForArchetype(archetype);
+    this.engagementCache.clear();
+  }
+
+  /** Apply manual settings override from the player's UI panel. */
+  applyManualSettings(settings: CompanionCombatSettings): void {
+    this.currentSettings = cloneSettings(settings);
   }
 
   getCurrentSettings(): CompanionCombatSettings {

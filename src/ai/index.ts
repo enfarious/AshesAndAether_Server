@@ -1,7 +1,12 @@
 export { NPCAIController } from './NPCAIController';
+export type { EngagementTarget } from './NPCAIController';
 export { LLMService } from './LLMService';
+export type { CombatSettingsContext, EngagementContext } from './LLMService';
 export { CompanionBehaviorTree } from './CompanionBehaviorTree';
+export type { CombatEntity, CombatContext, BehaviorTickResult } from './CompanionBehaviorTree';
 export { CompanionCombatTrigger } from './CompanionCombatTrigger';
+export type { CombatSnapshot, TriggerReason } from './CompanionCombatTrigger';
 export { CompanionCombatMetrics } from './CompanionCombatMetrics';
 export type { CompanionCombatSettings, CompanionArchetype } from './CompanionCombatSettings';
 export { BASELINE_SETTINGS, getBaselineForArchetype, mergePartialSettings, cloneSettings } from './CompanionCombatSettings';
+export { CompanionTaskService } from './CompanionTaskService';

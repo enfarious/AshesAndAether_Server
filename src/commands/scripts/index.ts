@@ -37,7 +37,11 @@ import { arenaCommand, setArenaManager } from './world/arena-command';
 export { setArenaManager };
 import { vaultCommand, setVaultManager } from './world/vault-command';
 export { setVaultManager };
+import { objectCommand, editCommand, undoCommand, doVerbCommand } from './world/object';
 import { marketCommand } from './market/market';
+import { guildCommand } from './social/guild';
+import { beaconCommand } from './world/beacon';
+import { libraryCommand } from './world/library';
 
 /**
  * Register all Phase 1 commands
@@ -76,9 +80,18 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(villageCommand);
   registry.register(arenaCommand);
   registry.register(vaultCommand);
+  registry.register(objectCommand);
+  registry.register(editCommand);
+  registry.register(undoCommand);
+  registry.register(doVerbCommand);
 
   // Market commands
   registry.register(marketCommand);
+
+  // Guild commands
+  registry.register(guildCommand);
+  registry.register(beaconCommand);
+  registry.register(libraryCommand);
 
   // Combat commands
   registry.register(attackCommand);
@@ -101,7 +114,9 @@ export function getAllCommandNames(): string[] {
     // Movement
     'move', 'stop',
     // World
-    'companion',
+    'companion', 'beacon', 'library',
+    // Guild
+    'guild',
     // Market
     'market',
     // Combat

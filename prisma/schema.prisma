@@ -15,6 +15,7 @@ model Account {
   createdAt    DateTime    @default(now())
   lastLoginAt  DateTime?
   characters   Character[]
+  companions   Companion[]
 
   @@map("accounts")
 }
@@ -99,6 +100,12 @@ model Character {
 
   // Village system
   village PlayerVillage?
+
+  // Player companions
+  companions Companion[]
+
+  // Guild system
+  guildMembership GuildMembership?
 
   @@index([accountId])
   @@index([zoneId])
@@ -245,14 +252,35 @@ model Companion {
   archetype      String @default("opportunist") // scrappy_fighter | cautious_healer | opportunist | tank
   combatSettings Json?                          // Persisted last-known CompanionCombatSettings (optional, for resuming)
 
+  // Ownership (null = server NPC)
+  ownerAccountId   String?
+  ownerCharacterId String?
+
+  // Mode & task state
+  behaviorState  String    @default("detached") // "active" | "detached" | "tasked"
+  behaviorTree   Json?                          // Serialized behavior tree (null = no task)
+  taskDescription String?                       // Human-readable task description
+  taskAssignedAt DateTime?
+
+  // Harvest stats
+  harvestsCompleted Int       @default(0)
+  itemsGathered     Int       @default(0)
+  lastHarvestAt     DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   // Airlock's long-term memory for this NPC
   memory CompanionMemory?
 
+  // Ownership relations
+  ownerAccount   Account?   @relation(fields: [ownerAccountId], references: [id])
+  ownerCharacter Character? @relation(fields: [ownerCharacterId], references: [id])
+
   @@index([tag])
   @@index([possessedAirlockId])
+  @@index([ownerAccountId])
+  @@index([ownerCharacterId])
   @@map("companions")
 }
 
@@ -277,6 +305,10 @@ model Mob {
   positionX Float
   positionY Float
   positionZ Float
+
+  // Taxonomy — broad family + specific species for engagement rules, loot, wiki
+  family    String?  // e.g. "hare", "canine", "cervid", "aberration"
+  species   String?  // e.g. "snow_hare", "ballistic_rabbit", "spiral_fox"
 
   // Faction and notoriety — client-side nameplate display
   faction    String?  // e.g. "hostile", "neutral", "friendly" — drives nameplate color
@@ -842,4 +874,294 @@ model CivicAnchor {
   @@index([type])
   @@index([lat, lon])
   @@map("civic_anchors")
+}
+
+// ============================================================================
+// SCRIPTED OBJECTS (MOO-style Lua scripting)
+// ============================================================================
+
+model ScriptedObject {
+  id               String    @id @default(uuid())
+  name             String
+  description      String?
+  ownerCharacterId String
+  zoneId           String
+  positionX        Float
+  positionY        Float
+  positionZ        Float
+
+  // Script content (Lua source, max 64KB enforced at application layer)
+  // Legacy: single-script mode. New objects use ObjectVerbScript for per-verb scripts.
+  scriptSource String @default("")
+
+  // Persistent state (JSON map, max 64 keys enforced at application layer)
+  stateData Json @default("{}")
+
+  // Safety
+  isActive     Boolean   @default(true)
+  errorCount   Int       @default(0)
+  lastErrorAt  DateTime?
+  lastErrorMsg String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Per-verb scripts
+  verbScripts ObjectVerbScript[]
+
+  @@index([zoneId])
+  @@index([ownerCharacterId])
+  @@map("scripted_objects")
+}
+
+model ObjectVerbScript {
+  id       String @id @default(uuid())
+  objectId String
+  verb     String // e.g. "light", "dig", "onHeartbeat", "onTouch"
+  source   String @default("") // Lua source (max 64KB enforced at app layer)
+
+  // Versioning
+  scriptHistory String @default("[]") // JSON array of last 3 prior sources, newest first
+  version       Int    @default(1)
+
+  // Metadata
+  compiledAt DateTime?
+  authorId   String // Character ID of last editor
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  object ScriptedObject @relation(fields: [objectId], references: [id], onDelete: Cascade)
+
+  @@unique([objectId, verb])
+  @@index([objectId])
+  @@map("object_verb_scripts")
+}
+
+// ============================================================================
+// GUILD SYSTEM
+// ============================================================================
+
+model Guild {
+  id          String    @id @default(uuid())
+  name        String    @unique // Max 48 chars, enforced at app layer
+  tag         String    @unique // 3-5 chars, uppercase, enforced at app layer
+  description String    @default("") // Max 500 chars
+  motto       String    @default("") // Max 120 chars
+  charter     String    @default("") // Auto-generated founding document
+  crestData   Json? // Crest customization (colors, icon id, etc.)
+
+  foundedAt   DateTime  @default(now())
+  disbandedAt DateTime? // Non-null = guild is dissolved
+
+  // Guildmaster — the only special role in alpha flat-rank model
+  guildmasterId String // Character ID of the founder/GM
+
+  // Cached member count for beacon allotment lookups
+  memberCount Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members  GuildMembership[]
+  beacons  GuildBeacon[]
+  polygons GuildPolygon[]
+
+  @@index([guildmasterId])
+  @@map("guilds")
+}
+
+model GuildMembership {
+  id          String   @id @default(uuid())
+  guildId     String
+  characterId String   @unique // A character can only be in one guild
+  joinedAt    DateTime @default(now())
+
+  guild     Guild     @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  character Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@index([characterId])
+  @@map("guild_memberships")
+}
+
+model GuildWorldPoint {
+  id          String  @id @default(uuid())
+  name        String // Human-readable point name
+  description String?
+
+  // Real-world coordinates (from OSM, when available)
+  lat Float?
+  lon Float?
+
+  // Game-world coordinates (always present)
+  worldX Float
+  worldY Float @default(0)
+  worldZ Float
+
+  // Zone association
+  zoneId String
+
+  // Beacon tier hint (1-5), locked to zone corruption depth at generation
+  tierHint Int @default(1)
+
+  // OSM provenance (nullable for manually seeded points)
+  osmId   Int?    @unique
+  osmType String? @default("node") // "node" or "way"
+  osmTags Json? // Original OSM tags for reference
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // The beacon placed at this point (if any)
+  beacon GuildBeacon?
+
+  @@index([zoneId])
+  @@index([lat, lon])
+  @@map("guild_world_points")
+}
+
+model GuildBeacon {
+  id           String  @id @default(uuid())
+  guildId      String
+  worldPointId String  @unique // One beacon per world point
+
+  // Beacon state
+  isLit Boolean @default(false)
+  tier  Int     @default(1) // 1-5, derived from world point tierHint
+
+  // Fuel system
+  fuelRemaining  Float    @default(0) // Hours of fuel remaining
+  fuelCapacity   Float    @default(48) // Max hours of fuel (always 48)
+  lastFuelTickAt DateTime @default(now()) // Last time fuel was decremented
+
+  // Ember clock — starts counting when fuel hits 0
+  emberClockStartedAt DateTime? // When the 48h ember countdown began (null = not dimming)
+
+  // Effect radius (100m for alpha)
+  effectRadius Float @default(100) // Meters
+
+  // Denormalized position from world point (for spatial queries)
+  worldX Float
+  worldY Float @default(0)
+  worldZ Float
+  zoneId String
+
+  litAt  DateTime? // When the beacon was last lit
+  darkAt DateTime? // When the beacon last went dark
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  guild      Guild            @relation(fields: [guildId], references: [id], onDelete: Cascade)
+  worldPoint GuildWorldPoint  @relation(fields: [worldPointId], references: [id])
+  fuelLogs   GuildBeaconFuelLog[]
+
+  @@index([guildId])
+  @@index([zoneId])
+  @@index([isLit])
+  @@map("guild_beacons")
+}
+
+model GuildBeaconFuelLog {
+  id          String   @id @default(uuid())
+  beaconId    String
+  characterId String // Who added the fuel
+  fuelType    String // Item template name of wood used
+  fuelHours   Float // Hours of fuel added
+  createdAt   DateTime @default(now())
+
+  beacon GuildBeacon @relation(fields: [beaconId], references: [id], onDelete: Cascade)
+
+  @@index([beaconId])
+  @@index([characterId])
+  @@map("guild_beacon_fuel_logs")
+}
+
+model GuildPolygon {
+  id      String @id @default(uuid())
+  guildId String
+
+  // Convex hull vertices as ordered array of {x, z} world coordinates
+  vertices Json // Array of {x: number, z: number}
+
+  // Beacon IDs that form the vertices (min 3, max 5)
+  beaconIds String[]
+
+  // Per-vertex tier data for gradient computation: [{beaconId, tier, x, z}, ...]
+  beaconTiers Json
+
+  // Cached area
+  areaSqMeters Float @default(0)
+
+  // Active only if all constituent beacons are lit
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  guild Guild @relation(fields: [guildId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("guild_polygons")
+}
+
+// ============================================================================
+// LIBRARY BEACON SYSTEM
+// ============================================================================
+
+model LibraryBeacon {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+
+  // Position
+  worldX Float
+  worldY Float @default(0)
+  worldZ Float
+  zoneId String
+
+  // Catchment area
+  catchmentRadius Float @default(500) // Meters — area of influence for assaults and services
+
+  // Online/offline state
+  isOnline      Boolean   @default(true)
+  offlineUntil  DateTime? // When the library will come back online
+  offlineReason String? // Why it went offline (assault type)
+
+  // Assault tracking
+  lastAssaultAt      DateTime? // When the last assault occurred
+  assaultCount       Int       @default(0) // Total assaults against this library
+  failedDefenseCount Int       @default(0) // How many assaults succeeded (library went offline)
+
+  // Activity tracking for assault triggers
+  lastActivityCheckAt DateTime? // Last time player activity was recorded in catchment
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  assaultLogs LibraryAssaultLog[]
+
+  @@index([zoneId])
+  @@index([isOnline])
+  @@map("library_beacons")
+}
+
+model LibraryAssaultLog {
+  id          String @id @default(uuid())
+  libraryId   String
+  assaultType String // WANDERING_WAVE, FERAL_SURGE, COORDINATED_ASSAULT, UNOPPOSED_CORRUPTION
+
+  triggeredAt      DateTime @default(now())
+  resolvedAt       DateTime?
+  wasDefended      Boolean  @default(false)
+  participantCount Int      @default(0) // Players who helped defend
+  offlineDuration  Float? // Hours the library was offline (null if defended)
+
+  library LibraryBeacon @relation(fields: [libraryId], references: [id], onDelete: Cascade)
+
+  @@index([libraryId])
+  @@index([triggeredAt])
+  @@map("library_assault_logs")
 }

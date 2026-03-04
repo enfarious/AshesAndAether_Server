@@ -447,6 +447,17 @@ export class MovementSystem {
       }
     }
 
+    // Steer movement around buildings so players don't walk through walls.
+    // Applies to all movement types: WASD, click-to-move paths, and entity tracking.
+    const zoneManager = this.zoneManagers.get(state.zoneId);
+    const physicsSystem = zoneManager?.getPhysicsSystem?.();
+    if (physicsSystem) {
+      const steered = physicsSystem.steerAroundWalls(
+        state.currentPosition, state.heading, 3.0, 0.5,
+      );
+      if (steered !== null) state.heading = steered;
+    }
+
     // Calculate new position based on heading
     const headingRad = (state.heading * Math.PI) / 180;
 
@@ -461,9 +472,6 @@ export class MovementSystem {
     };
 
     let finalPosition = newPosition;
-
-    const zoneManager = this.zoneManagers.get(state.zoneId);
-    const physicsSystem = zoneManager?.getPhysicsSystem?.();
     const entity = zoneManager?.getEntity?.(state.characterId) as
       | { movementProfile?: string; freediveMaxDepth?: number; freediveMaxSeconds?: number }
       | null
@@ -500,15 +508,20 @@ export class MovementSystem {
             }, 'Movement adjusted by physics');
             console.log(`[PHYSICS] Movement adjusted: ${validation.reason}`, { original: newPosition.y, adjusted: finalPosition.y });
           }
+        } else if (validation.reason === 'entity_collision') {
+          // Wall collision — slide along the wall instead of stopping dead
+          finalPosition = physicsSystem.resolveAgainstStructures(newPosition, 0.5);
+          // If resolution didn't move us, stay put
+          const slide = Math.abs(finalPosition.x - state.currentPosition.x) + Math.abs(finalPosition.z - state.currentPosition.z);
+          if (slide < 0.01) return null;
         } else {
-          // Movement blocked by physics
+          // Movement blocked by physics (non-wall reasons)
           if (PHYSICS_DEBUG) {
             logger.info({
               characterId: state.characterId,
               reason: validation.reason,
               blockedPosition: newPosition
             }, 'Movement blocked by physics');
-            console.log(`[PHYSICS] Movement blocked: ${validation.reason}`);
           }
           return null; // Don't update position
         }

@@ -153,6 +153,16 @@ export interface CharacterNameConfirmedMessage {
   };
 }
 
+export interface CompanionCreateData {
+  name: string;
+  personalityType?: string;
+  archetype?: string;
+  traits?: string[];
+  goals?: string[];
+  description?: string;
+  systemPrompt?: string;
+}
+
 export interface CharacterCreateMessage {
   type: 'character_create';
   payload: {
@@ -162,7 +172,7 @@ export interface CharacterCreateMessage {
       movementProfile?: 'terrestrial' | 'amphibious' | 'aquatic';
       speciesId?: string;
     };
-    // Additional character creation data can be added here
+    companion?: CompanionCreateData;
   };
 }
 
@@ -523,7 +533,7 @@ export interface MoveMessage {
   };
 }
 
-export type CommunicationChannel = 'say' | 'shout' | 'emote' | 'cfh' | 'whisper' | 'party' | 'world';
+export type CommunicationChannel = 'say' | 'shout' | 'emote' | 'cfh' | 'whisper' | 'party' | 'world' | 'guild' | 'companion';
 
 export interface ChatMessage {
   type: 'chat';
@@ -541,7 +551,7 @@ export interface CommunicationReceived {
     channel: 'say' | 'shout' | 'emote' | 'cfh';
     senderId: string;
     senderName: string;
-    senderType: 'player' | 'npc' | 'companion';
+    senderType: 'player' | 'npc' | 'companion' | 'scripted_object';
     content: string;
     distance: number;  // Actual distance from receiver in feet
     timestamp: number;
@@ -813,7 +823,7 @@ export const COMMUNICATION_RANGES = {
 export interface ProximityEntity {
   id: string;
   name: string;
-  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife';
+  type: 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' | 'scripted_object';
   isMachine: boolean;  // true = AI/NPC, false = human player
   isAlive: boolean;
   bearing: number;     // 0-360 degrees (0=North, 90=East, 180=South, 270=West)
@@ -1039,6 +1049,70 @@ export interface LootRollMessage {
   };
 }
 
+// ========== Script Editor ==========
+
+/** Server → Client: open the script editor modal */
+export interface EditorOpenMessage {
+  type: 'editor_open';
+  payload: {
+    editorId: string;    // Unique session ID for this editing session
+    objectId: string;
+    objectName: string;
+    verb: string;        // Verb being edited (e.g. "light", "onHeartbeat")
+    source: string;      // Current Lua source
+    language: 'lua';
+    readOnly: boolean;
+    version: number;     // Display-only version counter
+    origin: 'edit' | 'ai' | 'template' | 'undo'; // How the editor was opened
+  };
+}
+
+/** Client → Server: save script (compile + persist + hot-swap) */
+export interface EditorSaveMessage {
+  type: 'editor_save';
+  payload: {
+    editorId: string;
+    source: string;
+  };
+}
+
+/** Client → Server: compile-only check (no persist, no hot-swap) */
+export interface EditorCompileMessage {
+  type: 'editor_compile';
+  payload: {
+    editorId: string;
+    source: string;
+  };
+}
+
+/** Client → Server: revert to last saved source */
+export interface EditorRevertMessage {
+  type: 'editor_revert';
+  payload: {
+    editorId: string;
+  };
+}
+
+/** Server → Client: result of save or compile */
+export interface EditorResultMessage {
+  type: 'editor_result';
+  payload: {
+    editorId: string;
+    success: boolean;
+    version?: number;    // New version number (on successful save only)
+    errors: Array<{ line?: number; col?: number; message: string }>;
+    warnings: Array<{ line?: number; message: string }>;
+  };
+}
+
+/** Client → Server: close the editor */
+export interface EditorCloseMessage {
+  type: 'editor_close';
+  payload: {
+    editorId: string;
+  };
+}
+
 // ========== Union Type for All Messages ==========
 
 export type ClientMessage =
@@ -1067,7 +1141,11 @@ export type ClientMessage =
   | ProximityRefreshMessage
   | PingMessage
   | DisconnectMessage
-  | PlayerPeekRequest;
+  | PlayerPeekRequest
+  | EditorSaveMessage
+  | EditorCompileMessage
+  | EditorRevertMessage
+  | EditorCloseMessage;
 
 export type ServerMessage =
   | HandshakeAckMessage
@@ -1091,4 +1169,140 @@ export type ServerMessage =
   | InhabitGrantedMessage
   | InhabitDeniedMessage
   | InhabitRevokedMessage
-  | CorruptionUpdateMessage;
+  | CorruptionUpdateMessage
+  | EditorOpenMessage
+  | EditorResultMessage
+  | GuildUpdateMessage
+  | GuildMemberListMessage
+  | GuildInviteMessage
+  | GuildChatReceivedMessage
+  | GuildFoundingNarrativeMessage
+  | BeaconUpdateMessage
+  | BeaconAlertMessage
+  | LibraryStatusMessage
+  | LibraryAssaultAlertMessage;
+
+// ========== Guild System ==========
+
+export interface GuildUpdateMessage {
+  type: 'guild_update';
+  payload: {
+    guildId: string;
+    name: string;
+    tag: string;
+    description: string;
+    motto: string;
+    memberCount: number;
+    maxBeacons: number;
+    litBeaconCount: number;
+    isGuildmaster: boolean;
+    bonuses: {
+      corruptionResistPercent: number;
+      xpBonusPercent: number;
+    };
+  };
+}
+
+export interface GuildMemberListMessage {
+  type: 'guild_member_list';
+  payload: {
+    guildId: string;
+    guildTag: string;
+    members: Array<{
+      characterId: string;
+      characterName: string;
+      isGuildmaster: boolean;
+      isOnline: boolean;
+      joinedAt: number;
+    }>;
+  };
+}
+
+export interface GuildInviteMessage {
+  type: 'guild_invite';
+  payload: {
+    guildId: string;
+    guildName: string;
+    guildTag: string;
+    inviterId: string;
+    inviterName: string;
+  };
+}
+
+export interface GuildChatReceivedMessage {
+  type: 'guild_chat';
+  payload: {
+    senderId: string;
+    senderName: string;
+    message: string;
+    timestamp: number;
+  };
+}
+
+export interface GuildFoundingNarrativeMessage {
+  type: 'guild_founding_narrative';
+  payload: {
+    step: number;
+    totalSteps: number;
+    narrative: string;
+  };
+}
+
+// ========== Beacon System ==========
+
+export interface BeaconUpdateMessage {
+  type: 'beacon_update';
+  payload: {
+    beaconId: string;
+    worldPointName: string;
+    tier: number;
+    isLit: boolean;
+    fuelRemaining: number;
+    fuelCapacity: number;
+    emberClockStartedAt: number | null;
+    position: { x: number; y: number; z: number };
+    zoneId: string;
+    guildId: string;
+    guildTag: string;
+  };
+}
+
+export interface BeaconAlertMessage {
+  type: 'beacon_alert';
+  payload: {
+    beaconId: string;
+    alertType: 'LOW_FUEL' | 'CRITICAL_FUEL' | 'EXTINGUISHED' | 'RELIT';
+    hoursRemaining: number;
+    message: string;
+    timestamp: number;
+  };
+}
+
+// ========== Library Beacons ==========
+
+export interface LibraryStatusMessage {
+  type: 'library_status';
+  payload: {
+    libraryId: string;
+    name: string;
+    isOnline: boolean;
+    offlineUntil: number | null;
+    offlineReason: string | null;
+    catchmentRadius: number;
+    guildBeaconsInCatchment: number;
+    position: { x: number; y: number; z: number };
+  };
+}
+
+export interface LibraryAssaultAlertMessage {
+  type: 'library_assault';
+  payload: {
+    libraryId: string;
+    libraryName: string;
+    assaultType: string;
+    phase: 'started' | 'defended' | 'failed';
+    defenderCount: number;
+    message: string;
+    timestamp: number;
+  };
+}
