@@ -62,3 +62,12 @@ dump*
 USGS*
 dump.rdb
 dump.rdb
+/.replit_integration_files
+/.replit
+/start-distributed.ps1
+/_ 01 restart-distributed.ps1 - Shortcut.lnk
+/_02 LLM Airlock - startup.dev.ps1 - Shortcut.lnk
+/_03 wildlife_sim.exe - Shortcut.lnk
+/ashes-and-aether.exe - Shortcut.lnk
+/build_terrain.ps1
+/restart-distributed.ps1
