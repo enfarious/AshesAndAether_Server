@@ -77,8 +77,14 @@ export class WeatherBridge {
   private static readonly MIN_PUBLISH_INTERVAL = 5000;
   /** Force a refresh publish even if nothing changed (ms). */
   private static readonly FORCE_REFRESH_INTERVAL = 30000;
+  /** Don't check external sim more than once every 10 seconds. */
+  private static readonly EXTERNAL_CHECK_INTERVAL = 10000;
+  /** If the external sim's snapshot is older than this, consider it dead. */
+  private static readonly EXTERNAL_STALE_THRESHOLD = 15000;
 
   private publishCount: number = 0;
+  private externalSimActive: boolean = false;
+  private lastExternalCheckMs: number = 0;
 
   constructor(
     private zoneId: string,
@@ -95,6 +101,16 @@ export class WeatherBridge {
    */
   async tick(weather: string): Promise<void> {
     const now = Date.now();
+
+    // Periodically check if an external weather sim is publishing
+    if (now - this.lastExternalCheckMs > WeatherBridge.EXTERNAL_CHECK_INTERVAL) {
+      this.lastExternalCheckMs = now;
+      await this.checkExternalSim(now);
+    }
+
+    // If external sim is active, stay silent (defer)
+    if (this.externalSimActive) return;
+
     const changed = weather !== this.lastWeather;
     const stale = now - this.lastPublishMs > WeatherBridge.FORCE_REFRESH_INTERVAL;
 
@@ -123,6 +139,31 @@ export class WeatherBridge {
     } catch (err) {
       logger.warn({ err, zoneId: this.zoneId }, 'WeatherBridge: failed to publish');
     }
+  }
+
+  private async checkExternalSim(now: number): Promise<void> {
+    try {
+      const raw = await this.redisClient.get(`weather:snapshot:${this.zoneId}`);
+      if (raw) {
+        const snapshot = JSON.parse(raw) as { timestamp_ms?: number };
+        if (snapshot.timestamp_ms && now - snapshot.timestamp_ms < WeatherBridge.EXTERNAL_STALE_THRESHOLD) {
+          if (!this.externalSimActive) {
+            logger.info({ zoneId: this.zoneId },
+              'WeatherBridge: external weather sim detected, deferring');
+          }
+          this.externalSimActive = true;
+          return;
+        }
+      }
+    } catch {
+      // Redis read failure — fall through and act as provider
+    }
+
+    if (this.externalSimActive) {
+      logger.info({ zoneId: this.zoneId },
+        'WeatherBridge: external weather sim gone, taking over');
+    }
+    this.externalSimActive = false;
   }
 
   private buildSnapshot(weather: string, now: number): WeatherSnapshot {

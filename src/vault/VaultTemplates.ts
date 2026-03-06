@@ -6,6 +6,8 @@
  * VaultTemplate Prisma model.
  */
 
+import type { VaultGenParams } from './VaultTileGrid';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface VaultMobSpawnDef {
@@ -45,6 +47,8 @@ export interface VaultTemplateDefinition {
   zoneDimensions: { sizeX: number; sizeY: number; sizeZ: number };
   /** Gold awarded on vault completion (before scaling bonuses) */
   completionGold: number;
+  /** Cellular-automata generation parameters. When present, tile grid is generated. */
+  generation?: VaultGenParams;
 }
 
 // ─── Test Vault ───────────────────────────────────────────────────────────────
@@ -129,4 +133,5 @@ export const TEST_VAULT_TEMPLATE: VaultTemplateDefinition = {
   ],
   zoneDimensions: { sizeX: 60, sizeY: 20, sizeZ: 60 },
   completionGold: 100,
+  generation: { wallChance: 0.45, smoothIterations: 5, minFloorRatio: 0.35 },
 };

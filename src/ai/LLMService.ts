@@ -46,6 +46,22 @@ export interface CombatSettingsContext {
 type LLMProvider = 'anthropic' | 'openai-compatible';
 
 /**
+ * Strip extended-thinking blocks that some models emit (Qwen, DeepSeek, etc.).
+ * Handles `<think>…</think>`, `<thinking>…</thinking>`, and unclosed tags
+ * from truncated responses. Always returns usable text or the original input.
+ */
+function stripThinkingTags(raw: string): string {
+  // 1. Remove complete <think>…</think> / <thinking>…</thinking> blocks
+  let cleaned = raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+
+  // 2. Unclosed tag (truncated response) — drop from opening tag to end of string
+  cleaned = cleaned.replace(/<think(?:ing)?>[\s\S]*$/gi, '');
+
+  cleaned = cleaned.trim();
+  return cleaned || raw.trim();
+}
+
+/**
  * LLM service for generating NPC responses
  * Supports: Anthropic Claude, any OpenAI-compatible API (OpenAI, LMStudio, Ollama, etc.)
  */
@@ -241,7 +257,8 @@ export class LLMService {
       ],
     });
 
-    return response.content[0].type === 'text' ? response.content[0].text : '';
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    return stripThinkingTags(text);
   }
 
   /**
@@ -274,7 +291,7 @@ export class LLMService {
       temperature: 0.8,
     });
 
-    return response.choices[0]?.message?.content || '';
+    return stripThinkingTags(response.choices[0]?.message?.content || '');
   }
 
   /**
@@ -486,7 +503,8 @@ Keep responses short (1-2 sentences). Stay in character.`;
       messages: [{ role: 'user', content: userPrompt }],
     });
 
-    return response.content[0].type === 'text' ? response.content[0].text : '';
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    return stripThinkingTags(text);
   }
 
   private async generateEngagementOpenAI(
@@ -508,7 +526,7 @@ Keep responses short (1-2 sentences). Stay in character.`;
       temperature: 0.3,
     });
 
-    return response.choices[0]?.message?.content || '';
+    return stripThinkingTags(response.choices[0]?.message?.content || '');
   }
 
   private parseEngagementDecision(text: string): 'engage' | 'ignore' | null {
@@ -534,7 +552,8 @@ Keep responses short (1-2 sentences). Stay in character.`;
       messages: [{ role: 'user', content: userPrompt }],
     });
 
-    return response.content[0].type === 'text' ? response.content[0].text : '';
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    return stripThinkingTags(text);
   }
 
   private async generateCombatOpenAI(
@@ -556,7 +575,7 @@ Keep responses short (1-2 sentences). Stay in character.`;
       temperature: 0.4,
     });
 
-    return response.choices[0]?.message?.content || '';
+    return stripThinkingTags(response.choices[0]?.message?.content || '');
   }
 
   private buildCombatSystemPrompt(ctx: CombatSettingsContext): string {
@@ -740,7 +759,8 @@ If the task is impossible, unsafe, or out of scope, respond with exactly: REJECT
       messages: [{ role: 'user', content: userPrompt }],
     });
 
-    return response.content[0].type === 'text' ? response.content[0].text : '';
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    return stripThinkingTags(text);
   }
 
   private async generateBehaviorTreeOpenAI(
@@ -762,7 +782,7 @@ If the task is impossible, unsafe, or out of scope, respond with exactly: REJECT
       temperature: 0.4,
     });
 
-    return response.choices[0]?.message?.content || '';
+    return stripThinkingTags(response.choices[0]?.message?.content || '');
   }
 
   private parseBehaviorTreeResponse(text: string): BehaviorNode | string | null {

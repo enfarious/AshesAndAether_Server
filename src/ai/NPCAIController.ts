@@ -105,7 +105,7 @@ export class NPCAIController {
   // ══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Should this companion engage a nearby enemy?
+   * Should this companion/NPC engage a nearby enemy?
    *
    * Resolution order (species overrides family):
    * 1. species in alwaysEngageSpecies → engage
@@ -113,7 +113,7 @@ export class NPCAIController {
    * 3. family in alwaysEngageFamily   → engage
    * 4. family in ignoreFamily         → ignore
    * 5. cache hit                      → return cached answer
-   * 6. Archetype fallback             → aggressive types engage, others ignore
+   * 6. Default: ignore (only fight what's explicitly listed)
    */
   async shouldEngage(enemy: EngagementTarget, _ownerNearby: boolean): Promise<boolean> {
     const { species, family } = enemy;
@@ -136,15 +136,15 @@ export class NPCAIController {
     const cached = this.engagementCache.get(cacheKey);
     if (cached) return cached === 'engage';
 
-    // Default: all companions engage hostile mobs. The ignore lists above
-    // handle specific exclusions. No LLM call needed.
-    this.engagementCache.set(cacheKey, 'engage');
+    // Default: ignore unlisted mobs. Only fight what's in alwaysEngage lists.
+    // The LLM or player can expand the lists via combat settings.
+    this.engagementCache.set(cacheKey, 'ignore');
     logger.debug({
       companionId: this.companion.id,
       mob: enemy.name,
       cacheKey,
-    }, '[CompanionAI] Engagement decision (default engage)');
-    return true;
+    }, '[CompanionAI] Engagement decision (default ignore — not on engage list)');
+    return false;
   }
 
   // ══════════════════════════════════════════════════════════════════════════

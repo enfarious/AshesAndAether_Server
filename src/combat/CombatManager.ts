@@ -317,6 +317,20 @@ export class CombatManager {
   }
 
   /**
+   * Get all entity IDs whose auto-attack target is `targetId`.
+   * (Used for enmity list — who is attacking this entity?)
+   */
+  getAttackersOf(targetId: string): string[] {
+    const attackers: string[] = [];
+    for (const state of this.combatants.values()) {
+      if (state.autoAttackTarget === targetId && state.inCombat) {
+        attackers.push(state.entityId);
+      }
+    }
+    return attackers;
+  }
+
+  /**
    * Clear auto-attack for all entities targeting a specific entity
    * (Used when target dies or leaves)
    */

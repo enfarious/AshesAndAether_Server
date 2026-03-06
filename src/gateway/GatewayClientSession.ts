@@ -208,7 +208,8 @@ export class GatewayClientSession {
         return;
       }
       const routed = await this.routeToZone('move', data);
-      this.sendDevAck('move', routed, routed ? undefined : 'not_routed');
+      // Only ack failures — successful moves fire ~10×/sec and flood dev logs.
+      if (!routed) this.sendDevAck('move', false, 'not_routed');
     });
 
     this.socket.on('chat', async (data: ChatMessage['payload']) => {
@@ -1485,9 +1486,10 @@ export class GatewayClientSession {
           // No return point — fall back to the starter zone spawn
           const starterZoneId = 'USA_NY_Stephentown';
           const spawn = SpawnPointService.getStarterSpawn(starterZoneId);
+          const pos = spawn?.position ?? { x: 12, y: 265, z: -18 };
           logger.warn({ characterId: this.characterId }, 'No return point, resetting to starter zone');
           await VillageService.updateCharacterZone(
-            this.characterId, starterZoneId, spawn.x, spawn.y, spawn.z,
+            this.characterId, starterZoneId, pos.x, pos.y, pos.z,
           );
         }
       }
@@ -1525,13 +1527,15 @@ export class GatewayClientSession {
         name: e.name,
         position: e.position,
         isAlive: e.isAlive,
-        interactive: e.type !== 'wildlife' && e.type !== 'structure',
+        interactive: e.interactive ?? (e.type !== 'wildlife' && e.type !== 'structure'),
         description: e.description || '',
-        ...(e.tag       !== undefined && { tag:       e.tag }),
-        ...(e.level     !== undefined && { level:     e.level }),
-        ...(e.faction   !== undefined && { faction:   e.faction }),
-        ...(e.notorious !== undefined && { notorious: e.notorious }),
-        ...(e.health    !== undefined && { health:    e.health }),
+        ...(e.tag        !== undefined && { tag:        e.tag }),
+        ...(e.level      !== undefined && { level:      e.level }),
+        ...(e.faction    !== undefined && { faction:    e.faction }),
+        ...(e.notorious  !== undefined && { notorious:  e.notorious }),
+        ...(e.health     !== undefined && { health:     e.health }),
+        ...(e.modelAsset !== undefined && { modelAsset: e.modelAsset }),
+        ...(e.modelScale !== undefined && { modelScale: e.modelScale }),
       }));
     } else {
       // Fallback: zone server not up yet, use DB positions directly

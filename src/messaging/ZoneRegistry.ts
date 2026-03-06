@@ -231,6 +231,9 @@ export class ZoneRegistry {
     tag?: string; level?: number; faction?: string; aiType?: string;
     notorious?: boolean;
     health?: { current: number; max: number };
+    interactive?: boolean;
+    modelAsset?: string;
+    modelScale?: number;
   }> | null> {
     const client = this.messageBus.getClient();
     const key = `zone:entities:${zoneId}`;
@@ -265,6 +268,26 @@ export class ZoneRegistry {
     const data = await client.get(`zone:env:${zoneId}`);
     if (!data) return null;
     return JSON.parse(data);
+  }
+
+  // ── Vault tile grid persistence ─────────────────────────────────────────
+
+  /** Store a vault's tile grid JSON in Redis (zone server writes this). */
+  async setVaultTileGrid(instanceId: string, json: string): Promise<void> {
+    const client = this.messageBus.getClient();
+    await client.set(`vault:tiles:${instanceId}`, json);
+  }
+
+  /** Read a vault's tile grid JSON from Redis (gateway reads this). */
+  async getVaultTileGrid(instanceId: string): Promise<string | null> {
+    const client = this.messageBus.getClient();
+    return client.get(`vault:tiles:${instanceId}`);
+  }
+
+  /** Remove a vault's tile grid from Redis on teardown. */
+  async deleteVaultTileGrid(instanceId: string): Promise<void> {
+    const client = this.messageBus.getClient();
+    await client.del(`vault:tiles:${instanceId}`);
   }
 
   /**

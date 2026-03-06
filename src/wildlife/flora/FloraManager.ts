@@ -11,6 +11,7 @@
 
 import type {
   PlantEntity,
+  PlantGrowthStage,
   PlantSpecies,
   PlantSpawnConfig,
   PlantEvent,
@@ -35,6 +36,12 @@ export class FloraManager {
   // Timing
   private lastGrowthUpdateAt = 0;
   private lastSpawnCheckAt = 0;
+
+  /**
+   * When true, the FloraManager stops its own spawning and growth loop.
+   * Set when the external Rust wildlife sim takes over flora management.
+   */
+  private paused = false;
 
   // Callbacks
   private onPlantUpdate?: (plant: PlantEntity) => void;
@@ -64,6 +71,9 @@ export class FloraManager {
   // ========== Main Update Loop ==========
 
   update(_deltaTime: number, now: number): void {
+    // When the Rust sim is managing flora, skip local growth and spawning.
+    if (this.paused) return;
+
     // Update growth stages
     if (now - this.lastGrowthUpdateAt >= GROWTH_UPDATE_INTERVAL_MS) {
       this.updateGrowth(now);
@@ -545,6 +555,48 @@ export class FloraManager {
   /**
    * Get plants that wildlife can eat
    */
+  /**
+   * Remove all server-spawned plants immediately.
+   * Called when the external Rust wildlife sim takes over.
+   * Also pauses local growth/spawning so the Rust sim is authoritative.
+   * Returns the plant IDs that were removed.
+   */
+  despawnAll(): string[] {
+    const ids = Array.from(this.plants.keys());
+    this.plants.clear();
+    this.paused = true;
+    return ids;
+  }
+
+  /**
+   * Register a plant spawned by the external Rust wildlife sim.
+   * Stores it in the local map and fires onPlantSpawn so clients see it.
+   * Growth is managed by the Rust sim — stage changes arrive via
+   * notifyPlantStageChange on the IWildlifeWorld facade.
+   */
+  addExternalPlant(
+    plantId: string,
+    speciesId: string,
+    position: Vector3,
+    stage: string = 'mature',
+  ): void {
+    const now = Date.now();
+    const plant: PlantEntity = {
+      id: plantId,
+      speciesId,
+      position,
+      zoneId: this.zoneId,
+      currentStage: stage as PlantGrowthStage,
+      stageStartedAt: now,
+      growthProgress: 100,
+      isAlive: true,
+      timesHarvested: 0,
+      spawnedAt: now,
+    };
+    this.plants.set(plantId, plant);
+    this.onPlantSpawn?.(plant);
+  }
+
   getEdiblePlantsForWildlife(): Array<{ id: string; position: Vector3; plantType: string }> {
     const result: Array<{ id: string; position: Vector3; plantType: string }> = [];
 

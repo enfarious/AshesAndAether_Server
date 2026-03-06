@@ -35,6 +35,13 @@
 import { logger } from '@/utils/logger';
 import { randomUUID } from 'crypto';
 import type { VaultTemplateDefinition, VaultRoomDef } from './VaultTemplates';
+import {
+  generateVaultGrid,
+  getSpawnPositions,
+  lerpPoint,
+  TILE_SIZE,
+  type VaultTileGridData,
+} from './VaultTileGrid';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -102,6 +109,8 @@ export interface VaultInstance {
   cleanupTimer: NodeJS.Timeout | null;
   combatLog: VaultCombatLogEntry[];
   lootAwarded: VaultLootRecord[];
+  /** Procedural tile grid (null if template has no generation params). */
+  tileGrid: VaultTileGridData | null;
 }
 
 export interface VaultSummary {
@@ -227,6 +236,18 @@ export class VaultManager {
       });
     }
 
+    // ── Generate tile grid if template has generation params ──────────────
+    let tileGrid: VaultTileGridData | null = null;
+    if (template.generation) {
+      const widthTiles  = Math.floor(template.zoneDimensions.sizeX / TILE_SIZE);
+      const heightTiles = Math.floor(template.zoneDimensions.sizeZ / TILE_SIZE);
+      tileGrid = generateVaultGrid(widthTiles, heightTiles, template.generation, instanceId);
+      logger.info(
+        { instanceId, widthTiles, heightTiles, entrance: tileGrid.entrance, exit: tileGrid.exit },
+        'Vault tile grid generated',
+      );
+    }
+
     const instance: VaultInstance = {
       instanceId,
       templateId: template.templateId,
@@ -243,6 +264,7 @@ export class VaultManager {
       cleanupTimer: null,
       combatLog: [],
       lootAwarded: [],
+      tileGrid,
     };
 
     this.instances.set(instanceId, instance);
@@ -277,11 +299,29 @@ export class VaultManager {
 
     const scaling = VaultManager.getScalingModifiers(instance.scalingTier);
     const baseLevel = 5; // From template; hardcoded for now
+
+    // ── Derive mob positions from tile grid when available ───────────
+    const totalMobs = room.def.mobs.reduce((sum, m) => sum + m.count, 0);
+    let mobPositions: Array<{ x: number; y: number; z: number }>;
+
+    if (instance.tileGrid) {
+      // Progression: mobs spawn deeper along entrance→exit axis per room
+      const totalRooms = instance.rooms.length;
+      const t0 = (roomIndex + 0.2) / totalRooms;       // start ratio
+      const t1 = (roomIndex + 0.8) / totalRooms;       // end ratio
+      const anchor = lerpPoint(instance.tileGrid.entrance, instance.tileGrid.exit, (t0 + t1) / 2);
+      mobPositions = getSpawnPositions(instance.tileGrid, anchor, totalMobs, 3);
+    } else {
+      // Fallback: use hardcoded template positions
+      mobPositions = room.def.spawnPositions.mob.slice();
+    }
+
     let mobSpawnIndex = 0;
 
     for (const mobDef of room.def.mobs) {
       for (let i = 0; i < mobDef.count; i++) {
-        const pos = room.def.spawnPositions.mob[mobSpawnIndex % room.def.spawnPositions.mob.length];
+        const pos = mobPositions[mobSpawnIndex % mobPositions.length]
+          ?? { x: 0, y: 0, z: 0 };
         const level = baseLevel + mobDef.levelOffset;
 
         try {
@@ -579,6 +619,11 @@ export class VaultManager {
 
   isInVault(characterId: string): boolean {
     return this.characterToInstance.has(characterId);
+  }
+
+  /** Return the tile grid for a vault instance (used by HTTP endpoint). */
+  getTileGrid(instanceId: string): VaultTileGridData | null {
+    return this.instances.get(instanceId)?.tileGrid ?? null;
   }
 
   // ── Combat logging ──────────────────────────────────────────────────────────

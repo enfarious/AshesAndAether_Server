@@ -11,7 +11,7 @@
 export type PreferredRange = 'melee' | 'close' | 'mid' | 'far';
 
 export const RANGE_DISTANCES: Record<PreferredRange, { min: number; ideal: number; max: number }> = {
-  melee: { min: 0, ideal: 1.5, max: 2 },
+  melee: { min: 0, ideal: 2.5, max: 3.5 },
   close: { min: 3, ideal: 5, max: 8 },
   mid:   { min: 8, ideal: 15, max: 20 },
   far:   { min: 20, ideal: 30, max: 40 },

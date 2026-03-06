@@ -392,6 +392,8 @@ export interface Entity {
   movementDuration?: number;                          // How long movement takes (milliseconds)
   movementSpeed?: number;                             // Movement speed in m/s (for interpolation)
   heading?: number;                                   // Direction facing (0-360 degrees)
+  modelAsset?: string;                                 // GLB asset path (e.g. "village/building_market.glb")
+  modelScale?: number;                                 // Uniform scale for GLB model (default 1)
 }
 
 export interface Exit {
@@ -450,6 +452,16 @@ export interface StatusEffect {
   duration: number;
 }
 
+// ── Enmity list (threat indicator for combat HUD) ──────────────────────────
+/** Threat level indicator: red = top target, yellow = allied target, blue = low threat */
+export type EnmityLevel = 'red' | 'yellow' | 'blue';
+
+export interface EnmityEntry {
+  entityId: string;           // Mob's entity ID
+  name: string;               // Mob display name
+  level: EnmityLevel;         // Threat indicator color
+}
+
 export interface StateUpdateMessage {
   type: 'state_update';
   payload: {
@@ -474,6 +486,9 @@ export interface StateUpdateMessage {
       inCombat?: boolean;
       autoAttackTarget?: string;                        // Entity ID of current target
       specialCharges?: Record<string, number>;          // Builder/consumer charges (e.g., {"combo_point": 3})
+      /** Mobs that have this player on their enmity list.
+       *  Red = targeting you, Yellow = targeting your ally, Blue = you're attacking it. */
+      enmityList?: EnmityEntry[];
     };
     // Allied combat gauges (party/alliance members - ATB only, no auto-attack)
     allies?: Array<{

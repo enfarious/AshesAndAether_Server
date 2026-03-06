@@ -91,6 +91,19 @@ export class GatewayServer {
       res.json(JSON.parse(raw));
     });
 
+    // Serve OSM water polygon data per zone (for client-side water rendering)
+    const osmDir = path.join(process.cwd(), 'data', 'osm');
+    this.app.get('/world/water/:zoneId', (req, res) => {
+      const waterPath = path.join(osmDir, req.params.zoneId, 'water.json');
+      if (!fs.existsSync(waterPath)) { res.json([]); return; }
+      const raw = fs.readFileSync(waterPath, 'utf-8');
+      const etag = crypto.createHash('sha256').update(raw).digest('hex');
+      res.setHeader('ETag', etag);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      if (req.header('if-none-match') === etag) { res.status(304).end(); return; }
+      res.json(JSON.parse(raw));
+    });
+
     // Health check endpoint
     this.app.get('/health', (_req, res) => {
       res.json({
@@ -144,6 +157,23 @@ export class GatewayServer {
         }))
       );
       res.json({ servers: serverStatus });
+    });
+
+    // ── Vault tile grid endpoint ───────────────────────────────────────
+    this.app.get('/world/vault-tiles/:instanceId', async (req, res) => {
+      const { instanceId } = req.params;
+      try {
+        const json = await this.zoneRegistry.getVaultTileGrid(instanceId);
+        if (!json) {
+          res.status(404).json({ error: 'vault_tiles_not_found', instanceId });
+          return;
+        }
+        res.setHeader('Content-Type', 'application/json');
+        res.send(json);
+      } catch (err) {
+        logger.error({ instanceId, err }, 'Failed to fetch vault tile grid');
+        res.status(500).json({ error: 'internal_error' });
+      }
     });
   }
 

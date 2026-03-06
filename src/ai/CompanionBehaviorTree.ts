@@ -15,9 +15,17 @@ import { RANGE_DISTANCES } from './CompanionCombatSettings';
 // ── Output types ─────────────────────────────────────────────────────────────
 
 export interface BehaviorTickResult {
-  /** Position delta to apply this tick (null = don't move). */
-  movement: { x: number; y: number; z: number } | null;
-  /** Heading in degrees (0 = North/+Z, 90 = East/+X). Null = don't change. */
+  /**
+   * Continuous movement intent: null = stop, non-null = keep moving at this heading + speed.
+   * The caller computes the actual position step as `speed * deltaTime` so the same intent
+   * produces smooth motion regardless of tick rate.
+   */
+  movement: { heading: number; speed: number } | null;
+  /**
+   * Facing direction when standing still (e.g. "face the target while in range").
+   * When movement is non-null, movement.heading already implies facing — this is
+   * only used for the stopped-but-facing case.
+   */
   heading: number | null;
   /** Ability to use this tick (null = no ability). Caller validates ATB/cooldowns. */
   abilityAction: {
@@ -80,15 +88,17 @@ export interface CombatContext {
 
 // ── Movement speed ───────────────────────────────────────────────────────────
 
-const COMPANION_MOVE_SPEED = 3.0;    // m/s in combat
-const COMPANION_RETREAT_SPEED = 3.5; // m/s when retreating (slight speed boost)
-const FOLLOW_DISTANCE = 4.0;         // Stay within this range of the player when idle
+const COMPANION_MOVE_SPEED = 5.0;    // m/s in combat (match player pace)
+const COMPANION_RETREAT_SPEED = 5.5; // m/s when retreating (slight speed boost)
+const FOLLOW_DISTANCE = 4.0;         // Stop following when this close
+const FOLLOW_RESUME_DISTANCE = 6.0;  // Start following when this far (hysteresis prevents stutter)
 
 // ── The behavior tree ────────────────────────────────────────────────────────
 
 export class CompanionBehaviorTree {
   private state: CompanionAIState = 'idle';
   private currentTargetId: string | null = null;
+  private isFollowing = false; // hysteresis flag for follow behavior
 
   /**
    * Tick the behavior tree. Called every game tick when companion is in combat
@@ -158,27 +168,32 @@ export class CompanionBehaviorTree {
 
   private tickFollowPlayer(
     context: CombatContext,
-    deltaTime: number,
+    _deltaTime: number,
     result: BehaviorTickResult,
   ): void {
     if (!context.owner) return;
 
     const dist = distance2D(context.self.position, context.owner.position);
-    if (dist > FOLLOW_DISTANCE) {
-      const move = moveToward(
-        context.self.position,
-        context.owner.position,
-        COMPANION_MOVE_SPEED * deltaTime,
-      );
-      result.movement = move.delta;
-      result.heading = move.heading;
+
+    // Hysteresis: start following at FOLLOW_RESUME_DISTANCE, stop at FOLLOW_DISTANCE.
+    // Prevents start/stop stutter when hovering near the threshold.
+    if (!this.isFollowing && dist > FOLLOW_RESUME_DISTANCE) {
+      this.isFollowing = true;
+    } else if (this.isFollowing && dist <= FOLLOW_DISTANCE) {
+      this.isFollowing = false;
+    }
+
+    if (this.isFollowing) {
+      const heading = headingTo(context.self.position, context.owner.position);
+      result.movement = { heading, speed: COMPANION_MOVE_SPEED };
+      result.heading = heading;
     }
   }
 
   private tickEngaging(
     settings: CompanionCombatSettings,
     context: CombatContext,
-    deltaTime: number,
+    _deltaTime: number,
     result: BehaviorTickResult,
   ): void {
     // 1. Select target
@@ -190,16 +205,17 @@ export class CompanionBehaviorTree {
 
     // 2. Range management — move to ideal range
     const rangeBand = RANGE_DISTANCES[settings.preferredRange];
-    const movement = this.manageRange(
+    const m = this.manageRange(
       context.self.position,
       target.position,
       dist,
       rangeBand,
       COMPANION_MOVE_SPEED,
-      deltaTime,
     );
-    result.movement = movement.delta;
-    result.heading = movement.heading;
+    result.heading = m.heading;
+    if (m.speed > 0) {
+      result.movement = { heading: m.heading, speed: m.speed };
+    }
 
     // 3. Try to use an ability (if in range and ATB available)
     result.abilityAction = this.selectAbility(settings, context, target, dist);
@@ -208,7 +224,7 @@ export class CompanionBehaviorTree {
   private tickRetreating(
     _settings: CompanionCombatSettings,
     context: CombatContext,
-    deltaTime: number,
+    _deltaTime: number,
     result: BehaviorTickResult,
   ): void {
     // Find nearest enemy and move away from them
@@ -221,17 +237,17 @@ export class CompanionBehaviorTree {
 
     if (dist < 0.1) {
       // On top of enemy — pick arbitrary escape direction
-      result.movement = { x: COMPANION_RETREAT_SPEED * deltaTime, y: 0, z: 0 };
+      result.movement = { heading: 90, speed: COMPANION_RETREAT_SPEED };
       result.heading = 90;
       return;
     }
 
     // Move directly away
-    const speed = COMPANION_RETREAT_SPEED * deltaTime;
     const nx = dx / dist;
     const nz = dz / dist;
-    result.movement = { x: nx * speed, y: 0, z: nz * speed };
-    result.heading = Math.atan2(nx, nz) * (180 / Math.PI);
+    const escapeHeading = Math.atan2(nx, nz) * (180 / Math.PI);
+    result.movement = { heading: escapeHeading, speed: COMPANION_RETREAT_SPEED };
+    result.heading = escapeHeading;
 
     // While retreating, still try to use any instant heal if available
     const healAbility = this.findBestHealAbility(context, context.self.id);
@@ -243,7 +259,7 @@ export class CompanionBehaviorTree {
   private tickSupporting(
     settings: CompanionCombatSettings,
     context: CombatContext,
-    deltaTime: number,
+    _deltaTime: number,
     result: BehaviorTickResult,
   ): void {
     // Support priority: heal injured allies > CC enemies > damage
@@ -256,13 +272,9 @@ export class CompanionBehaviorTree {
         // Move within range of ally
         const dist = distance2D(context.self.position, injuredAlly.position);
         if (dist > healAbility.range) {
-          const move = moveToward(
-            context.self.position,
-            injuredAlly.position,
-            COMPANION_MOVE_SPEED * deltaTime,
-          );
-          result.movement = move.delta;
-          result.heading = move.heading;
+          const heading = headingTo(context.self.position, injuredAlly.position);
+          result.movement = { heading, speed: COMPANION_MOVE_SPEED };
+          result.heading = heading;
         }
         result.abilityAction = { abilityId: healAbility.id, targetId: injuredAlly.id };
         return;
@@ -278,16 +290,17 @@ export class CompanionBehaviorTree {
 
     // Support stance uses mid range regardless of settings
     const rangeBand = RANGE_DISTANCES.mid;
-    const movement = this.manageRange(
+    const m = this.manageRange(
       context.self.position,
       target.position,
       dist,
       rangeBand,
       COMPANION_MOVE_SPEED,
-      deltaTime,
     );
-    result.movement = movement.delta;
-    result.heading = movement.heading;
+    result.heading = m.heading;
+    if (m.speed > 0) {
+      result.movement = { heading: m.heading, speed: m.speed };
+    }
 
     // Prefer CC abilities when supporting
     result.abilityAction = this.selectAbility(
@@ -337,28 +350,31 @@ export class CompanionBehaviorTree {
 
   // ── Range management ─────────────────────────────────────────────────────
 
+  /**
+   * Returns the movement intent needed to reach/maintain the ideal range band.
+   * `speed = 0` means "stopped at ideal range, but face the target heading."
+   * `speed > 0` means "keep moving at this heading and speed."
+   * The caller applies `speed * deltaTime` to compute the actual step.
+   */
   private manageRange(
     selfPos: { x: number; y: number; z: number },
     targetPos: { x: number; y: number; z: number },
     currentDist: number,
     rangeBand: { min: number; ideal: number; max: number },
     speed: number,
-    deltaTime: number,
-  ): { delta: { x: number; y: number; z: number } | null; heading: number | null } {
-    const tolerance = 1.0; // Don't micro-adjust within 1m of ideal
+  ): { heading: number; speed: number } {
+    // Tighter tolerance for melee (ideal ≤ 3.5m) to stay reliably in range
+    const tolerance = rangeBand.ideal <= 3.5 ? 0.5 : 1.0;
+    const facing = headingTo(selfPos, targetPos);
 
     if (Math.abs(currentDist - rangeBand.ideal) <= tolerance) {
-      // Already at ideal range — face target but don't move
-      return {
-        delta: null,
-        heading: headingTo(selfPos, targetPos),
-      };
+      // Already at ideal range — face target, no movement
+      return { heading: facing, speed: 0 };
     }
 
     if (currentDist > rangeBand.ideal + tolerance) {
-      // Too far — move closer
-      const move = moveToward(selfPos, targetPos, speed * deltaTime);
-      return { delta: move.delta, heading: move.heading };
+      // Too far — approach
+      return { heading: facing, speed };
     }
 
     // Too close — back away
@@ -366,15 +382,11 @@ export class CompanionBehaviorTree {
     const dz = selfPos.z - targetPos.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
     if (dist < 0.1) {
-      return { delta: { x: speed * deltaTime, y: 0, z: 0 }, heading: 90 };
+      return { heading: 90, speed };
     }
-    const step = speed * deltaTime;
     const nx = dx / dist;
     const nz = dz / dist;
-    return {
-      delta: { x: nx * step, y: 0, z: nz * step },
-      heading: Math.atan2(nx, nz) * (180 / Math.PI),
-    };
+    return { heading: Math.atan2(nx, nz) * (180 / Math.PI), speed };
   }
 
   // ── Ability selection ────────────────────────────────────────────────────
@@ -547,25 +559,3 @@ function headingTo(
   return Math.atan2(dx, dz) * (180 / Math.PI);
 }
 
-function moveToward(
-  from: { x: number; y: number; z: number },
-  to: { x: number; y: number; z: number },
-  maxStep: number,
-): { delta: { x: number; y: number; z: number }; heading: number } {
-  const dx = to.x - from.x;
-  const dz = to.z - from.z;
-  const dist = Math.sqrt(dx * dx + dz * dz);
-
-  if (dist < 0.01) {
-    return { delta: { x: 0, y: 0, z: 0 }, heading: 0 };
-  }
-
-  const step = Math.min(maxStep, dist);
-  const nx = dx / dist;
-  const nz = dz / dist;
-
-  return {
-    delta: { x: nx * step, y: 0, z: nz * step },
-    heading: Math.atan2(nx, nz) * (180 / Math.PI),
-  };
-}

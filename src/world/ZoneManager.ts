@@ -52,6 +52,9 @@ interface Entity {
   sprite?: string;
   heading?: number;
   behavior?: string;
+  modelAsset?: string;  // GLB asset path for 3D clients (e.g. "village/building_market.glb")
+  modelScale?: number;  // Uniform scale multiplier for the GLB model (default 1)
+  interactive?: boolean; // Override default interactive logic (e.g. dungeon entrances)
 }
 
 export interface WildlifeEntityData {
@@ -123,8 +126,8 @@ export class ZoneManager {
 
   constructor(zone: Zone) {
     this.zone = zone;
-    const isVillage = zone.id.startsWith('village:');
-    this.physicsSystem = new PhysicsSystem(isVillage);
+    const isFlat = zone.id.startsWith('village:') || zone.id.startsWith('vault:');
+    this.physicsSystem = new PhysicsSystem(isFlat);
     this.animationLockSystem = new AnimationLockSystem();
 
     // Register building footprints as static collision geometry so players
@@ -1294,7 +1297,7 @@ export class ZoneManager {
   // ── Structure entities (village system) ──────────────────────────────────
 
   /** Add a structure entity (for village instances). */
-  addStructure(data: { id: string; name: string; description?: string; position: Vector3 }): void {
+  addStructure(data: { id: string; name: string; description?: string; position: Vector3; modelAsset?: string }): void {
     const position = this.physicsSystem.applyGravity(data.position);
     const entity: Entity = {
       id: data.id,
@@ -1304,6 +1307,7 @@ export class ZoneManager {
       position,
       isMachine: true,
       isAlive: true,
+      modelAsset: data.modelAsset,
     };
     this.entities.set(data.id, entity);
     this.physicsSystem.registerEntity({
@@ -1325,7 +1329,7 @@ export class ZoneManager {
   }
 
   /** Add a scripted object entity to the zone. */
-  addScriptedObject(data: { id: string; name: string; description?: string; position: Vector3 }): void {
+  addScriptedObject(data: { id: string; name: string; description?: string; position: Vector3; interactive?: boolean; modelAsset?: string; modelScale?: number }): void {
     const position = this.physicsSystem.applyGravity(data.position);
     const entity: Entity = {
       id: data.id,
@@ -1335,6 +1339,9 @@ export class ZoneManager {
       position,
       isMachine: true,
       isAlive: true,
+      interactive: data.interactive,
+      modelAsset: data.modelAsset,
+      modelScale: data.modelScale,
     };
     this.entities.set(data.id, entity);
     this.physicsSystem.registerEntity({

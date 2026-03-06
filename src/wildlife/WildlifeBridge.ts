@@ -65,6 +65,15 @@ export interface WildlifeBirthEvent {
   zone_id: string;
 }
 
+export interface PlantSpawnEvent {
+  type: 'plant_spawn';
+  plant_id: string;
+  species_id: string;
+  position: Vector3;
+  zone_id: string;
+  stage: string;
+}
+
 export interface PlantGrowEvent {
   type: 'plant_grow';
   plant_id: string;
@@ -84,6 +93,7 @@ export type WildlifeEvent =
   | WildlifeDeathEvent
   | WildlifeAttackEvent
   | WildlifeBirthEvent
+  | PlantSpawnEvent
   | PlantGrowEvent
   | PlantEatenEvent;
 
@@ -125,11 +135,20 @@ export interface IWildlifeWorld {
   /** Remove a wildlife entity from the zone (death / despawn). */
   removeWildlifeFromZone(zoneId: string, entityId: string): void;
 
+  /** Register a plant spawned by the Rust wildlife sim. */
+  addExternalPlant(zoneId: string, plantId: string, speciesId: string, position: Vector3, stage: string): void;
+
   /** Notify the FloraManager that the Rust sim advanced a plant's growth stage. */
   notifyPlantStageChange(plantId: string, newStage: string): void;
 
   /** Notify the FloraManager that a wildlife entity ate a plant. */
   notifyPlantEaten(plantId: string, wildlifeId: string, foodValue: number): void;
+
+  /**
+   * Despawn all server-spawned wildlife and flora in a zone.
+   * Called when the external Rust wildlife sim takes over to avoid duplicates.
+   */
+  despawnLocalWildlifeAndFlora(zoneId: string): void;
 
   /** Returns all active zone IDs managed by this server. */
   getAllActiveZoneIds(): string[];
@@ -142,6 +161,9 @@ export interface IWildlifeWorld {
 
   /** Returns the biome identifier for a zone (e.g. 'forest', 'grassland'). */
   getZoneBiome(zoneId: string): string;
+
+  /** Returns the world-space bounds for a zone ({ min, max } vectors). */
+  getZoneBounds(zoneId: string): { min: Vector3; max: Vector3 } | null;
 
   /**
    * Returns the normalised time-of-day (0–1) for a zone.
@@ -241,10 +263,11 @@ export class WildlifeBridge {
       void this._publishAllZoneInfo();
     }, 10_000);
 
-    // Keep the Rust sim updated with player positions every second
+    // Keep the Rust sim updated with player positions (250ms for responsive
+    // wildlife reactions — prey needs to detect approaching players quickly)
     this.updateInterval = setInterval(() => {
       void this._publishPlayerPositions();
-    }, 1_000);
+    }, 250);
 
     this.connected = true;
     logger.info('[WildlifeBridge] started — subscribed to wildlife:events');
@@ -307,11 +330,12 @@ export class WildlifeBridge {
     if (zoneIds.length === 0) return;
 
     for (const zoneId of zoneIds) {
+      const bounds = this.world.getZoneBounds(zoneId);
       const info: ZoneInfoMessage = {
         id:          zoneId,
         biome:       this.world.getZoneBiome(zoneId) as ZoneInfoMessage['biome'],
-        bounds_min:  { x: -500, y: 0, z: -500 },
-        bounds_max:  { x:  500, y: 50, z:  500 },
+        bounds_min:  bounds?.min ?? { x: -500, y: 0, z: -500 },
+        bounds_max:  bounds?.max ?? { x:  500, y: 50, z:  500 },
         time_of_day: this.world.getZoneTimeOfDayNormalized(zoneId) * 24,
       };
       await this.publishZoneInfo(info);
@@ -337,7 +361,8 @@ export class WildlifeBridge {
     for (const zoneId of this.world.getAllActiveZoneIds()) {
       players.push(...this.world.getZonePlayerPositions(zoneId));
     }
-    if (players.length === 0) return;
+    // Always publish, even when empty — the Rust sim needs to know when all
+    // players have left so it can clear stale positions and stop fleeing.
     await this.messageBus.publish(CH.PLAYERS, {
       type: 'players_update',
       players,                  // flat — Rust: PlayersUpdate { players: Vec<PlayerPosition> }
@@ -351,7 +376,12 @@ export class WildlifeBridge {
     this.lastEventReceivedAt = Date.now();
     if (!wasActive && this.isExternalSimActive()) {
       logger.info({ knownEntities: this.entityMeta.size },
-        '[WildlifeBridge] external Rust wildlife sim active — local managers deferred');
+        '[WildlifeBridge] external Rust wildlife sim active — despawning local entities');
+      // Despawn all server-spawned wildlife and flora so the Rust sim's
+      // entities are the only ones visible to clients.
+      for (const zoneId of this.world.getAllActiveZoneIds()) {
+        this.world.despawnLocalWildlifeAndFlora(zoneId);
+      }
     }
 
     switch (event.type) {
@@ -360,6 +390,7 @@ export class WildlifeBridge {
       case 'death':       void this._handleDeath(event);  break;
       case 'attack':      this._handleAttack(event);      break;
       case 'birth':       this._handleBirth(event);       break;
+      case 'plant_spawn': this._handlePlantSpawn(event);   break;
       case 'plant_grow':  this._handlePlantGrow(event);   break;
       case 'plant_eaten': this._handlePlantEaten(event);  break;
       default:
@@ -416,6 +447,12 @@ export class WildlifeBridge {
     // Individual offspring arrive as Spawn events; this is informational only.
     logger.debug({ parent: event.parent_id, count: event.offspring_ids.length },
       '[WildlifeBridge] birth');
+  }
+
+  private _handlePlantSpawn(event: PlantSpawnEvent): void {
+    logger.debug({ plant_id: event.plant_id, species: event.species_id, zone: event.zone_id },
+      '[WildlifeBridge] plant spawn');
+    this.world.addExternalPlant(event.zone_id, event.plant_id, event.species_id, event.position, event.stage);
   }
 
   private _handlePlantGrow(event: PlantGrowEvent): void {

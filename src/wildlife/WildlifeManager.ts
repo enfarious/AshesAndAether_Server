@@ -725,6 +725,17 @@ export class WildlifeManager {
     return result;
   }
 
+  /**
+   * Remove all server-spawned entities immediately.
+   * Called when the external Rust wildlife sim takes over.
+   * Returns the entity IDs that were removed.
+   */
+  despawnAll(): string[] {
+    const ids = Array.from(this.entities.keys());
+    this.entities.clear();
+    return ids;
+  }
+
   damageEntity(entityId: string, damage: number, attackerId?: string): boolean {
     const entity = this.entities.get(entityId);
     if (!entity || !entity.isAlive) return false;

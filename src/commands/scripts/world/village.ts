@@ -189,6 +189,21 @@ async function handleCatalog(): Promise<CommandResult> {
   return {
     success: true,
     message: ['Available structures:', ...lines].join('\n'),
+    events: [{
+      type: 'village_catalog',
+      data: {
+        structures: catalog.map(c => ({
+          name:          c.name,
+          displayName:   c.displayName,
+          description:   c.description ?? '',
+          category:      c.category,
+          sizeX:         c.sizeX,
+          sizeZ:         c.sizeZ,
+          goldCost:      c.goldCost,
+          maxPerVillage: c.maxPerVillage,
+        })),
+      },
+    }],
   };
 }
 

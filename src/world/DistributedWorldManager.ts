@@ -16,6 +16,9 @@ import { CommandRegistry, CommandParser, CommandExecutor, registerAllCommands, s
 import { ArenaManager } from '@/arena/ArenaManager';
 import { VaultManager, TEST_VAULT_TEMPLATE } from '@/vault';
 import type { VaultScalingModifiers, VaultTemplateDefinition } from '@/vault';
+import { getWallSegments, getSpawnPositions, tileGridToJSON, type VaultTileGridData } from '@/vault/VaultTileGrid';
+import { CollisionLayer } from '@/physics/types';
+import type { PhysicsEntity } from '@/physics/types';
 import type { CommandContext, CommandEvent } from '@/commands/types';
 import type { Character, Companion, Prisma } from '@prisma/client';
 import { StatCalculator } from '@/game/stats/StatCalculator';
@@ -86,9 +89,10 @@ const COMBAT_EVENT_RANGE_METERS = 45.72; // 150 feet
 
 // ── Range-check geometry ───────────────────────────────────────────────────
 // Every entity is registered with a 0.5 m bounding sphere.
-// Effective melee reach = arm reach past the sphere edge + both radii + weapon.
-const ENTITY_RADIUS = 0.5; // metres — matches PhysicsSystem bounding sphere
-const BASE_REACH    = 1.0; // metres — arm reach beyond sphere edge (H2H baseline)
+// Effective melee reach = arm reach past the sphere edge + both radii + weapon + buffer.
+const ENTITY_RADIUS      = 0.5; // metres — matches PhysicsSystem bounding sphere
+const BASE_REACH         = 1.0; // metres — arm reach beyond sphere edge (H2H baseline)
+const MELEE_RANGE_BUFFER = 1.0; // metres — gameplay buffer so you don't have to be nose-to-nose
 
 const BIOME_FALLBACK: BiomeType = 'forest';
 const PARTY_MAX_MEMBERS = 5;
@@ -141,6 +145,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private respawnTimers: Map<string, NodeJS.Timeout> = new Map();
   /** Timestamps (ms) of the last /unstuck use per characterId — enforces cooldown. */
   private readonly unstuckCooldowns = new Map<string, number>();
+  /** Timestamps (ms) of the last /return use per characterId — enforces cooldown. */
+  private readonly returnCooldowns = new Map<string, number>();
   private movementSystem: MovementSystem;
   private attackSpeedBonusCache: Map<string, number> = new Map();
   private wildlifeManagers: Map<string, WildlifeManager> = new Map();
@@ -625,6 +631,20 @@ export class DistributedWorldManager implements IWildlifeWorld {
         lighting:       zoneManager.getLighting(),
       });
 
+      // ── Static world fixtures (dungeon entrances, interactive objects) ───────
+      if (zoneId === 'USA_NY_Stephentown') {
+        zoneManager.addScriptedObject({
+          id: 'dungeon_entrance_stephentown_01',
+          name: 'Ancient Dungeon Entrance',
+          description: 'A weathered stone archway leads down into darkness. Strange runes flicker faintly along its edges.',
+          position: { x: 80, y: 0, z: 45 },
+          interactive: true,
+          modelAsset: 'dungeon/Dungeon_Entrance_01.glb',
+          modelScale: 3,
+        });
+        logger.info({ zoneId }, 'Spawned dungeon entrance fixture');
+      }
+
       // Publish authoritative entity positions so the gateway can use them at world_entry
       await this.publishZoneEntities(zone.id, zoneManager);
     }
@@ -903,29 +923,48 @@ export class DistributedWorldManager implements IWildlifeWorld {
       this.vaultManager.handlePlayerJoin(character.id);
     }
 
-    // ── Re-spawn owned companion if not already in zone ──
+    // ── Re-spawn or teleport owned companion ──
     // Companions despawn when the owner leaves; re-spawn them at the owner's
     // position when the owner enters a zone so the companion follows naturally.
+    // If the companion already exists (server didn't cycle), teleport it to the
+    // owner instead of silently leaving it wherever it was.
     try {
       const ownedCompanion = await CompanionService.findByOwnerCharacter(character.id);
-      if (ownedCompanion && !this.npcControllers.has(ownedCompanion.id)) {
-        // Update companion's zone + position in DB to match the owner
-        await CompanionService.updatePosition(ownedCompanion.id, {
-          zoneId: character.zoneId,
-          positionX: character.positionX,
-          positionY: character.positionY,
-          positionZ: character.positionZ,
-        });
-        // Reload the companion to get the updated data
-        const refreshed = await CompanionService.findById(ownedCompanion.id);
-        if (refreshed) {
-          await this.registerCompanionInZone(refreshed, character.zoneId);
-          logger.info({ companionId: refreshed.id, ownerId: character.id, zoneId: character.zoneId },
-            'Companion re-spawned — owner entered zone');
+      if (ownedCompanion) {
+        const ownerPos = {
+          x: character.positionX,
+          y: character.positionY,
+          z: character.positionZ,
+        };
+
+        if (!this.npcControllers.has(ownedCompanion.id)) {
+          // Companion not registered — full re-spawn at owner position
+          await CompanionService.updatePosition(ownedCompanion.id, {
+            zoneId: character.zoneId,
+            positionX: ownerPos.x,
+            positionY: ownerPos.y,
+            positionZ: ownerPos.z,
+          });
+          const refreshed = await CompanionService.findById(ownedCompanion.id);
+          if (refreshed) {
+            await this.registerCompanionInZone(refreshed, character.zoneId);
+            logger.info({ companionId: refreshed.id, ownerId: character.id, zoneId: character.zoneId },
+              'Companion re-spawned — owner entered zone');
+          }
+        } else {
+          // Companion already registered — teleport it to the owner
+          const zm = this.zones.get(character.zoneId);
+          if (zm) {
+            const heading = 0;
+            zm.updateCompanionPosition(ownedCompanion.id, ownerPos, heading);
+            void this.broadcastPositionUpdate(ownedCompanion.id, character.zoneId, ownerPos, 0, 0);
+            logger.info({ companionId: ownedCompanion.id, ownerId: character.id },
+              'Companion teleported to owner on login');
+          }
         }
       }
     } catch (err) {
-      logger.warn({ err, characterId: character.id }, 'Failed to re-spawn companion on zone entry');
+      logger.warn({ err, characterId: character.id }, 'Failed to re-spawn/teleport companion on zone entry');
     }
 
     logger.info({ characterId: character.id, zoneId: character.zoneId }, 'Player joined zone');
@@ -1060,6 +1099,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
         name: struct.catalog.displayName,
         description: struct.catalog.description ?? undefined,
         position: { x: struct.positionX, y: struct.positionY, z: struct.positionZ },
+        modelAsset: struct.catalog.modelAsset,
       });
     }
 
@@ -1117,6 +1157,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     this.zones.delete(zoneId);
     this.movementSystem.unregisterZoneManager(zoneId);
     this.villageInstances.delete(zoneId);
+    this.movementQueue.delete(zoneId);
 
     logger.info({ zoneId }, 'Village instance torn down');
   }
@@ -1217,6 +1258,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     this.zones.delete(zoneId);
     this.movementSystem.unregisterZoneManager(zoneId);
     this.vaultInstances.delete(zoneId);
+    this.movementQueue.delete(zoneId);
 
     // Delete the transient Zone DB record
     try {
@@ -1225,7 +1267,18 @@ export class DistributedWorldManager implements IWildlifeWorld {
       logger.warn({ zoneId, err }, 'Failed to delete vault zone record (may already be gone)');
     }
 
+    // Clean up tile grid from Redis
+    const vaultInstanceId = VaultManager.extractInstanceId(zoneId);
+    if (vaultInstanceId) {
+      await this.zoneRegistry.deleteVaultTileGrid(vaultInstanceId).catch(() => {});
+    }
+
     logger.info({ zoneId }, 'Vault instance torn down');
+  }
+
+  /** Expose tile grid data for the HTTP endpoint. */
+  getVaultTileGrid(instanceId: string): VaultTileGridData | null {
+    return this.vaultManager.getTileGrid(instanceId);
   }
 
   /**
@@ -1537,6 +1590,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       // server auto-stops if heartbeat expires (see MovementSystem).
       if (this.movementSystem.isMoving(characterId)) {
         this.movementSystem.updateHeading(characterId, heading);
+        this.movementSystem.refreshHeartbeat(characterId);
       } else {
         const started = await this.movementSystem.startMovement({
           characterId,
@@ -2045,6 +2099,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
           overrideResponse = {
             success: true,
             message: `Order created successfully (ID: ${response.orderId?.slice(0, 8)})`,
+            data: result.data,
           };
           break;
         }
@@ -2060,6 +2115,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
           overrideResponse = {
             success: true,
             message: 'Purchase completed successfully!',
+            data: result.data,
           };
           break;
         }
@@ -2074,6 +2130,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
           overrideResponse = {
             success: true,
             message: 'Order cancelled. Items returned to inventory.',
+            data: result.data,
           };
           break;
         }
@@ -2376,6 +2433,15 @@ export class DistributedWorldManager implements IWildlifeWorld {
           overrideResponse = { success: unstuckResult.success, message: unstuckResult.message };
           break;
         }
+        case 'return_home': {
+          const returnResult = await this.processReturnCommand(
+            context.characterId,
+            context.zoneId,
+            context.socketId,
+          );
+          overrideResponse = { success: returnResult.success, message: returnResult.message };
+          break;
+        }
         case 'ability_unlock': {
           const { nodeId } = event.data as { nodeId: string };
           const unlockResult = await unlockAbility(context.characterId, nodeId);
@@ -2581,6 +2647,22 @@ export class DistributedWorldManager implements IWildlifeWorld {
           break;
         }
 
+        case 'village_catalog': {
+          // Forward structured catalog to the client for the BuildPanel
+          await this.messageBus.publish('gateway:output', {
+            type: MessageType.CLIENT_MESSAGE,
+            characterId: context.characterId,
+            socketId: context.socketId,
+            payload: {
+              socketId: context.socketId,
+              event: 'village_catalog',
+              data: event.data,
+            },
+            timestamp: Date.now(),
+          });
+          break;
+        }
+
         case 'village_remove': {
           const { structureId } = event.data as { structureId: string };
           const ownerCharIdRemove = VillageService.extractOwnerCharacterId(context.zoneId);
@@ -2691,6 +2773,41 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
             const vaultZoneId = VaultManager.vaultZoneId(instanceId);
 
+            // ── Register wall collision from tile grid ──────────────────
+            const tileGrid = this.vaultManager.getTileGrid(instanceId);
+            if (tileGrid) {
+              const vaultZoneMgr = this.zones.get(vaultZoneId);
+              if (vaultZoneMgr) {
+                const wallSegs = getWallSegments(tileGrid);
+                const physics = vaultZoneMgr.getPhysicsSystem();
+                for (let i = 0; i < wallSegs.length; i++) {
+                  const seg = wallSegs[i]!;
+                  physics.registerEntity({
+                    id: `vault_wall_${i}`,
+                    position: { x: (seg.ax + seg.bx) / 2, y: 0, z: (seg.az + seg.bz) / 2 },
+                    boundingVolume: seg,
+                    type: 'static',
+                    collisionLayer: CollisionLayer.STRUCTURES,
+                  } as PhysicsEntity);
+                }
+                logger.info(
+                  { vaultZoneId, wallCount: wallSegs.length },
+                  'Vault wall collision registered',
+                );
+              }
+
+              // Persist tile grid to Redis so the gateway can serve it
+              await this.zoneRegistry.setVaultTileGrid(instanceId, JSON.stringify(tileGridToJSON(tileGrid)));
+            }
+
+            // ── Derive player spawn positions from tile grid ────────────
+            let playerSpawns: Array<{ x: number; y: number; z: number }>;
+            if (tileGrid) {
+              playerSpawns = getSpawnPositions(tileGrid, tileGrid.entrance, partyMembers.length, 2);
+            } else {
+              playerSpawns = template.rooms[0]!.spawnPositions.player;
+            }
+
             // Save return points and transfer all party members
             for (const member of partyMembers) {
               const memberChar = await CharacterService.findById(member.id);
@@ -2702,10 +2819,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
                 memberChar.positionX, memberChar.positionY, memberChar.positionZ,
               );
 
-              // Get player spawn position from first room
-              const spawnPos = template.rooms[0].spawnPositions.player[
-                partyMembers.indexOf(member) % template.rooms[0].spawnPositions.player.length
-              ];
+              // Get player spawn position
+              const spawnPos = playerSpawns[
+                partyMembers.indexOf(member) % playerSpawns.length
+              ]!;
 
               // Update character zone to vault
               await VillageService.updateCharacterZone(
@@ -5718,7 +5835,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const isMelee = !ability.range || ability.range <= 2;
     const weaponReach    = weaponRange ?? UNARMED_RANGE;
     const effectiveRange = isMelee
-      ? BASE_REACH + ENTITY_RADIUS + ENTITY_RADIUS + weaponReach
+      ? BASE_REACH + ENTITY_RADIUS + ENTITY_RADIUS + weaponReach + MELEE_RANGE_BUFFER
       : ability.range + ENTITY_RADIUS + ENTITY_RADIUS;
 
     // Use horizontal (XZ) distance for range validation.
@@ -6012,6 +6129,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
   ): void {
     const zm = this.zones.get(zoneId);
     if (!zm) return;
+    // Snap Y to server terrain — the Rust sim may not have real elevation data.
+    data.position = this._snapWildlifeY(zm, data.position);
     zm.addWildlife(data);
     void this.broadcastNearbyUpdate(zoneId);
   }
@@ -6026,7 +6145,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
   ): void {
     const zm = this.zones.get(zoneId);
     if (!zm) return;
-    zm.updateWildlife(entityId, position, heading, behavior);
+    // Snap Y to server terrain — the Rust sim may not have real elevation data.
+    const snapped = this._snapWildlifeY(zm, position);
+    zm.updateWildlife(entityId, snapped, heading, behavior);
   }
 
   removeWildlifeFromZone(zoneId: string, entityId: string): void {
@@ -6036,12 +6157,68 @@ export class DistributedWorldManager implements IWildlifeWorld {
     void this.broadcastNearbyUpdate(zoneId);
   }
 
+  /**
+   * Snap a wildlife position's Y to the server's terrain elevation.
+   *
+   * The Rust wildlife sim may not have real elevation data (the navmesh
+   * cells can have zero elevation when the ElevationPipeline hasn't run),
+   * so it falls back to procedural hills that don't match the GLB terrain.
+   * This method uses the same applyGravity that the server uses for
+   * players, mobs, and companions so wildlife walk on the correct surface.
+   */
+  private _snapWildlifeY(
+    zm: any,
+    position: { x: number; y: number; z: number },
+  ): { x: number; y: number; z: number } {
+    const physics = zm.getPhysicsSystem?.();
+    if (!physics) return position;
+    return physics.applyGravity(position);
+  }
+
+  despawnLocalWildlifeAndFlora(zoneId: string): void {
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+
+    // Despawn server-spawned wildlife
+    const wm = this.wildlifeManagers.get(zoneId);
+    if (wm) {
+      const removedIds = wm.despawnAll();
+      for (const id of removedIds) {
+        zm.removeWildlife(id);
+      }
+      if (removedIds.length > 0) {
+        void this.broadcastNearbyUpdate(zoneId);
+      }
+    }
+
+    // Despawn server-spawned flora
+    const fm = this.floraManagers.get(zoneId);
+    if (fm) {
+      const removedPlantIds = fm.despawnAll();
+      for (const plantId of removedPlantIds) {
+        void this._broadcastPlantRemoved(zoneId, plantId);
+      }
+    }
+  }
+
   getAllActiveZoneIds(): string[] {
     return [...this.zones.keys()];
   }
 
   getZoneBiome(zoneId: string): string {
     return this.zoneBiomes.get(zoneId) ?? BIOME_FALLBACK;
+  }
+
+  getZoneBounds(zoneId: string): { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null {
+    const zm = this.zones.get(zoneId);
+    if (!zm) return null;
+    const zone = zm.getZone();
+    const halfX = zone.sizeX / 2;
+    const halfZ = zone.sizeZ / 2;
+    return {
+      min: { x: zone.worldX - halfX, y: 0, z: zone.worldY - halfZ },
+      max: { x: zone.worldX + halfX, y: zone.sizeY, z: zone.worldY + halfZ },
+    };
   }
 
   getZoneTimeOfDayNormalized(zoneId: string): number {
@@ -6069,10 +6246,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
     animation: string,
     speed: number,
   ): Promise<void> {
+    // Snap Y to server terrain so wildlife walk on the actual ground surface.
+    const zm = this.zones.get(zoneId);
+    const snapped = zm ? this._snapWildlifeY(zm, position) : position;
     const stateUpdate = {
       timestamp: Date.now(),
       entities: {
-        updated: [{ id: entityId, name, type: 'wildlife', position, heading, currentAction: animation, movementDuration: 520, movementSpeed: speed }],
+        updated: [{ id: entityId, name, type: 'wildlife', position: snapped, heading, currentAction: animation, movementDuration: 520, movementSpeed: speed }],
       },
     };
     for (const [charId, charZoneId] of this.characterToZone.entries()) {
@@ -6090,7 +6270,24 @@ export class DistributedWorldManager implements IWildlifeWorld {
     }
   }
 
-  // ── IWildlifeWorld — plant notification stubs ─────────────────────────────
+  // ── IWildlifeWorld — plant management ───────────────────────────────────
+
+  addExternalPlant(
+    zoneId: string,
+    plantId: string,
+    speciesId: string,
+    position: { x: number; y: number; z: number },
+    stage: string,
+  ): void {
+    const fm = this.floraManagers.get(zoneId);
+    if (!fm) return;
+
+    // Snap Y to server terrain, same as wildlife.
+    const zm = this.zones.get(zoneId);
+    const snapped = zm ? this._snapWildlifeY(zm, position) : position;
+
+    fm.addExternalPlant(plantId, speciesId, snapped, stage);
+  }
 
   notifyPlantStageChange(plantId: string, newStage: string): void {
     // Find which zone this plant belongs to and update its FloraManager
@@ -6135,12 +6332,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
     stage: string,
     mode: 'added' | 'updated',
   ): Promise<void> {
+    // Snap Y to server terrain — plant positions from the Rust sim or
+    // FloraManager may not match the GLB terrain surface.
+    const zm = this.zones.get(zoneId);
+    const snapped = zm ? this._snapWildlifeY(zm, position) : position;
     const speciesData = getPlantSpecies(speciesId);
     const entity = {
       id:          plantId,
       type:        'plant',
       name:        speciesData?.name ?? speciesId,
-      position,
+      position:    snapped,
       description: speciesData?.description ?? '',
       isAlive:     true,
       interactive: true,
@@ -6284,6 +6485,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       description: s.description ?? '',
       isAlive:     true,
       interactive: false,
+      modelAsset:  s.modelAsset,
     }));
 
     await this.messageBus.publish('gateway:output', {
@@ -6331,6 +6533,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
         rotation:  s.rotation,
         sizeX:     s.catalog.sizeX,
         sizeZ:     s.catalog.sizeZ,
+        modelAsset: s.catalog.modelAsset,
       })),
       maxStructures: village.template.maxStructures,
       gridSize:      village.template.gridSize,
@@ -6396,6 +6599,75 @@ export class DistributedWorldManager implements IWildlifeWorld {
     logger.info({ characterId, zoneId, nudged }, '[DWM] /unstuck applied');
 
     return { success: true, message: 'Nudging you to a nearby clear spot…' };
+  }
+
+  private async processReturnCommand(
+    characterId: string,
+    zoneId: string,
+    socketId?: string,
+  ): Promise<{ success: boolean; message: string }> {
+    const COOLDOWN_MS = 30 * 60 * 1_000; // 30 minutes
+    const now = Date.now();
+    const last = this.returnCooldowns.get(characterId) ?? 0;
+
+    if (now - last < COOLDOWN_MS) {
+      const remaining = Math.ceil((COOLDOWN_MS - (now - last)) / 1_000);
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      const label = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      return { success: false, message: `You can't use /return yet — wait ${label}.` };
+    }
+
+    // Determine destination — if in a village/vault instance, transfer back to
+    // the main world zone.  Otherwise teleport to the zone's city/starter spawn.
+    const destZoneId = VillageService.isVillageZone(zoneId)
+      ? 'USA_NY_Stephentown'
+      : zoneId;
+
+    const spawn = SpawnPointService.getCitySpawn(destZoneId)
+      ?? SpawnPointService.getStarterSpawn(destZoneId);
+    const dest = spawn?.position ?? { x: 12, y: 265, z: -18 };
+
+    if (VillageService.isVillageZone(zoneId)) {
+      // Zone transfer: update DB, clear return point, trigger client reconnect
+      await VillageService.updateCharacterZone(
+        characterId, destZoneId, dest.x, dest.y, dest.z,
+      );
+      await VillageService.clearReturnPoint(characterId);
+
+      if (socketId) {
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId,
+          socketId,
+          payload: {
+            socketId,
+            event: 'zone_transfer',
+            data: { zoneId: destZoneId },
+          },
+          timestamp: Date.now(),
+        });
+      }
+
+      this.returnCooldowns.set(characterId, now);
+      logger.info({ characterId, from: zoneId, to: destZoneId, dest }, '[DWM] /return (zone transfer)');
+      return { success: true, message: `Returning to ${spawn?.name ?? 'Town Hall'}…` };
+    }
+
+    // Same-zone teleport
+    const zm = this.zones.get(zoneId);
+    if (!zm) return { success: false, message: 'Zone not available.' };
+
+    zm.updatePlayerPosition(characterId, dest);
+    await CharacterService.updatePosition(characterId, dest);
+
+    await this.broadcastPositionUpdate(characterId, zoneId, dest);
+    await this.broadcastNearbyUpdate(zoneId);
+
+    this.returnCooldowns.set(characterId, now);
+    logger.info({ characterId, zoneId, dest }, '[DWM] /return applied');
+
+    return { success: true, message: `You have returned to ${spawn?.name ?? 'Town Hall'}.` };
   }
 
   async processHarvestCommand(
@@ -7685,7 +7957,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private async broadcastPositionUpdate(
     characterId: string,
     zoneId: string,
-    position: Vector3
+    position: Vector3,
+    overrideMovementSpeed?: number,
+    overrideMovementDuration?: number,
   ): Promise<void> {
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) return;
@@ -7698,8 +7972,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const movementSystem = this.movementSystem;
     
     const animationState = animationLockSystem?.getState(characterId);
-    const movementDuration = movementSystem.getMovementDuration(characterId);
-    const movementSpeed = movementSystem.getMovementSpeed(characterId);
+    const movementDuration = overrideMovementDuration ?? movementSystem.getMovementDuration(characterId);
+    const movementSpeed = overrideMovementSpeed ?? movementSystem.getMovementSpeed(characterId);
     // MovementSystem only tracks headings for player/character movement; fall
     // back to the entity's own heading field for mobs, wildlife, etc.
     const heading = movementSystem.getHeading(characterId) ?? entity.heading;
@@ -7840,10 +8114,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Broadcast combat gauges to players in combat
     void this.broadcastCombatGauges();
 
-    // Update movement system
+    // Update movement system — queue player position snapshots for batched broadcast.
     const positionUpdates = this.movementSystem.update(deltaTime);
     if (positionUpdates.size > 0) {
-      void this.handleMovementUpdates(positionUpdates);
+      this.handleMovementUpdates(positionUpdates);
     }
 
     // Update wildlife simulation and flush batched position broadcasts.
@@ -7939,7 +8213,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
         // Feed the terrain-snapped Y back so the next tick uses the actual
         // ground elevation and mobs don't float or clip terrain.
         wanderSystem.updateCurrentPosition(id, snapped);
-        void this.broadcastPositionUpdate(id, zoneId, snapped);
+        // Queue for batched broadcast (flushed by _flushMovementQueue at end of tick).
+        this._queueEntityBroadcast(id, zoneId, snapped);
         anyMoved = true;
       }
 
@@ -7950,7 +8225,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
         const nudged  = physics.nudgeToUnstuck(entity.position, 0.5);
         const snapped = zm.updateMobPosition(id, nudged, entity.heading ?? 0);
         wanderSystem.updateCurrentPosition(id, snapped);
-        void this.broadcastPositionUpdate(id, zoneId, snapped);
+        // Queue for batched broadcast.
+        this._queueEntityBroadcast(id, zoneId, snapped);
         anyMoved = true;
         logger.debug({ mobId: id, zoneId, nudged }, '[MobWander] Geometry unstuck applied');
       }
@@ -7974,12 +8250,20 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const physicsMoved = zoneManager.tickPhysics(deltaTime);
       if (physicsMoved.length > 0) {
         for (const { id, position } of physicsMoved) {
-          void this.broadcastPositionUpdate(id, zoneId, position);
+          // Queue for batched broadcast (flushed below).
+          this._queueEntityBroadcast(id, zoneId, position);
         }
         // Keep Redis entity snapshot current so world_entry gets correct positions
         void this.publishZoneEntities(zoneId, zoneManager);
       }
     }
+
+    // ── Flush all queued entity position broadcasts ──────────────────────
+    // ONE batched state_update per zone per recipient, containing every
+    // entity that moved this tick (players, mobs, physics).  This replaces
+    // the old pattern of N individual broadcastPositionUpdate() calls that
+    // flooded the message bus and caused mobs to freeze during WASD movement.
+    void this._flushMovementQueue();
 
     // Log physics sample once per second — gated behind PHYSICS_DEBUG=true
     if (PHYSICS_DEBUG) {
@@ -8065,8 +8349,162 @@ export class DistributedWorldManager implements IWildlifeWorld {
    * - Party/Alliance: Gets ATB only (no auto-attack info)
    * - Enemies: Get nothing
    */
+  /** Counter for throttling enmity list broadcasts (every N ticks). */
+  private enmityBroadcastCounter = 0;
+
+  /** Batched entity movement broadcasting.
+   *
+   *  ALL position-changing sources (player movement, mob wander, physics)
+   *  queue snapshots into movementQueue during the tick.  At the end of
+   *  update(), _flushMovementQueue() sends ONE combined state_update per
+   *  zone per recipient, dramatically reducing message-bus throughput.
+   *
+   *  Previously, mob positions were broadcast individually (one Redis
+   *  publish per mob per player per tick).  When player WASD movement added
+   *  extra async messages (proximity rosters, nearby updates), the message
+   *  bus became congested and mob updates were delayed — causing mobs to
+   *  appear frozen on the client while the player held WASD keys.
+   *
+   *  The queue stores the *latest* snapshot per entity — intermediate ticks
+   *  just overwrite the previous entry, so no unbounded growth.
+   *
+   *  Proximity rosters are also flushed on the same cadence. */
+  private movementBroadcastTickCounter = 0;
+  private static readonly MOVEMENT_BROADCAST_INTERVAL = 1; // every tick (~50 ms at 20 TPS → 20 Hz)
+
+  /** Per-zone queue of entity snapshots accumulated since last flush. */
+  private movementQueue = new Map<string, Map<string, {
+    id: string; name: string; type: string;
+    position: Vector3; heading?: number;
+    movementDuration?: number; movementSpeed?: number;
+    currentAction?: string;
+  }>>();
+  /**
+   * Queue an entity position snapshot for batched broadcasting.
+   * Used by player movement (handleMovementUpdates), mob wander, and
+   * physics ticks.  The queue is flushed once per tick by
+   * _flushMovementQueue(), producing ONE combined state_update per zone
+   * per recipient — dramatically reducing Redis message-bus throughput.
+   */
+  private _queueEntityBroadcast(
+    entityId: string,
+    zoneId: string,
+    position: Vector3,
+    overrideHeading?: number,
+    overrideMovementDuration?: number,
+    overrideMovementSpeed?: number,
+  ): void {
+    const zoneManager = this.zones.get(zoneId);
+    if (!zoneManager) return;
+
+    const entity = zoneManager.getEntity(entityId);
+    if (!entity) return;
+
+    const animationState = zoneManager.getAnimationLockSystem()?.getState(entityId);
+    const heading = overrideHeading
+      ?? this.movementSystem.getHeading(entityId)
+      ?? entity.heading;
+    const movementDuration = overrideMovementDuration
+      ?? this.movementSystem.getMovementDuration(entityId);
+    const movementSpeed = overrideMovementSpeed
+      ?? this.movementSystem.getMovementSpeed(entityId);
+
+    let zoneQueue = this.movementQueue.get(zoneId);
+    if (!zoneQueue) {
+      zoneQueue = new Map();
+      this.movementQueue.set(zoneId, zoneQueue);
+    }
+    // Overwrite — we only care about the latest snapshot per entity.
+    zoneQueue.set(entityId, {
+      id: entityId,
+      name: entity.name,
+      type: entity.type,
+      position,
+      heading,
+      movementDuration,
+      movementSpeed,
+      currentAction: animationState?.currentAction,
+    });
+  }
+
+  /**
+   * Flush the movementQueue — send one batched state_update per zone per
+   * recipient, then fire proximity rosters for player entities only.
+   *
+   * Called once per tick from update(), AFTER all movement sources (player
+   * movement, mob wander, physics) have queued their snapshots.
+   */
+  private async _flushMovementQueue(): Promise<void> {
+    this.movementBroadcastTickCounter++;
+    if (this.movementBroadcastTickCounter < DistributedWorldManager.MOVEMENT_BROADCAST_INTERVAL) {
+      return; // keep accumulating
+    }
+    this.movementBroadcastTickCounter = 0;
+
+    const zoneUpdates = new Set<string>();
+
+    for (const [zoneId, entityMap] of this.movementQueue) {
+      if (entityMap.size === 0) continue;
+
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) { entityMap.clear(); continue; }
+
+      zoneUpdates.add(zoneId);
+
+      // Build one batched state_update containing ALL moving entities in this zone.
+      const updatedEntities = Array.from(entityMap.values());
+      const now = Date.now();
+
+      // Send to every player in the zone, filtering out their OWN entity.
+      // Sending a player their own stale position causes client-side prediction
+      // to fight the reconciliation loop (anchor/jitter).
+      for (const [charId, charZoneId] of this.characterToZone.entries()) {
+        if (charZoneId !== zoneId) continue;
+        const socketId = zoneManager.getSocketIdForCharacter(charId);
+        if (!socketId) continue;
+
+        // Exclude self — the player trusts their own prediction during movement.
+        const filtered = updatedEntities.filter(e => e.id !== charId);
+        if (filtered.length === 0) continue; // nothing to send
+
+        await this.messageBus.publish('gateway:output', {
+          type: MessageType.CLIENT_MESSAGE,
+          characterId: charId,
+          socketId,
+          payload: {
+            socketId,
+            event: 'state_update',
+            data: { timestamp: now, entities: { updated: filtered } },
+          },
+          timestamp: now,
+        });
+      }
+
+      // Proximity rosters only for player entities (mobs/NPCs don't have sockets).
+      for (const characterId of entityMap.keys()) {
+        if (this.characterToZone.has(characterId)) {
+          await this.sendProximityRosterToEntity(characterId);
+        }
+      }
+
+      entityMap.clear();
+    }
+
+    // Zone-wide proximity roster refresh for affected zones.
+    for (const zoneId of zoneUpdates) {
+      await this.broadcastNearbyUpdate(zoneId);
+    }
+  }
+
+  private static readonly ENMITY_BROADCAST_INTERVAL = 10; // every 10 ticks (~500 ms at 20 TPS)
+
   private async broadcastCombatGauges(): Promise<void> {
     const entitiesInCombat = this.combatManager.getEntitiesInCombat();
+
+    // Enmity list is moderately expensive — throttle to every ~500 ms
+    this.enmityBroadcastCounter++;
+    const includeEnmity = this.enmityBroadcastCounter >= DistributedWorldManager.ENMITY_BROADCAST_INTERVAL;
+    if (includeEnmity) this.enmityBroadcastCounter = 0;
 
     for (const entityId of entitiesInCombat) {
       // Only broadcast to players (not NPCs/companions for now)
@@ -8086,7 +8524,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       // Build state_update with combat gauges
       // Only include specialCharges if there are any (avoid empty object)
       const hasCharges = Object.keys(combatState.specialCharges).length > 0;
-      const stateUpdate = {
+      const stateUpdate: Record<string, unknown> = {
         timestamp: Date.now(),
         combat: {
           atb: combatState.atb,
@@ -8094,6 +8532,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
           inCombat: combatState.inCombat,
           autoAttackTarget: combatState.autoAttackTarget,
           ...(hasCharges && { specialCharges: combatState.specialCharges }),
+          ...(includeEnmity && { enmityList: this.buildEnmityList(entityId, zoneId, zoneManager) }),
         },
         // TODO: Add party/alliance ATB when party system is implemented
         // allies: this.getPartyMemberAtb(entityId),
@@ -8112,6 +8551,87 @@ export class DistributedWorldManager implements IWildlifeWorld {
         timestamp: Date.now(),
       });
     }
+  }
+
+  // ── Enmity list ────────────────────────────────────────────────────────────
+
+  /**
+   * Build the enmity list for a player: all mobs involved with this player
+   * or their allies, classified by threat level.
+   *
+   *   Red    – mob is auto-attacking this player (top enmity)
+   *   Yellow – mob is auto-attacking player's companion or party member
+   *   Blue   – player is attacking this mob, but mob is focused elsewhere
+   */
+  private buildEnmityList(
+    playerId: string,
+    zoneId: string,
+    zoneManager: ZoneManager,
+  ): Array<{ entityId: string; name: string; level: 'red' | 'yellow' | 'blue' }> {
+    const playerEntity = zoneManager.getEntity(playerId);
+    if (!playerEntity) return [];
+
+    // Collect ally IDs (companions + party members) for yellow classification
+    const allyIds = new Set<string>();
+    for (const [compId, ctrl] of this.npcControllers) {
+      if (ctrl.getCompanion().ownerCharacterId === playerId) {
+        allyIds.add(compId);
+      }
+    }
+    // Party members — synchronous lookup from cached party state
+    // (partyService calls Redis, which is async; to avoid async in a hot path
+    //  we pre-cache party membership in a later pass. For now, companions only.)
+    // TODO: cache partyMembers set and include here
+
+    // What the player is auto-attacking
+    const playerTarget = this.combatManager.getAutoAttackTarget(playerId);
+
+    // Scan nearby entities for mobs/wildlife in combat
+    const nearby = zoneManager.getEntitiesInRangeForCombat(playerEntity.position, 30, playerId);
+    const entries: Array<{ entityId: string; name: string; level: 'red' | 'yellow' | 'blue' }> = [];
+    const seen = new Set<string>();
+
+    for (const entity of nearby) {
+      if (entity.type !== 'mob' && entity.type !== 'wildlife') continue;
+      if (!entity.isAlive) continue;
+      if (!this.combatManager.isInCombat(entity.id)) continue;
+      if (seen.has(entity.id)) continue;
+
+      const mobTarget = this.combatManager.getAutoAttackTarget(entity.id);
+
+      if (mobTarget === playerId) {
+        // Red — mob is targeting this player directly
+        entries.push({ entityId: entity.id, name: entity.name, level: 'red' });
+        seen.add(entity.id);
+      } else if (mobTarget && allyIds.has(mobTarget)) {
+        // Yellow — mob is targeting player's companion/party member
+        entries.push({ entityId: entity.id, name: entity.name, level: 'yellow' });
+        seen.add(entity.id);
+      } else if (playerTarget === entity.id) {
+        // Blue — player is attacking this mob, but it's focused elsewhere
+        entries.push({ entityId: entity.id, name: entity.name, level: 'blue' });
+        seen.add(entity.id);
+      }
+      // else: mob in combat but not involved with this player — skip
+    }
+
+    // Also check if any mob outside the nearby scan is targeting this player
+    // (covers edge cases where mob is >30m but still auto-attacking)
+    const attackersOfPlayer = this.combatManager.getAttackersOf(playerId);
+    for (const attackerId of attackersOfPlayer) {
+      if (seen.has(attackerId)) continue;
+      const entity = zoneManager.getEntity(attackerId);
+      if (!entity || !entity.isAlive) continue;
+      if (entity.type !== 'mob' && entity.type !== 'wildlife') continue;
+      entries.push({ entityId: entity.id, name: entity.name, level: 'red' });
+      seen.add(entity.id);
+    }
+
+    // Sort: red first, then yellow, then blue
+    const order = { red: 0, yellow: 1, blue: 2 };
+    entries.sort((a, b) => order[a.level] - order[b.level]);
+
+    return entries;
   }
 
   private async processQueuedCombatActions(): Promise<void> {
@@ -8294,11 +8814,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
   }
 
   /**
-   * Handle position updates from movement system
+   * Handle position updates from movement system — queue only, no flush.
+   *
+   * Updates zone-manager positions immediately (synchronous), then queues
+   * entity snapshots into movementQueue.  The actual broadcast happens later
+   * in _flushMovementQueue() which runs once per tick after ALL movement
+   * sources (player, mob, physics) have contributed their snapshots.
    */
-  private async handleMovementUpdates(updates: Map<string, Vector3>): Promise<void> {
-    const zoneUpdates = new Set<string>();
-
+  private handleMovementUpdates(updates: Map<string, Vector3>): void {
     for (const [characterId, position] of updates) {
       const zoneId = this.characterToZone.get(characterId);
       if (!zoneId) continue;
@@ -8306,20 +8829,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const zoneManager = this.zones.get(zoneId);
       if (!zoneManager) continue;
 
-      // Update position in zone manager
+      // Update zone-manager position immediately (combat/AI needs this now).
       zoneManager.updatePlayerPosition(characterId, position);
-      zoneUpdates.add(zoneId);
 
-      // Broadcast state_update to all players in the zone
-      await this.broadcastPositionUpdate(characterId, zoneId, position);
-
-      // Send proximity roster to moving player
-      await this.sendProximityRosterToEntity(characterId);
-    }
-
-    // Broadcast proximity roster updates to all affected zones
-    for (const zoneId of zoneUpdates) {
-      await this.broadcastNearbyUpdate(zoneId);
+      // Snapshot into the broadcast queue.
+      this._queueEntityBroadcast(characterId, zoneId, position);
     }
   }
 
@@ -8341,7 +8855,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // Update position one final time
     zoneManager.updatePlayerPosition(characterId, finalPosition);
 
-    // Broadcast final position update with idle animation state
+    // Remove any stale queued snapshot so the next flush doesn't overwrite
+    // this authoritative final position with an outdated mid-movement frame.
+    this.movementQueue.get(zoneId)?.delete(characterId);
+
+    // Broadcast final position update with idle animation state (immediate)
     await this.broadcastPositionUpdate(characterId, zoneId, finalPosition);
 
     // Only send narrative feedback for command-sourced movements.
@@ -8460,8 +8978,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
       // Filter enemies to only those the companion has decided to fight
       const engagedEnemies = hostiles.filter(e => {
-        // If we're in combat, we already passed the gate — but re-check for new mobs
-        // that wandered in. For performance, only check settings lists (no LLM mid-combat).
+        // Re-check engagement lists for new mobs that wandered in mid-combat.
+        // Only engage explicitly listed mobs — unknown mobs are ignored.
         const s = controller.getCurrentSettings();
         if (e.species) {
           if (s.alwaysEngageSpecies.includes(e.species)) return true;
@@ -8471,8 +8989,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
           if (s.alwaysEngageFamily.includes(e.family)) return true;
           if (s.ignoreFamily.includes(e.family)) return false;
         }
-        // Unknown mid-combat — engage (already committed to fighting)
-        return true;
+        // Unknown mid-combat — ignore (only fight what's on the engage lists)
+        return false;
       });
 
       // Build combat context for the behavior tree
@@ -8483,30 +9001,25 @@ export class DistributedWorldManager implements IWildlifeWorld {
       // Tick the behavior tree
       const result = await controller.updateCombat(combatContext, deltaTime);
 
-      // Apply movement output — steer around buildings first, then wall-resolve
+      // Apply movement intent — compute step from heading+speed, steer around buildings, wall-resolve
       if (result.movement) {
         const physics = zm.getPhysicsSystem();
-        let mx = result.movement.x;
-        let mz = result.movement.z;
-        const moveDist = Math.sqrt(mx * mx + mz * mz);
-        if (moveDist > 0.001) {
-          let heading = Math.atan2(mx, mz) * (180 / Math.PI);
-          if (heading < 0) heading += 360;
-          const steered = physics.steerAroundWalls(companionEntity.position, heading, 4.0, 0.5);
-          if (steered !== null && steered !== heading) {
-            const rad = (steered * Math.PI) / 180;
-            mx = Math.sin(rad) * moveDist;
-            mz = Math.cos(rad) * moveDist;
-          }
-        }
+        const step = result.movement.speed * deltaTime;
+        let heading = result.movement.heading;
+        if (heading < 0) heading += 360;
+        const steered = physics.steerAroundWalls(companionEntity.position, heading, 4.0, 0.5);
+        const finalHeading = (steered !== null && steered !== heading) ? steered : heading;
+        const rad = (finalHeading * Math.PI) / 180;
         const newPos = {
-          x: companionEntity.position.x + mx,
+          x: companionEntity.position.x + Math.sin(rad) * step,
           y: companionEntity.position.y,
-          z: companionEntity.position.z + mz,
+          z: companionEntity.position.z + Math.cos(rad) * step,
         };
         const wallResolved = physics.resolveAgainstStructures(newPos, 0.5);
-        const snapped = zm.updateCompanionPosition(companionId, wallResolved, result.heading ?? 0);
-        void this.broadcastPositionUpdate(companionId, zoneId, snapped);
+        const snapped = zm.updateCompanionPosition(companionId, wallResolved, finalHeading);
+        // movementDuration spans ~3 ticks so the client interpolates smoothly
+        // instead of restarting mid-lerp every tick.
+        void this.broadcastPositionUpdate(companionId, zoneId, snapped, result.movement.speed, 150);
       }
 
       // Apply ability action output
@@ -8655,7 +9168,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
    * Tick companion behavior trees (TASKED) and follow logic (ACTIVE).
    * Called every game tick right after tickCompanionCombat.
    */
-  private async tickCompanionBehavior(_deltaTime: number): Promise<void> {
+  private async tickCompanionBehavior(deltaTime: number): Promise<void> {
     const now = Date.now();
 
     for (const [companionId, controller] of this.npcControllers) {
@@ -8677,7 +9190,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       if (state === 'tasked') {
         await this.tickCompanionTask(companionId, companionEntity, zm, zoneId, now);
       } else if (state === 'active') {
-        await this.tickCompanionFollow(companionId, companionEntity, zm, zoneId);
+        await this.tickCompanionFollow(companionId, companionEntity, zm, zoneId, deltaTime);
       }
       // 'detached' — do nothing
     }
@@ -8815,7 +9328,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
             };
             const resolved = physics.resolveAgainstStructures(newPos, 0.5);
             const snapped = zm.updateCompanionPosition(companionId, resolved, heading);
-            void this.broadcastPositionUpdate(companionId, zoneId, snapped);
+            void this.broadcastPositionUpdate(companionId, zoneId, snapped, 5.0, 75);
           }
         }
         break;
@@ -8851,6 +9364,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     companionEntity: ReturnType<ZoneManager['getEntity']> & {},
     zm: ZoneManager,
     zoneId: string,
+    deltaTime: number,
   ): Promise<void> {
     const controller = this.npcControllers.get(companionId);
     if (!controller) return;
@@ -8870,8 +9384,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
     if (dist > 5.0) {
       // Slightly faster than owner so the companion catches up instead of drifting behind
       const ownerSpeed = this.movementSystem.getMovementSpeed(ownerCharId) ?? 5.0;
-      const speed = (ownerSpeed * 1.15) * 0.05; // +15% to close gaps; * ~50ms tick
-      const step = Math.min(speed, dist);
+      const speed = ownerSpeed * 1.15; // +15% to close gaps
+      const step = Math.min(speed * deltaTime, dist);
       const physics = zm.getPhysicsSystem();
 
       // Steer around buildings
@@ -8888,7 +9402,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       };
       const resolved = physics.resolveAgainstStructures(newPos, 0.5);
       const snapped = zm.updateCompanionPosition(companionId, resolved, heading);
-      void this.broadcastPositionUpdate(companionId, zoneId, snapped);
+      void this.broadcastPositionUpdate(companionId, zoneId, snapped, speed, 150);
     }
   }
 
@@ -9931,6 +10445,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const data: ZoneCorruptionData[] = [];
 
     for (const [zoneId, zoneManager] of this.zones.entries()) {
+      // Villages are safe havens — skip corruption entirely.
+      // No zone gain, no isolation gain, no wealth gain. Corruption stays flat.
+      if (zoneId.startsWith('village:')) continue;
+
       const corruptionTag = this.zoneCorruptionTags.get(zoneId) || 'WILDS';
       const characterIds: string[] = [];
       const characterPositions = new Map<string, { x: number; z: number }>();
@@ -10579,6 +11097,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
         ...(e.currentHealth !== undefined && e.maxHealth !== undefined && {
           health: { current: e.currentHealth, max: e.maxHealth },
         }),
+        // Per-entity interactive override (dungeon entrances, clickable fixtures)
+        ...(e.interactive  !== undefined && { interactive:  e.interactive }),
+        // GLB model asset path for 3D clients
+        ...(e.modelAsset   !== undefined && { modelAsset:   e.modelAsset }),
+        ...(e.modelScale   !== undefined && { modelScale:   e.modelScale }),
       }));
     await this.zoneRegistry.setZoneEntities(zoneId, entities);
   }
