@@ -1460,11 +1460,14 @@ export class GatewayClientSession {
 
     logger.info(`Character ${this.characterId} entering world`);
 
-    // If the character is stuck in a village zone whose ephemeral instance is
-    // gone (e.g. server restart), restore them to their saved return point.
-    // Skip this if the village instance is still live (active zone transfer).
+    // If the character is stuck in an ephemeral zone (village/vault) whose
+    // instance is gone (e.g. server restart), restore them to their saved
+    // return point.  Skip this if the instance is still live (active zone transfer).
     const preCheck = await CharacterService.findById(this.characterId);
-    if (preCheck && preCheck.zoneId.startsWith('village:')) {
+    const isEphemeralZone = preCheck && (
+      preCheck.zoneId.startsWith('village:') || preCheck.zoneId.startsWith('vault:')
+    );
+    if (preCheck && isEphemeralZone) {
       const villageLive = await this.zoneRegistry.getZoneAssignment(preCheck.zoneId);
       const serverAlive = villageLive
         ? await this.zoneRegistry.isServerAlive(villageLive.serverId)
@@ -1476,7 +1479,7 @@ export class GatewayClientSession {
         }
         if (preCheck.returnZoneId) {
           logger.info({ characterId: this.characterId, from: preCheck.zoneId, to: preCheck.returnZoneId },
-            'Restoring character from stale village zone to return point');
+            'Restoring character from stale ephemeral zone to return point');
           await VillageService.updateCharacterZone(
             this.characterId, preCheck.returnZoneId,
             preCheck.returnPositionX ?? 0, preCheck.returnPositionY ?? 0, preCheck.returnPositionZ ?? 0,

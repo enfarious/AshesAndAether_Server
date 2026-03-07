@@ -6620,7 +6620,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     // Determine destination — if in a village/vault instance, transfer back to
     // the main world zone.  Otherwise teleport to the zone's city/starter spawn.
-    const destZoneId = VillageService.isVillageZone(zoneId)
+    const isEphemeral = VillageService.isVillageZone(zoneId) || VaultManager.isVaultZone(zoneId);
+    const destZoneId = isEphemeral
       ? 'USA_NY_Stephentown'
       : zoneId;
 
@@ -6628,7 +6629,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       ?? SpawnPointService.getStarterSpawn(destZoneId);
     const dest = spawn?.position ?? { x: 12, y: 265, z: -18 };
 
-    if (VillageService.isVillageZone(zoneId)) {
+    if (isEphemeral) {
       // Zone transfer: update DB, clear return point, trigger client reconnect
       await VillageService.updateCharacterZone(
         characterId, destZoneId, dest.x, dest.y, dest.z,
