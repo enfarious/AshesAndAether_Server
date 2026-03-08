@@ -2,15 +2,19 @@
  * /companion command — Player companion control.
  *
  * Subcommands:
- *   status   — Show companion mode, task, and harvest stats
- *   follow   — Enter ACTIVE mode, companion follows player
- *   detach   — Enter DETACHED mode, companion idles
- *   task <d> — Enter TASKED mode, LLM generates behavior tree from description
- *   harvest  — Enter TASKED mode with the default harvest tree (no LLM call)
- *   recall   — Navigate to player and enter ACTIVE mode
- *   report   — LLM summarizes recent activity
- *   next     — Cycle to next companion (legacy)
- *   prev     — Cycle to previous companion (legacy)
+ *   status     — Show companion mode, task, and harvest stats
+ *   follow     — Enter ACTIVE mode, companion follows player
+ *   detach     — Enter DETACHED mode, companion idles
+ *   task <d>   — Enter TASKED mode, LLM generates behavior tree from description
+ *   harvest    — Enter TASKED mode with the default harvest tree (no LLM call)
+ *   recall     — Navigate to player and enter ACTIVE mode
+ *   report     — LLM summarizes recent activity
+ *   archetype  — Set companion archetype
+ *   configure  — Adjust combat settings
+ *   abilities  — View/manage active ability loadout
+ *   passives   — View/manage passive ability loadout
+ *   config     — View current companion config
+ *   next/prev  — Cycle companions (legacy)
  */
 
 import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } from '@/commands/types';
@@ -19,13 +23,13 @@ const VALID_ARCHETYPES = new Set(['scrappy_fighter', 'cautious_healer', 'opportu
 
 const SUBCOMMANDS = new Set([
   'status', 'follow', 'detach', 'task', 'harvest', 'recall', 'report', 'next', 'prev',
-  'archetype', 'configure', 'abilities', 'config',
+  'archetype', 'configure', 'abilities', 'passives', 'config',
 ]);
 
 export const companionCommand: CommandDefinition = {
   name: 'companion',
   aliases: ['comp'],
-  description: 'Control your companion — follow, detach, task, harvest, recall, report, status',
+  description: 'Control your companion — follow, detach, task, harvest, recall, report, status, abilities, passives',
   category: 'world',
   usage: '/companion <subcommand> [args]',
   examples: [
@@ -36,6 +40,11 @@ export const companionCommand: CommandDefinition = {
     '/companion harvest',
     '/companion recall',
     '/companion report',
+    '/companion abilities',
+    '/companion abilities slot 0 active_tank_t1',
+    '/companion abilities unslot 3',
+    '/companion passives',
+    '/companion passives slot 0 passive_tank_t1',
   ],
 
   parameters: {
@@ -54,7 +63,7 @@ export const companionCommand: CommandDefinition = {
     if (!rawInput) {
       return {
         success: false,
-        error: 'Usage: /companion <status|follow|detach|task|harvest|recall|report>',
+        error: 'Usage: /companion <status|follow|detach|task|harvest|recall|report|abilities|passives>',
       };
     }
 
@@ -192,18 +201,110 @@ export const companionCommand: CommandDefinition = {
         };
       }
 
+      // ── Active ability loadout management ────────────────────────────────
+
       case 'abilities': {
         if (!rest) {
+          // No args — view current active loadout
           return {
-            success: false,
-            error: 'Usage: /companion abilities <id,id,...>  e.g. /companion abilities provoke,mend',
+            success: true,
+            message: 'Viewing companion active loadout...',
+            events: [{ type: 'companion_view_active_loadout', data: {} }],
           };
         }
+
+        const parts = rest.split(/\s+/);
+        const action = parts[0]?.toLowerCase();
+
+        if (action === 'slot') {
+          const slotIndex = parseInt(parts[1] ?? '', 10);
+          const nodeId = parts[2];
+          if (isNaN(slotIndex) || !nodeId) {
+            return {
+              success: false,
+              error: 'Usage: /companion abilities slot <index 0-7> <nodeId>',
+            };
+          }
+          return {
+            success: true,
+            message: `Slotting ${nodeId} into active slot ${slotIndex}...`,
+            events: [{ type: 'companion_slot_active', data: { slotIndex, nodeId } }],
+          };
+        }
+
+        if (action === 'unslot') {
+          const slotIndex = parseInt(parts[1] ?? '', 10);
+          if (isNaN(slotIndex)) {
+            return {
+              success: false,
+              error: 'Usage: /companion abilities unslot <index 0-7>',
+            };
+          }
+          return {
+            success: true,
+            message: `Clearing active slot ${slotIndex}...`,
+            events: [{ type: 'companion_unslot_active', data: { slotIndex } }],
+          };
+        }
+
+        // Legacy: comma-separated ability IDs
         const abilityIds = rest.split(',').map(s => s.trim()).filter(Boolean);
         return {
           success: true,
           message: 'Updating companion abilities...',
           events: [{ type: 'companion_set_abilities', data: { abilityIds } }],
+        };
+      }
+
+      // ── Passive ability loadout management ──────────────────────────────
+
+      case 'passives': {
+        if (!rest) {
+          // No args — view current passive loadout
+          return {
+            success: true,
+            message: 'Viewing companion passive loadout...',
+            events: [{ type: 'companion_view_passive_loadout', data: {} }],
+          };
+        }
+
+        const parts = rest.split(/\s+/);
+        const action = parts[0]?.toLowerCase();
+
+        if (action === 'slot') {
+          const slotIndex = parseInt(parts[1] ?? '', 10);
+          const nodeId = parts[2];
+          if (isNaN(slotIndex) || !nodeId) {
+            return {
+              success: false,
+              error: 'Usage: /companion passives slot <index 0-7> <nodeId>',
+            };
+          }
+          return {
+            success: true,
+            message: `Slotting ${nodeId} into passive slot ${slotIndex}...`,
+            events: [{ type: 'companion_slot_passive', data: { slotIndex, nodeId } }],
+          };
+        }
+
+        if (action === 'unslot') {
+          const slotIndex = parseInt(parts[1] ?? '', 10);
+          if (isNaN(slotIndex)) {
+            return {
+              success: false,
+              error: 'Usage: /companion passives unslot <index 0-7>',
+            };
+          }
+          return {
+            success: true,
+            message: `Clearing passive slot ${slotIndex}...`,
+            events: [{ type: 'companion_unslot_passive', data: { slotIndex } }],
+          };
+        }
+
+        return {
+          success: false,
+          error: 'Usage: /companion passives [slot <index> <nodeId> | unslot <index>]',
         };
       }
 

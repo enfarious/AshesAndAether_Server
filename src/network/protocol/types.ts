@@ -449,7 +449,9 @@ export interface EntityUpdates {
 export interface StatusEffect {
   id: string;
   name: string;
-  duration: number;
+  duration: number;              // remaining seconds
+  type?: 'buff' | 'debuff';     // display coloring; defaults to 'buff'
+  description?: string;          // hover tooltip text
 }
 
 // ── Enmity list (threat indicator for combat HUD) ──────────────────────────

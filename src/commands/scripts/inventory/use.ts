@@ -10,6 +10,11 @@ type ItemEffect =
   | { type: 'stamina'; amount: number }
   | { type: 'mana'; amount: number };
 
+// ── Potion cooldown tracking ───────────────────────────────────────────────
+// Key: "characterId:consumableType" → timestamp of last use (ms)
+const potionCooldowns = new Map<string, number>();
+const DEFAULT_POTION_COOLDOWN_S = 15;
+
 export const useCommand: CommandDefinition = {
   name: 'use',
   aliases: ['item'],
@@ -79,13 +84,34 @@ export const useCommand: CommandDefinition = {
       };
     }
 
-    const properties = inventoryItem.template.properties as { effect?: ItemEffect } | null;
+    const properties = inventoryItem.template.properties as {
+      effect?: ItemEffect;
+      consumableType?: string;
+      cooldown?: number;
+    } | null;
     const effect = properties?.effect;
     if (!effect || typeof effect.amount !== 'number' || effect.amount <= 0) {
       return {
         success: false,
         error: `Item '${inventoryItem.template.name}' cannot be used yet.`,
       };
+    }
+
+    // ── Cooldown check ───────────────────────────────────────────────────
+    const consumableType = properties?.consumableType ?? inventoryItem.template.itemType;
+    const cooldownSeconds = properties?.cooldown ?? DEFAULT_POTION_COOLDOWN_S;
+    const cdKey = `${context.characterId}:${consumableType}`;
+    const lastUsed = potionCooldowns.get(cdKey);
+    if (lastUsed !== undefined) {
+      const elapsedMs = Date.now() - lastUsed;
+      const cooldownMs = cooldownSeconds * 1000;
+      if (elapsedMs < cooldownMs) {
+        const remainingS = Math.ceil((cooldownMs - elapsedMs) / 1000);
+        return {
+          success: false,
+          error: `${inventoryItem.template.name} is on cooldown (${remainingS}s remaining).`,
+        };
+      }
     }
 
     const character = await prisma.character.findUnique({
@@ -148,6 +174,9 @@ export const useCommand: CommandDefinition = {
         });
       }
     });
+
+    // Record cooldown timestamp after successful use
+    potionCooldowns.set(cdKey, Date.now());
 
     return {
       success: true,

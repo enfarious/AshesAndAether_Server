@@ -1,4 +1,5 @@
 import type { CombatAbilityDefinition } from '@/combat/types';
+import type { EnmityTable } from '@/combat/EnmityTable';
 import type { CompanionCombatSettings } from './CompanionCombatSettings';
 import { RANGE_DISTANCES } from './CompanionCombatSettings';
 
@@ -92,6 +93,8 @@ export interface CombatContext {
   currentStamina: number;
   /** Max stamina pool (for resource reserve calculations). */
   maxStamina: number;
+  /** Enmity table for threat-aware target selection (optional). */
+  enmityTable?: EnmityTable;
 }
 
 // ── Movement speed ───────────────────────────────────────────────────────────
@@ -375,7 +378,20 @@ export class CompanionBehaviorTree {
 
       case 'threatening_player': {
         if (!context.owner) return this.findNearest(context.self.position, alive) ?? alive[0];
-        // Find enemy closest to the player (most threatening)
+        // Pick enemy with highest threat toward owner (from enmity table)
+        if (context.enmityTable) {
+          let highestThreat = 0;
+          let mostThreatening: CombatEntity | null = null;
+          for (const enemy of alive) {
+            const threat = context.enmityTable.getThreat(enemy.id, context.owner.id);
+            if (threat > highestThreat) {
+              highestThreat = threat;
+              mostThreatening = enemy;
+            }
+          }
+          if (mostThreatening) return mostThreatening;
+        }
+        // Fallback: nearest to player
         return this.findNearest(context.owner.position, alive) ?? alive[0];
       }
 

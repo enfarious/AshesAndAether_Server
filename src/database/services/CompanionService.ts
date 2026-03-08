@@ -118,6 +118,29 @@ export class CompanionService {
     });
   }
 
+  static async updateLevel(
+    companionId: string,
+    level: number,
+    stats: Prisma.InputJsonValue,
+    maxHealth: number,
+    currentHealth: number,
+  ): Promise<void> {
+    await prisma.companion.update({
+      where: { id: companionId },
+      data: { level, stats, maxHealth, currentHealth },
+    });
+  }
+
+  static async updateLoadouts(
+    companionId: string,
+    data: { activeLoadout?: Prisma.InputJsonValue; passiveLoadout?: Prisma.InputJsonValue },
+  ): Promise<void> {
+    await prisma.companion.update({
+      where: { id: companionId },
+      data,
+    });
+  }
+
   static async updateCombatConfig(
     companionId: string,
     data: { archetype?: string; combatSettings?: Prisma.InputJsonValue; abilityIds?: string[] },

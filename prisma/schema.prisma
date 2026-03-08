@@ -252,6 +252,8 @@ model Companion {
   // Combat AI
   archetype      String @default("opportunist") // scrappy_fighter | cautious_healer | opportunist | tank
   combatSettings Json?                          // Persisted last-known CompanionCombatSettings (optional, for resuming)
+  activeLoadout  Json?                          // { slots: (nodeId | null)[] } — 8 active ability slots (T1-T3 only)
+  passiveLoadout Json?                          // { slots: (nodeId | null)[] } — 8 passive ability slots (T1-T3 only)
 
   // Ownership (null = server NPC)
   ownerAccountId   String?

@@ -1,4 +1,5 @@
-import { CombatantState, ATB_DEFAULT_MAX, ATB_ABSOLUTE_MAX, SPECIAL_CHARGE_MAX, QueuedCombatAction, ActiveBuff, CombatStats } from './types';
+import { CombatantState, CombatAbilityDefinition, ATB_DEFAULT_MAX, ATB_ABSOLUTE_MAX, SPECIAL_CHARGE_MAX, QueuedCombatAction, ActiveBuff, CombatStats, CombatUpdateResult } from './types';
+import { EnmityTable, EnmityConfig } from './EnmityTable';
 
 const DEFAULT_ATB_BASE_RATE = 10; // gauge per second
 const DEFAULT_COMBAT_TIMEOUT_MS = 15000;
@@ -9,10 +10,12 @@ export class CombatManager {
   private queuedActions: QueuedCombatAction[] = [];
   private readonly baseRate: number;
   private readonly timeoutMs: number;
+  private readonly enmityTable: EnmityTable;
 
-  constructor(options?: { baseRate?: number; timeoutMs?: number }) {
+  constructor(options?: { baseRate?: number; timeoutMs?: number; enmityConfig?: Partial<EnmityConfig> }) {
     this.baseRate = options?.baseRate ?? DEFAULT_ATB_BASE_RATE;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_COMBAT_TIMEOUT_MS;
+    this.enmityTable = new EnmityTable(options?.enmityConfig);
   }
 
   ensureCombatant(entityId: string, now: number): CombatantState {
@@ -29,6 +32,9 @@ export class CombatManager {
         weaponSpeed: DEFAULT_WEAPON_SPEED,
         specialCharges: new Map(),
         activeBuffs: [],
+        threatMultiplier: 1.0,
+        threatShedRate: 1.0,
+        healPotencyMult: 1.0,
       };
       this.combatants.set(entityId, state);
     }
@@ -48,9 +54,11 @@ export class CombatManager {
     state.lastHostileAt = now;
   }
 
-  update(deltaTime: number, getAttackSpeedBonus: (entityId: string) => number): string[] {
+  update(deltaTime: number, getAttackSpeedBonus: (entityId: string) => number): CombatUpdateResult {
     const now = Date.now();
-    const expired: string[] = [];
+    const expiredCombatants: string[] = [];
+    const expiredBuffs: Array<{ entityId: string; buff: ActiveBuff }> = [];
+    const buffTicks: Array<{ entityId: string; buff: ActiveBuff }> = [];
 
     for (const state of this.combatants.values()) {
       // Update auto-attack timer (separate from ATB)
@@ -69,13 +77,32 @@ export class CombatManager {
         if (now - state.lastHostileAt >= this.timeoutMs) {
           state.inCombat = false;
           state.autoAttackTimer = 0;
-          expired.push(state.entityId);
+          expiredCombatants.push(state.entityId);
         }
       }
 
-      // Expire buffs
+      // Process DoT/HoT ticks on active buffs
+      for (const buff of state.activeBuffs) {
+        if (buff.expiresAt <= now) continue;
+        if (!buff.tickDamage && !buff.tickHeal) continue;
+        const interval = buff.tickIntervalMs ?? 1000;
+        if (buff.lastTickAt && now - buff.lastTickAt >= interval) {
+          buff.lastTickAt = now;
+          buffTicks.push({ entityId: state.entityId, buff });
+        }
+      }
+
+      // Expire buffs — collect expired ones before filtering
       if (state.activeBuffs.length > 0) {
-        state.activeBuffs = state.activeBuffs.filter(b => b.expiresAt > now);
+        const stillActive: ActiveBuff[] = [];
+        for (const b of state.activeBuffs) {
+          if (b.expiresAt > now) {
+            stillActive.push(b);
+          } else {
+            expiredBuffs.push({ entityId: state.entityId, buff: b });
+          }
+        }
+        state.activeBuffs = stillActive;
       }
 
       // Expire taunt
@@ -97,7 +124,29 @@ export class CombatManager {
       }
     }
 
-    return expired;
+    // ── Enmity: decay all threat tables ──
+    this.enmityTable.decayAll(deltaTime, (entityId) => {
+      const s = this.combatants.get(entityId);
+      return s?.threatShedRate ?? 1.0;
+    });
+
+    // ── Enmity: evaluate target switches for mobs with threat tables ──
+    const targetSwitches: Array<{ mobId: string; newTargetId: string; previousTargetId?: string }> = [];
+    for (const mobId of this.enmityTable.getAllMobIds()) {
+      const mobState = this.combatants.get(mobId);
+      if (!mobState?.inCombat) continue;
+      // Taunt overrides threat-based targeting
+      if (mobState.tauntedBy) continue;
+
+      const currentTarget = mobState.autoAttackTarget;
+      const newTarget = this.enmityTable.evaluateTarget(mobId, currentTarget);
+      if (newTarget && newTarget !== currentTarget) {
+        mobState.autoAttackTarget = newTarget;
+        targetSwitches.push({ mobId, newTargetId: newTarget, previousTargetId: currentTarget });
+      }
+    }
+
+    return { expiredCombatants, expiredBuffs, buffTicks, targetSwitches };
   }
 
   canSpendAtb(entityId: string, cost: number): boolean {
@@ -419,6 +468,10 @@ export class CombatManager {
 
   addBuff(entityId: string, buff: ActiveBuff): void {
     const state = this.ensureCombatant(entityId, Date.now());
+    // Initialize tick timer for DoT/HoT buffs so first tick fires after one interval
+    if ((buff.tickDamage || buff.tickHeal) && buff.lastTickAt == null) {
+      buff.lastTickAt = Date.now();
+    }
     state.activeBuffs.push(buff);
   }
 
@@ -492,6 +545,19 @@ export class CombatManager {
     state.tauntExpiresAt = undefined;
   }
 
+  /** Get active CC state with expiry timestamps (for effect serialization). */
+  getCCState(entityId: string): { tauntExpiresAt?: number; rootExpiresAt?: number } {
+    const state = this.combatants.get(entityId);
+    if (!state) return {};
+    const now = Date.now();
+    return {
+      tauntExpiresAt: (state.tauntedBy && state.tauntExpiresAt && state.tauntExpiresAt > now)
+        ? state.tauntExpiresAt : undefined,
+      rootExpiresAt: (state.rooted && state.rootExpiresAt && state.rootExpiresAt > now)
+        ? state.rootExpiresAt : undefined,
+    };
+  }
+
   getTauntedBy(entityId: string): string | undefined {
     const state = this.combatants.get(entityId);
     if (!state || !state.tauntedBy) return undefined;
@@ -543,5 +609,62 @@ export class CombatManager {
       return true;
     }
     return false;
+  }
+
+  // ========== Enmity / Threat Methods ==========
+
+  getEnmityTable(): EnmityTable {
+    return this.enmityTable;
+  }
+
+  /** Generate threat from damage dealt. Applies the source entity's threatMultiplier. */
+  generateDamageThreat(mobId: string, sourceId: string, damageAmount: number): void {
+    const source = this.combatants.get(sourceId);
+    const multiplier = source?.threatMultiplier ?? 1.0;
+    this.enmityTable.addDamageThreat(mobId, sourceId, damageAmount, multiplier);
+  }
+
+  /** Generate threat from healing done. Applies the healer's threatMultiplier. */
+  generateHealingThreat(mobId: string, healerId: string, healAmount: number): void {
+    const healer = this.combatants.get(healerId);
+    const multiplier = healer?.threatMultiplier ?? 1.0;
+    this.enmityTable.addHealingThreat(mobId, healerId, healAmount, multiplier);
+  }
+
+  /** Generate flat threat (buffs, proximity, misc). Applies source's threatMultiplier. */
+  generateFlatThreat(mobId: string, sourceId: string, amount: number): void {
+    const source = this.combatants.get(sourceId);
+    const multiplier = source?.threatMultiplier ?? 1.0;
+    this.enmityTable.addFlatThreat(mobId, sourceId, amount, multiplier);
+  }
+
+  /** Generate ability-specific threat using the ability's threatModifier on top of entity multiplier. */
+  generateAbilityThreat(mobId: string, sourceId: string, ability: CombatAbilityDefinition, baseThreat: number): void {
+    const source = this.combatants.get(sourceId);
+    const entityMultiplier = source?.threatMultiplier ?? 1.0;
+    const abilityMultiplier = ability.threatModifier?.multiplier ?? 1.0;
+    const flatBonus = ability.threatModifier?.flatBonus ?? 0;
+    const totalThreat = (baseThreat * abilityMultiplier + flatBonus) * entityMultiplier;
+    this.enmityTable.addRawThreat(mobId, sourceId, totalThreat);
+  }
+
+  setThreatMultiplier(entityId: string, multiplier: number): void {
+    const state = this.ensureCombatant(entityId, Date.now());
+    state.threatMultiplier = multiplier;
+  }
+
+  setThreatShedRate(entityId: string, rate: number): void {
+    const state = this.ensureCombatant(entityId, Date.now());
+    state.threatShedRate = rate;
+  }
+
+  setHealPotencyMult(entityId: string, mult: number): void {
+    const state = this.ensureCombatant(entityId, Date.now());
+    state.healPotencyMult = mult;
+  }
+
+  getHealPotencyMult(entityId: string): number {
+    const state = this.combatants.get(entityId);
+    return state?.healPotencyMult ?? 1.0;
   }
 }

@@ -7,7 +7,10 @@ import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
 import { NPCAIController, LLMService, getBaselineForArchetype, mergePartialSettings } from '@/ai';
 import type { CompanionCombatSettings } from '@/ai';
-import { T1_ABILITIES } from '@/combat/AbilityData';
+import { T1_ABILITIES, resolveAbilitiesFromLoadout } from '@/combat/AbilityData';
+import { ARCHETYPE_MODIFIERS } from '@/ai/CompanionArchetypeModifiers';
+import type { CompanionArchetype } from '@/ai/CompanionCombatSettings';
+import { canCompanionSlotActive, canCompanionSlotPassive } from '@/ai/CompanionAbilityValidator';
 import { BehaviorTreeExecutor, type BehaviorNode, type BehaviorAction } from '@/ai/behaviors/BehaviorTreeExecutor';
 import { type ConditionContext, type PlantInfo } from '@/ai/behaviors/ConditionEvaluator';
 import { DEFAULT_HARVEST_TREE } from '@/ai/behaviors/HarvestBehavior';
@@ -30,13 +33,15 @@ import {
   getNodeInfo,
   listWebNodes,
   parsePassiveLoadout,
+  loadAbilityState,
+  getNode,
 } from '@/game/abilities/tree';
 import { PASSIVE_WEB_MAP } from '@/game/abilities/tree/PassiveWeb';
 import { CombatManager } from '@/combat/CombatManager';
 import { AbilitySystem } from '@/combat/AbilitySystem';
 import { DamageCalculator } from '@/combat/DamageCalculator';
 import { buildCombatNarrative } from '@/combat/CombatNarratives';
-import type { CombatAbilityDefinition, CombatStats, DamageProfileSegment, PhysicalDamageType } from '@/combat/types';
+import type { ActiveBuff, CombatAbilityDefinition, CombatStats, DamageProfileSegment, PhysicalDamageType } from '@/combat/types';
 import type { DamageType } from '@/game/abilities/AbilityTypes';
 import type { MovementSpeed, Vector3 } from '@/network/protocol/types';
 import { WildlifeManager, getSpecies, type BiomeType } from '@/wildlife';
@@ -848,6 +853,20 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     zm.addCompanion(companion);
 
+    // ── Level sync: companion always matches owner ──────────────────────
+    const ownerCharId = companion.ownerCharacterId;
+    let ownerLevel = ownerCharId ? this._charLevel.get(ownerCharId) : undefined;
+    if (!ownerLevel && ownerCharId) {
+      // Fallback: load from DB if not cached
+      try {
+        const ownerChar = await prisma.character.findUnique({ where: { id: ownerCharId }, select: { level: true } });
+        if (ownerChar) ownerLevel = ownerChar.level;
+      } catch { /* ignore */ }
+    }
+    if (ownerLevel && companion.level !== ownerLevel) {
+      await this.syncCompanionLevel(companion, ownerLevel, zm);
+    }
+
     // Compute max mana/stamina from companion stats so the HUD can show resource bars
     const compStats = (companion.stats as Record<string, number>) || {};
     const derived = StatCalculator.calculateDerivedStats({
@@ -855,35 +874,156 @@ export class DistributedWorldManager implements IWildlifeWorld {
       dexterity: compStats.dexterity ?? 10, agility: compStats.agility ?? 10,
       intelligence: compStats.intelligence ?? 10, wisdom: compStats.wisdom ?? 10,
     }, companion.level);
+
+    // ── Archetype modifiers: apply stat buffs/debuffs ───────────────────
+    const archetype = (companion.archetype ?? 'opportunist') as CompanionArchetype;
+    const archetypeMod = ARCHETYPE_MODIFIERS[archetype] ?? ARCHETYPE_MODIFIERS.opportunist;
+    const mods = archetypeMod.statMods;
+
+    // Apply HP bonus from archetype and update zone entity
+    const archetypeHpBonus = mods.maxHp ?? 0;
+    if (archetypeHpBonus !== 0) {
+      const adjustedMaxHp = companion.maxHealth + archetypeHpBonus;
+      const adjustedCurrentHp = Math.min(companion.currentHealth + archetypeHpBonus, adjustedMaxHp);
+      zm.setEntityHealth(companion.id, adjustedCurrentHp, adjustedMaxHp);
+    }
+
     zm.setEntityResources(companion.id, {
       currentMana: derived.maxMana, maxMana: derived.maxMana,
       currentStamina: derived.maxStamina, maxStamina: derived.maxStamina,
     });
 
-    const controller = new NPCAIController(companion, this.llmService);
-    // Wire abilities — use saved DB list, or assign defaults if empty
-    let abilityIds = companion.abilityIds ?? [];
-    if (abilityIds.length === 0) {
-      // Every companion gets mend (healing) plus archetype-appropriate abilities
-      const archetype = companion.archetype ?? 'opportunist';
-      const defaultAbilities: Record<string, string[]> = {
-        scrappy_fighter: ['mend', 'power_strike'],
-        cautious_healer: ['mend', 'embolden'],
-        opportunist:     ['mend', 'shadow_bolt', 'ensnare'],
-        tank:            ['mend', 'provoke'],
-      };
-      abilityIds = defaultAbilities[archetype] ?? ['mend'];
-      // Persist so we don't re-derive next time
-      void CompanionService.updateCombatConfig(companion.id, { abilityIds });
-      logger.info({ companionId: companion.id, archetype, abilityIds }, 'Assigned default abilities to companion');
+    // Apply threat and heal potency multipliers to combat state
+    if (mods.threatMultiplier !== undefined) {
+      this.combatManager.setThreatMultiplier(companion.id, mods.threatMultiplier);
     }
-    const resolved = T1_ABILITIES.filter(a => abilityIds.includes(a.id));
-    if (resolved.length > 0) controller.setAbilities(resolved);
+    if (mods.healPotencyMult !== undefined) {
+      this.combatManager.setHealPotencyMult(companion.id, mods.healPotencyMult);
+    }
+
+    const controller = new NPCAIController(companion, this.llmService);
+
+    // ── Ability resolution: loadout > legacy abilityIds > archetype defaults ──
+    const companionActiveLoadout = companion.activeLoadout as { slots: (string | null)[] } | null;
+    let resolvedAbilities: CombatAbilityDefinition[] = [];
+
+    if (companionActiveLoadout?.slots?.some(s => s !== null)) {
+      // Use the companion's active loadout to resolve abilities
+      resolvedAbilities = resolveAbilitiesFromLoadout(companionActiveLoadout.slots);
+    } else {
+      // Fall back to legacy abilityIds or archetype defaults
+      let abilityIds = companion.abilityIds ?? [];
+      if (abilityIds.length === 0) {
+        const defaultAbilities: Record<string, string[]> = {
+          scrappy_fighter: ['mend', 'power_strike'],
+          cautious_healer: ['mend', 'embolden'],
+          opportunist:     ['mend', 'shadow_bolt', 'ensnare'],
+          tank:            ['mend', 'provoke'],
+        };
+        abilityIds = defaultAbilities[archetype] ?? ['mend'];
+        void CompanionService.updateCombatConfig(companion.id, { abilityIds });
+        logger.info({ companionId: companion.id, archetype, abilityIds }, 'Assigned default abilities to companion');
+      }
+      resolvedAbilities = T1_ABILITIES.filter(a => abilityIds.includes(a.id));
+    }
+
+    if (resolvedAbilities.length > 0) controller.setAbilities(resolvedAbilities);
     this.npcControllers.set(companion.id, controller);
     this.companionToZone.set(companion.id, zoneId);
 
     void this.publishZoneEntities(zoneId, zm);
-    logger.info({ companionId: companion.id, name: companion.name, zoneId }, 'Player companion registered in running zone');
+    logger.info({
+      companionId: companion.id, name: companion.name, zoneId,
+      level: companion.level, archetype, archetypeBuff: archetypeMod.label,
+    }, 'Player companion registered in running zone');
+  }
+
+  /**
+   * Sync a companion's level and stats to match a target level.
+   * Scales core stats proportionally and recomputes derived stats.
+   */
+  private async syncCompanionLevel(companion: Companion, targetLevel: number, zm: ZoneManager): Promise<void> {
+    const currentStats = (companion.stats as Record<string, number>) || {};
+    // Base stats at level 1, then +2 per level for each core stat
+    const baseStats = {
+      strength:     (currentStats.strength ?? 8),
+      vitality:     (currentStats.vitality ?? 10),
+      dexterity:    (currentStats.dexterity ?? 10),
+      agility:      (currentStats.agility ?? 10),
+      intelligence: (currentStats.intelligence ?? 8),
+      wisdom:       (currentStats.wisdom ?? 8),
+    };
+    // Scale: each stat gets +2 per level beyond 1
+    const levelBonus = (targetLevel - 1) * 2;
+    const scaledStats = {
+      strength:     baseStats.strength + levelBonus,
+      vitality:     baseStats.vitality + levelBonus,
+      dexterity:    baseStats.dexterity + levelBonus,
+      agility:      baseStats.agility + levelBonus,
+      intelligence: baseStats.intelligence + levelBonus,
+      wisdom:       baseStats.wisdom + levelBonus,
+    };
+    const derived = StatCalculator.calculateDerivedStats(scaledStats, targetLevel);
+    const newMaxHealth = derived.maxHp;
+    // Scale current HP proportionally
+    const hpRatio = companion.maxHealth > 0 ? companion.currentHealth / companion.maxHealth : 1;
+    const newCurrentHealth = Math.max(1, Math.round(newMaxHealth * hpRatio));
+
+    // Update DB
+    await CompanionService.updateLevel(companion.id, targetLevel, scaledStats, newMaxHealth, newCurrentHealth);
+
+    // Update in-memory companion object
+    (companion as { level: number }).level = targetLevel;
+    (companion as { stats: Record<string, number> }).stats = scaledStats;
+    (companion as { maxHealth: number }).maxHealth = newMaxHealth;
+    (companion as { currentHealth: number }).currentHealth = newCurrentHealth;
+
+    // Update zone entity
+    const entity = zm.getEntity(companion.id);
+    if (entity) {
+      (entity as { level: number }).level = targetLevel;
+      (entity as { currentHealth: number }).currentHealth = newCurrentHealth;
+      (entity as { maxHealth: number }).maxHealth = newMaxHealth;
+    }
+
+    logger.info({
+      companionId: companion.id, oldLevel: companion.level, newLevel: targetLevel,
+    }, 'Companion level synced to owner');
+  }
+
+  /**
+   * When a player levels up, find their companion and sync its level.
+   */
+  private async syncCompanionOnLevelUp(characterId: string, newLevel: number): Promise<void> {
+    // Find companion by iterating companionToZone and checking ownership
+    for (const [companionId, zoneId] of this.companionToZone.entries()) {
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+      const entity = zm.getEntity(companionId);
+      if (!entity || entity.type !== 'companion') continue;
+
+      // Look up the companion's owner
+      const comp = zm.getCompanions().find(c => c.id === companionId);
+      if (!comp) continue;
+
+      // We need to load the companion from DB to check ownership
+      const companion = await CompanionService.findById(companionId);
+      if (!companion || companion.ownerCharacterId !== characterId) continue;
+      if (companion.level >= newLevel) continue;
+
+      await this.syncCompanionLevel(companion, newLevel, zm);
+
+      // Notify owner
+      await this._sendToSocket(characterId, 'event', {
+        eventType: 'companion_level_up',
+        level: newLevel,
+        message: `Your companion has reached level ${newLevel}!`,
+      });
+
+      // Update the entity in the zone for HUD display
+      void this.publishZoneEntities(zoneId, zm);
+      break; // One companion per character
+    }
   }
 
   private async handleCompanionSpawn(message: MessageEnvelope): Promise<void> {
@@ -2458,6 +2598,36 @@ export class DistributedWorldManager implements IWildlifeWorld {
         }
         case 'companion_get_config': {
           overrideResponse = await this.processCompanionGetConfig(context.characterId);
+          break;
+        }
+
+        // ── Companion loadout management ────────────────────────────────
+        case 'companion_view_active_loadout': {
+          overrideResponse = await this.processCompanionViewLoadout(context.characterId, 'active');
+          break;
+        }
+        case 'companion_view_passive_loadout': {
+          overrideResponse = await this.processCompanionViewLoadout(context.characterId, 'passive');
+          break;
+        }
+        case 'companion_slot_active': {
+          const { slotIndex, nodeId } = event.data as { slotIndex: number; nodeId: string };
+          overrideResponse = await this.processCompanionSlotAbility(context.characterId, 'active', slotIndex, nodeId);
+          break;
+        }
+        case 'companion_slot_passive': {
+          const { slotIndex, nodeId } = event.data as { slotIndex: number; nodeId: string };
+          overrideResponse = await this.processCompanionSlotAbility(context.characterId, 'passive', slotIndex, nodeId);
+          break;
+        }
+        case 'companion_unslot_active': {
+          const { slotIndex } = event.data as { slotIndex: number };
+          overrideResponse = await this.processCompanionUnslotAbility(context.characterId, 'active', slotIndex);
+          break;
+        }
+        case 'companion_unslot_passive': {
+          const { slotIndex } = event.data as { slotIndex: number };
+          overrideResponse = await this.processCompanionUnslotAbility(context.characterId, 'passive', slotIndex);
           break;
         }
 
@@ -4423,10 +4593,23 @@ export class DistributedWorldManager implements IWildlifeWorld {
     if (targetEntity.id === attackerEntity.id) return;
     // Players retaliate manually; only NPCs/mobs/wildlife auto-retaliate.
     if (targetEntity.type === 'player' || targetEntity.type === 'companion') return;
-    if (this.combatManager.hasAutoAttackTarget(targetEntity.id)) return;
+
+    const enmity = this.combatManager.getEnmityTable();
+
+    // Seed proximity threat so the mob has an initial threat entry
+    if (!enmity.hasTable(targetEntity.id)) {
+      enmity.addRawThreat(targetEntity.id, attackerEntity.id, enmity.config.proximityThreat);
+    }
+
     const now = Date.now();
     this.combatManager.startCombat(targetEntity.id, now);
-    this.combatManager.setAutoAttackTarget(targetEntity.id, attackerEntity.id);
+
+    // If mob has no target yet, pick from top threat (usually the first attacker)
+    if (!this.combatManager.hasAutoAttackTarget(targetEntity.id)) {
+      const top = enmity.getTopThreat(targetEntity.id);
+      this.combatManager.setAutoAttackTarget(targetEntity.id, top?.entityId ?? attackerEntity.id);
+    }
+    // If mob already has a target, the CombatManager.update() threat evaluation handles switching
   }
 
   private async handlePartyAction(
@@ -5433,6 +5616,15 @@ export class DistributedWorldManager implements IWildlifeWorld {
         // Root-break: if target is rooted, check if damage breaks the root
         this.combatManager.checkRootBreak(target.id, result.amount);
 
+        // Generate enmity threat on mobs/wildlife from damage dealt
+        if ((target.type as string) === 'mob' || (target.type as string) === 'wildlife') {
+          if (resolvedAbility.threatModifier) {
+            this.combatManager.generateAbilityThreat(target.id, characterId, resolvedAbility, result.amount);
+          } else {
+            this.combatManager.generateDamageThreat(target.id, characterId, result.amount);
+          }
+        }
+
         // Record damage for loot resolution (mobs only)
         if (!targetData.isPlayer && !targetData.isWildlife) {
           this._recordMobDamage(targetData.entityId, characterId, result.amount, zoneManager.getZone().id);
@@ -5509,6 +5701,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
           // Clear auto-attack for the dying target and all entities targeting it
           this.combatManager.clearAutoAttackTarget(targetData.entityId);
           this.combatManager.clearAutoAttacksOnTarget(targetData.entityId);
+
+          // Clear enmity: remove this entity's threat table and purge it from all other tables
+          this.combatManager.getEnmityTable().clearTable(targetData.entityId);
+          this.combatManager.getEnmityTable().removeEntityFromAllTables(targetData.entityId);
 
           await this.broadcastNearbyUpdate(zoneManager.getZone().id);
 
@@ -5642,14 +5838,25 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
       const scalingStat = ability.healing.scalingStat;
       const scalingValue = scalingStat ? (attackerSnapshot.coreStats[scalingStat] ?? 0) : 0;
-      const healAmount = Math.floor(
-        ability.healing.amount + scalingValue * (ability.healing.scalingMultiplier ?? 0)
-      );
+      const baseHeal = ability.healing.amount + scalingValue * (ability.healing.scalingMultiplier ?? 0);
+      const healPotency = this.combatManager.getHealPotencyMult(characterId);
+      const healAmount = Math.floor(baseHeal * healPotency);
       const newHp = Math.min(healSnapshot.maxHealth, healSnapshot.currentHealth + healAmount);
       await this.updateHealth(healSnapshot, newHp);
 
       // Mirror health into ZoneManager so companion AI can track ally HP
       zoneManager.setEntityHealth(targetId, newHp, healSnapshot.maxHealth);
+
+      // Healing generates threat on all mobs engaged with the healer or heal target
+      {
+        const enmity = this.combatManager.getEnmityTable();
+        const mobsFromTarget = enmity.getMobsThreatenedBy(targetId);
+        const mobsFromHealer = enmity.getMobsThreatenedBy(characterId);
+        const relevantMobs = new Set([...mobsFromTarget, ...mobsFromHealer]);
+        for (const mobId of relevantMobs) {
+          this.combatManager.generateHealingThreat(mobId, characterId, healAmount);
+        }
+      }
 
       if (healSnapshot.isPlayer) {
         await this.sendCharacterResourcesUpdate(zoneManager, targetId, {
@@ -5682,6 +5889,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
     // ── Provoke (taunt) ───────────────────────────────────────────────────────
     if (ability.id === 'provoke') {
       this.combatManager.setTaunt(targetId, characterId, 4000, now); // 4 seconds
+      // Dump large threat so tank stays on top after taunt expires
+      this.combatManager.generateAbilityThreat(targetId, characterId, ability, 0);
       const targetName = zoneManager.getEntity(targetId)?.name ?? 'target';
       await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
         eventType: 'combat_effect',
@@ -5706,6 +5915,16 @@ export class DistributedWorldManager implements IWildlifeWorld {
         expiresAt: now + 10_000, // 10 seconds
         statMods: { attackRating: 10, magicAttack: 8 },
       });
+
+      // Buff application generates flat threat on all mobs engaged with the target
+      {
+        const enmity = this.combatManager.getEnmityTable();
+        const relevantMobs = enmity.getMobsThreatenedBy(targetId);
+        for (const mobId of relevantMobs) {
+          this.combatManager.generateFlatThreat(mobId, characterId, enmity.config.buffBaseThreat);
+        }
+      }
+
       const targetName = zoneManager.getEntity(targetId)?.name ?? 'target';
       await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
         eventType: 'combat_effect',
@@ -7279,6 +7498,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
                 level:     xpResult.newLevel,
                 message:   `You have reached level ${xpResult.newLevel}! You gain 1 ability point and 1 stat point.`,
               });
+
+              // ── Companion level sync on player level-up ────────────────
+              try {
+                await this.syncCompanionOnLevelUp(memberId, xpResult.newLevel);
+              } catch (syncErr) {
+                logger.warn({ err: syncErr, memberId }, '[XP] Failed to sync companion level');
+              }
             } else {
               await this._sendToSocket(memberId, 'event', {
                 eventType: 'xp_gain',
@@ -8473,13 +8699,19 @@ export class DistributedWorldManager implements IWildlifeWorld {
    * Update tick - called by game loop
    */
   update(deltaTime: number): void {
-    // Update combat system (ATB, cooldowns, combat timeouts)
-    const expired = this.combatManager.update(
+    // Update combat system (ATB, cooldowns, combat timeouts, buff ticks/expiry)
+    const combatResult = this.combatManager.update(
       deltaTime,
       (entityId) => this.attackSpeedBonusCache.get(entityId) ?? 0
     );
-    if (expired.length > 0) {
-      void this.handleCombatTimeouts(expired);
+    if (combatResult.expiredCombatants.length > 0) {
+      void this.handleCombatTimeouts(combatResult.expiredCombatants);
+    }
+    if (combatResult.buffTicks.length > 0) {
+      void this.processBuffTicks(combatResult.buffTicks);
+    }
+    if (combatResult.expiredBuffs.length > 0) {
+      void this.broadcastBuffExpiries(combatResult.expiredBuffs);
     }
 
     // Process queued combat actions (cast times)
@@ -8572,6 +8804,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
         if (entity) {
           this.combatManager.clearAutoAttackTarget(id);
           this.combatManager.clearQueuedActionsForEntity(id);
+          this.combatManager.getEnmityTable().clearTable(id);
           zm.setEntityCombatState(id, false);
           // wanderSystem already transitioned the mob to 'returning'
         }
@@ -8909,6 +9142,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       // Build state_update with combat gauges
       // Only include specialCharges if there are any (avoid empty object)
       const hasCharges = Object.keys(combatState.specialCharges).length > 0;
+      const effects = this.serializeEffectsForEntity(entityId);
       const stateUpdate: Record<string, unknown> = {
         timestamp: Date.now(),
         combat: {
@@ -8919,6 +9153,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
           ...(hasCharges && { specialCharges: combatState.specialCharges }),
           ...(includeEnmity && { enmityList: this.buildEnmityList(entityId, zoneId, zoneManager) }),
         },
+        // Include active effects (buffs/debuffs/CC) for HUD display
+        ...(effects.length > 0 && { character: { effects } }),
         // TODO: Add party/alliance ATB when party system is implemented
         // allies: this.getPartyMemberAtb(entityId),
       };
@@ -8934,6 +9170,175 @@ export class DistributedWorldManager implements IWildlifeWorld {
           data: stateUpdate,
         },
         timestamp: Date.now(),
+      });
+    }
+  }
+
+  // ── Status effect serialization & tick processing ─────────────────────────
+
+  /**
+   * Serialize an entity's active buffs + CC states into the StatusEffect[]
+   * format expected by the client HUD (character.effects in state_update).
+   */
+  private serializeEffectsForEntity(entityId: string): Array<{ id: string; name: string; duration: number; type?: 'buff' | 'debuff' }> {
+    const now = Date.now();
+    const effects: Array<{ id: string; name: string; duration: number; type?: 'buff' | 'debuff' }> = [];
+
+    // Active buffs from CombatManager
+    const buffs = this.combatManager.getBuffs(entityId);
+    for (const b of buffs) {
+      if (b.expiresAt <= now) continue;
+      effects.push({
+        id: b.id,
+        name: DistributedWorldManager.buffDisplayName(b.id),
+        duration: Math.max(0, Math.ceil((b.expiresAt - now) / 1000)),
+        type: b.tickDamage ? 'debuff' : 'buff',
+      });
+    }
+
+    // Synthesize CC states (taunt/root) tracked outside activeBuffs
+    const cc = this.combatManager.getCCState(entityId);
+    if (cc.tauntExpiresAt) {
+      effects.push({
+        id: 'taunted',
+        name: 'Taunted',
+        duration: Math.max(0, Math.ceil((cc.tauntExpiresAt - now) / 1000)),
+        type: 'debuff',
+      });
+    }
+    if (cc.rootExpiresAt) {
+      effects.push({
+        id: 'rooted',
+        name: 'Rooted',
+        duration: Math.max(0, Math.ceil((cc.rootExpiresAt - now) / 1000)),
+        type: 'debuff',
+      });
+    }
+
+    return effects;
+  }
+
+  private static buffDisplayName(buffId: string): string {
+    return buffId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  /**
+   * Process DoT/HoT buff ticks — apply damage or healing and broadcast events.
+   */
+  private async processBuffTicks(ticks: Array<{ entityId: string; buff: ActiveBuff }>): Promise<void> {
+    for (const { entityId, buff } of ticks) {
+      // Find which zone this entity is in
+      const zoneId = this.characterToZone.get(entityId) ?? this.findZoneForEntity(entityId);
+      if (!zoneId) continue;
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) continue;
+      const entity = zoneManager.getEntity(entityId);
+      if (!entity || !entity.isAlive) continue;
+
+      const entityName = entity.name ?? entityId;
+      const now = Date.now();
+
+      // ── DoT tick ──
+      if (buff.tickDamage) {
+        const currentHp = entity.health?.current ?? 0;
+        const maxHp = entity.health?.max ?? 1;
+        const newHp = Math.max(0, currentHp - buff.tickDamage.amount);
+        zoneManager.setEntityHealth(entityId, newHp, maxHp);
+
+        // DoT ticks generate threat from the original caster
+        if (entity.type === 'mob' || entity.type === 'wildlife') {
+          this.combatManager.generateDamageThreat(entityId, buff.sourceId, buff.tickDamage.amount);
+        }
+
+        await this.broadcastEntityHealthUpdate(zoneManager, entity.position, entityId, {
+          current: newHp,
+          max: maxHp,
+        });
+
+        // Send resource update to player if applicable
+        const socketId = zoneManager.getSocketIdForCharacter(entityId);
+        if (socketId) {
+          await this.sendCharacterResourcesUpdate(zoneManager, entityId, {
+            health: { current: newHp, max: maxHp },
+          });
+        }
+
+        await this.broadcastCombatEvent(zoneId, entity.position, {
+          eventType: 'combat_dot',
+          timestamp: now,
+          narrative: `${entityName} takes ${buff.tickDamage.amount} ${buff.tickDamage.type} damage from ${DistributedWorldManager.buffDisplayName(buff.id)}.`,
+          eventTypeData: {
+            targetId: entityId,
+            sourceId: buff.sourceId,
+            abilityId: buff.id,
+            amount: buff.tickDamage.amount,
+            damageType: buff.tickDamage.type,
+            floatText: `-${buff.tickDamage.amount}`,
+          },
+        });
+      }
+
+      // ── HoT tick ──
+      if (buff.tickHeal) {
+        const currentHp = entity.health?.current ?? 0;
+        const maxHp = entity.health?.max ?? 1;
+        const healAmount = Math.min(buff.tickHeal, maxHp - currentHp);
+        if (healAmount > 0) {
+          const newHp = currentHp + healAmount;
+          zoneManager.setEntityHealth(entityId, newHp, maxHp);
+
+          await this.broadcastEntityHealthUpdate(zoneManager, entity.position, entityId, {
+            current: newHp,
+            max: maxHp,
+          });
+
+          const socketId = zoneManager.getSocketIdForCharacter(entityId);
+          if (socketId) {
+            await this.sendCharacterResourcesUpdate(zoneManager, entityId, {
+              health: { current: newHp, max: maxHp },
+            });
+          }
+
+          await this.broadcastCombatEvent(zoneId, entity.position, {
+            eventType: 'combat_hot',
+            timestamp: now,
+            narrative: `${entityName} heals for ${healAmount} from ${DistributedWorldManager.buffDisplayName(buff.id)}.`,
+            eventTypeData: {
+              targetId: entityId,
+              sourceId: buff.sourceId,
+              abilityId: buff.id,
+              amount: healAmount,
+              floatText: `+${healAmount}`,
+            },
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Broadcast buff expiry events so clients can clean up HUD badges immediately.
+   */
+  private async broadcastBuffExpiries(expiries: Array<{ entityId: string; buff: ActiveBuff }>): Promise<void> {
+    for (const { entityId, buff } of expiries) {
+      const zoneId = this.characterToZone.get(entityId) ?? this.findZoneForEntity(entityId);
+      if (!zoneId) continue;
+      const zoneManager = this.zones.get(zoneId);
+      if (!zoneManager) continue;
+      const entity = zoneManager.getEntity(entityId);
+      if (!entity) continue;
+
+      const entityName = entity.name ?? entityId;
+
+      await this.broadcastCombatEvent(zoneId, entity.position, {
+        eventType: 'combat_effect',
+        timestamp: Date.now(),
+        narrative: `${DistributedWorldManager.buffDisplayName(buff.id)} fades from ${entityName}.`,
+        eventTypeData: {
+          targetId: entityId,
+          abilityId: buff.id,
+          effectType: 'buff_expire',
+        },
       });
     }
   }
@@ -8970,6 +9375,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     // What the player is auto-attacking
     const playerTarget = this.combatManager.getAutoAttackTarget(playerId);
+    const enmity = this.combatManager.getEnmityTable();
 
     // Scan nearby entities for mobs/wildlife in combat
     const nearby = zoneManager.getEntitiesInRangeForCombat(playerEntity.position, 30, playerId);
@@ -8983,17 +9389,21 @@ export class DistributedWorldManager implements IWildlifeWorld {
       if (seen.has(entity.id)) continue;
 
       const mobTarget = this.combatManager.getAutoAttackTarget(entity.id);
+      const topThreat = enmity.getTopThreat(entity.id);
 
-      if (mobTarget === playerId) {
-        // Red — mob is targeting this player directly
+      if (mobTarget === playerId || topThreat?.entityId === playerId) {
+        // Red — mob is targeting this player or player is top threat
         entries.push({ entityId: entity.id, name: entity.name, level: 'red' });
         seen.add(entity.id);
-      } else if (mobTarget && allyIds.has(mobTarget)) {
-        // Yellow — mob is targeting player's companion/party member
+      } else if (
+        (mobTarget && allyIds.has(mobTarget)) ||
+        (topThreat && allyIds.has(topThreat.entityId))
+      ) {
+        // Yellow — mob is targeting or top-threatening player's companion/party member
         entries.push({ entityId: entity.id, name: entity.name, level: 'yellow' });
         seen.add(entity.id);
-      } else if (playerTarget === entity.id) {
-        // Blue — player is attacking this mob, but it's focused elsewhere
+      } else if (enmity.getThreat(entity.id, playerId) > 0 || playerTarget === entity.id) {
+        // Blue — player has threat on this mob but isn't top, or is attacking it
         entries.push({ entityId: entity.id, name: entity.name, level: 'blue' });
         seen.add(entity.id);
       }
@@ -9576,6 +9986,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
       maxMana: companionEntity.maxMana ?? 0,
       currentStamina: companionEntity.currentStamina ?? 0,
       maxStamina: companionEntity.maxStamina ?? 0,
+      enmityTable: this.combatManager.getEnmityTable(),
     };
   }
 
@@ -10177,6 +10588,146 @@ export class DistributedWorldManager implements IWildlifeWorld {
       payload: { socketId, event: 'companion_config', data: payload },
       timestamp: Date.now(),
     });
+  }
+
+  // ── Companion loadout handlers ──────────────────────────────────────────
+
+  private async processCompanionViewLoadout(
+    characterId: string,
+    web: 'active' | 'passive',
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+    const loadoutRaw = web === 'active' ? companion.activeLoadout : companion.passiveLoadout;
+    const loadout = (loadoutRaw as { slots: (string | null)[] } | null)?.slots ?? Array(8).fill(null);
+
+    // Load owner's unlocked abilities for display
+    const ownerState = await loadAbilityState(characterId);
+    const unlockedNodes = web === 'active'
+      ? (ownerState?.unlocked.activeNodes ?? [])
+      : (ownerState?.unlocked.passiveNodes ?? []);
+
+    // Resolve node names for display
+    const slots = loadout.map((nodeId: string | null, idx: number) => {
+      if (!nodeId) return { slot: idx, nodeId: null, name: '(empty)' };
+      const node = getNode(nodeId);
+      return { slot: idx, nodeId, name: node?.name ?? nodeId };
+    });
+
+    const available = unlockedNodes
+      .filter(nid => {
+        const node = getNode(nid);
+        return node && node.tier <= 3; // No T4 for companions
+      })
+      .map(nid => {
+        const node = getNode(nid)!;
+        return { nodeId: nid, name: node.name, tier: node.tier, sector: node.sector };
+      });
+
+    // Send to client
+    const socketId = this._charToSocket.get(characterId);
+    if (socketId) {
+      void this.messageBus.publish('gateway:output', {
+        type: MessageType.CLIENT_MESSAGE,
+        characterId,
+        socketId,
+        payload: {
+          socketId,
+          event: `companion_${web}_loadout`,
+          data: { companionId: companion.id, web, slots, available },
+        },
+        timestamp: Date.now(),
+      });
+    }
+
+    const filledCount = loadout.filter((s: string | null) => s !== null).length;
+    return { success: true, message: `${web === 'active' ? 'Active' : 'Passive'} loadout: ${filledCount}/8 slots filled.` };
+  }
+
+  private async processCompanionSlotAbility(
+    characterId: string,
+    web: 'active' | 'passive',
+    slotIndex: number,
+    nodeId: string,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+
+    // Load owner's unlocked abilities for validation
+    const ownerState = await loadAbilityState(characterId);
+    if (!ownerState) return { success: false, message: 'Could not load ability state.' };
+
+    // Validate
+    const result = web === 'active'
+      ? canCompanionSlotActive(nodeId, slotIndex, ownerState.unlocked)
+      : canCompanionSlotPassive(nodeId, slotIndex, ownerState.unlocked);
+
+    if (!result.ok) return { success: false, message: result.reason };
+
+    // Update loadout
+    const loadoutRaw = web === 'active' ? companion.activeLoadout : companion.passiveLoadout;
+    const slots = (loadoutRaw as { slots: (string | null)[] } | null)?.slots?.slice() ?? Array(8).fill(null);
+    slots[slotIndex] = nodeId;
+    const newLoadout = { slots };
+
+    // Persist
+    const updateData = web === 'active'
+      ? { activeLoadout: newLoadout }
+      : { passiveLoadout: newLoadout };
+    await CompanionService.updateLoadouts(companion.id, updateData);
+
+    // If active, re-resolve abilities and update controller
+    if (web === 'active') {
+      const resolved = resolveAbilitiesFromLoadout(slots);
+      const controller = this.npcControllers.get(companion.id);
+      if (controller && resolved.length > 0) controller.setAbilities(resolved);
+    }
+
+    const nodeName = getNode(nodeId)?.name ?? nodeId;
+    return { success: true, message: `Slotted ${nodeName} into ${web} slot ${slotIndex + 1}.` };
+  }
+
+  private async processCompanionUnslotAbility(
+    characterId: string,
+    web: 'active' | 'passive',
+    slotIndex: number,
+  ): Promise<{ success: boolean; message?: string }> {
+    const found = await this.findPlayerCompanion(characterId);
+    if (!found) return { success: false, message: 'No companion found.' };
+
+    const { companion } = found;
+
+    if (slotIndex < 0 || slotIndex >= 8) {
+      return { success: false, message: 'Slot index must be 0-7.' };
+    }
+
+    const loadoutRaw = web === 'active' ? companion.activeLoadout : companion.passiveLoadout;
+    const slots = (loadoutRaw as { slots: (string | null)[] } | null)?.slots?.slice() ?? Array(8).fill(null);
+
+    const removedId = slots[slotIndex];
+    if (!removedId) return { success: false, message: `${web === 'active' ? 'Active' : 'Passive'} slot ${slotIndex + 1} is already empty.` };
+
+    slots[slotIndex] = null;
+    const newLoadout = { slots };
+
+    const updateData = web === 'active'
+      ? { activeLoadout: newLoadout }
+      : { passiveLoadout: newLoadout };
+    await CompanionService.updateLoadouts(companion.id, updateData);
+
+    // If active, re-resolve abilities
+    if (web === 'active') {
+      const resolved = resolveAbilitiesFromLoadout(slots);
+      const controller = this.npcControllers.get(companion.id);
+      if (controller) controller.setAbilities(resolved);
+    }
+
+    const nodeName = getNode(removedId)?.name ?? removedId;
+    return { success: true, message: `Removed ${nodeName} from ${web} slot ${slotIndex + 1}.` };
   }
 
   // ── Scripted Object process methods ─────────────────────────────────────
@@ -10870,9 +11421,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const entity = zoneManager.getEntity(entityId);
       if (!entity) continue;
 
-      // Clear auto-attack when combat times out
+      // Clear auto-attack and threat table when combat times out
       this.combatManager.clearAutoAttackTarget(entityId);
       this.combatManager.clearQueuedActionsForEntity(entityId);
+      this.combatManager.getEnmityTable().clearTable(entityId);
 
       zoneManager.setEntityCombatState(entityId, false);
       await this.broadcastNearbyUpdate(zoneId);

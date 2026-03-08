@@ -631,7 +631,7 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
           type: 'heal',
           amount: 50,
         },
-        cooldown: 30,
+        cooldown: 15,
       },
       value: 25,
       stackable: true,
@@ -639,7 +639,26 @@ Content Rating: Teen (13+) - Keep language mild, no graphic content.`,
     },
   });
 
-  console.log(`Γ£ô Created item templates: ${rustySword.name}, ${ironMace.name}, ${ashwoodSpear.name}, ${morningStar.name}, ${fireStaff.name}, ${steelBreastplate.name}, ${leatherJerkin.name}, ${silkRobe.name}, ${healthPotion.name}`);
+  const manaPotion = await prisma.itemTemplate.create({
+    data: {
+      name: 'Mana Potion',
+      description: 'A small vial of blue liquid that restores magical energy.',
+      itemType: 'consumable',
+      properties: {
+        consumableType: 'potion',
+        effect: {
+          type: 'mana',
+          amount: 40,
+        },
+        cooldown: 15,
+      },
+      value: 30,
+      stackable: true,
+      maxStackSize: 20,
+    },
+  });
+
+  console.log(`✔ Created item templates: ${rustySword.name}, ${ironMace.name}, ${ashwoodSpear.name}, ${morningStar.name}, ${fireStaff.name}, ${steelBreastplate.name}, ${leatherJerkin.name}, ${silkRobe.name}, ${healthPotion.name}, ${manaPotion.name}`);
 
   // Give the test character a starting weapon
   console.log('Equipping test character...');

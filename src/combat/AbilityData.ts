@@ -28,6 +28,7 @@ export const T1_ABILITIES: CombatAbilityDefinition[] = [
     // No damage — taunt-only. Mechanic handled in DWM.
     // Duration: 4s. Threat multiplier applies even on miss.
     tags: ['taunt'],
+    threatModifier: { multiplier: 1.0, flatBonus: 2000 },
   },
 
   // ── HEALER: Mend ───────────────────────────────────────
@@ -179,3 +180,65 @@ export const T1_PASSIVES: PassiveAbilityDef[] = [
     statBonuses: { attackRating: 8, criticalHitChance: 2 },
   },
 ];
+
+// ═══════════════════════════════════════════════════════════
+// ABILITY RESOLUTION — maps node IDs to CombatAbilityDefinitions
+// ═══════════════════════════════════════════════════════════
+
+/** Lookup map: ability id → CombatAbilityDefinition */
+const ABILITY_MAP = new Map<string, CombatAbilityDefinition>(
+  T1_ABILITIES.map(a => [a.id, a]),
+  // Future: spread T2_ABILITIES, T3_ABILITIES here as they're added
+);
+
+/**
+ * Resolve a companion's active loadout into CombatAbilityDefinitions.
+ *
+ * Takes the companion's slotted node IDs and returns the corresponding
+ * ability definitions. Node IDs follow the convention `active_{sector}_t{tier}`
+ * — the ability id is extracted from the node's activeEffect or looked up
+ * by matching the sector+tier to the known ability table.
+ *
+ * For T1 nodes, the ability id is the same as the T1_ABILITIES entries
+ * (e.g., active_tank_t1 → provoke, active_healer_t1 → mend).
+ *
+ * @param slottedNodeIds Array of (nodeId | null) from the companion's loadout
+ * @returns Array of resolved CombatAbilityDefinition (skips nulls / unknown IDs)
+ */
+export function resolveAbilitiesFromLoadout(
+  slottedNodeIds: (string | null)[],
+): CombatAbilityDefinition[] {
+  const resolved: CombatAbilityDefinition[] = [];
+
+  // Map from active web node IDs to ability IDs
+  const nodeToAbilityId: Record<string, string> = {
+    active_tank_t1:    'provoke',
+    active_healer_t1:  'mend',
+    active_magic_t1:   'shadow_bolt',
+    active_support_t1: 'embolden',
+    active_control_t1: 'ensnare',
+    active_phys_t1:    'power_strike',
+    // Future T2/T3 mappings will be added here as abilities are defined
+  };
+
+  for (const nodeId of slottedNodeIds) {
+    if (!nodeId) continue;
+
+    // Try direct lookup (ability ID matches node ID in some cases)
+    let def = ABILITY_MAP.get(nodeId);
+    if (def) {
+      resolved.push(def);
+      continue;
+    }
+
+    // Try mapping from node ID to ability ID
+    const abilityId = nodeToAbilityId[nodeId];
+    if (abilityId) {
+      def = ABILITY_MAP.get(abilityId);
+      if (def) resolved.push(def);
+    }
+    // Unknown node IDs are silently skipped (future T2/T3 abilities)
+  }
+
+  return resolved;
+}
