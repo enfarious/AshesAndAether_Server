@@ -26,13 +26,20 @@ export interface EngagementTarget {
  * When in combat, the behavior tree ticks every frame and the LLM
  * adjusts settings on meaningful state changes.
  */
+/** Callback signature for BYOLLM trigger emission — DWM provides this for companions. */
+export type OnTriggerCallback = (type: 'combat' | 'social', triggerReason: string, snapshot: unknown) => void;
+
 export class NPCAIController {
   private companion: Companion;
-  private llmService: LLMService;
+  private llmService: LLMService | null;
+  private onTrigger: OnTriggerCallback | null;
 
   // ── Social layer ─────────────────────────────────────────────────────────
   private lastSocialAction: number = 0;
   private socialCooldown: number = 5000; // 5 seconds between social actions
+  /** Social idle trigger — configurable, default 5 min since last social trigger. */
+  private lastSocialTriggerAt: number = 0;
+  private static readonly SOCIAL_IDLE_MS = 5 * 60 * 1000;
 
   // ── Combat layer ─────────────────────────────────────────────────────────
   private behaviorTree: CompanionBehaviorTree;
@@ -64,9 +71,18 @@ export class NPCAIController {
   /** Last ability the companion used — drives casting bar on the HUD. */
   private _lastAbilityUsed: { abilityId: string; abilityName: string; timestamp: number } | null = null;
 
-  constructor(companion: Companion, llmService: LLMService) {
+  /** Track last zone ID for zone_change social triggers. */
+  private _lastZoneId: string | null = null;
+
+  /**
+   * @param companion  Companion DB record
+   * @param llmService LLMService instance for NPC AI (null for BYOLLM companions)
+   * @param onTrigger  Callback for BYOLLM trigger emission (null for server-side NPC AI)
+   */
+  constructor(companion: Companion, llmService: LLMService | null, onTrigger?: OnTriggerCallback | null) {
     this.companion = companion;
     this.llmService = llmService;
+    this.onTrigger = onTrigger ?? null;
 
     // Initialize combat subsystems
     const archetype = companion.archetype ?? 'opportunist';
@@ -80,18 +96,43 @@ export class NPCAIController {
     );
   }
 
+  /** Whether this controller uses BYOLLM (client-side LLM). */
+  get isBYOLLM(): boolean {
+    return this.onTrigger !== null;
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // Social update (out of combat)
   // ══════════════════════════════════════════════════════════════════════════
 
   /**
    * Update NPC AI for social behavior (called when NOT in combat).
+   *
+   * BYOLLM companions: evaluates social trigger conditions and fires
+   * the onTrigger callback when appropriate.
+   * NPC instances: existing behavior (server-side LLM).
    */
   async updateSocial(
     proximityRoster: ProximityRosterMessage['payload'],
-    nearbyPlayerMessages: { sender: string; channel: string; message: string }[] = []
+    nearbyPlayerMessages: { sender: string; channel: string; message: string }[] = [],
+    zoneId?: string,
   ): Promise<void> {
     const now = Date.now();
+
+    // ── BYOLLM companion path: evaluate social trigger conditions ──────
+    if (this.onTrigger) {
+      const triggerReason = this.evaluateSocialTrigger(proximityRoster, nearbyPlayerMessages, zoneId, now);
+      if (triggerReason) {
+        this.lastSocialTriggerAt = now;
+        this.onTrigger('social', triggerReason, {
+          proximityRoster,
+          nearbyPlayerMessages,
+        });
+      }
+      return;
+    }
+
+    // ── NPC path: existing server-side behavior ───────────────────────
     if (now - this.lastSocialAction < this.socialCooldown) return;
 
     const shouldRespond = this.shouldRespondToSituation(proximityRoster, nearbyPlayerMessages);
@@ -99,6 +140,50 @@ export class NPCAIController {
 
     this.lastSocialAction = now;
     logger.debug({ companionId: this.companion.id, companionName: this.companion.name }, 'NPC social AI update triggered');
+  }
+
+  /**
+   * Evaluate social trigger conditions for BYOLLM companions.
+   * Returns trigger reason or null if no trigger.
+   */
+  private evaluateSocialTrigger(
+    proximityRoster: ProximityRosterMessage['payload'],
+    nearbyPlayerMessages: { sender: string; channel: string; message: string }[],
+    zoneId: string | undefined,
+    now: number,
+  ): 'player_spoke' | 'entity_nearby' | 'zone_change' | 'idle' | null {
+    // Player spoke in say or companion channel
+    if (nearbyPlayerMessages.length > 0) {
+      return 'player_spoke';
+    }
+
+    // Zone changed (companion crossed a zone boundary)
+    if (zoneId && this._lastZoneId !== null && this._lastZoneId !== zoneId) {
+      this._lastZoneId = zoneId;
+      return 'zone_change';
+    }
+    if (zoneId) this._lastZoneId = zoneId;
+
+    // Entity entered say range (proximity roster delta — checking say count)
+    // This fires when a new entity is near enough to talk; we approximate by
+    // checking if say count went up recently (DWM will pass changed rosters).
+    if (proximityRoster.channels.say.count >= 2) {
+      // Don't fire entity_nearby more than once per social cooldown
+      if (now - this.lastSocialTriggerAt >= this.socialCooldown) {
+        return 'entity_nearby';
+      }
+    }
+
+    // Idle timer: fire if no social trigger for SOCIAL_IDLE_MS
+    if (this.lastSocialTriggerAt > 0 && now - this.lastSocialTriggerAt >= NPCAIController.SOCIAL_IDLE_MS) {
+      return 'idle';
+    }
+    // First idle trigger after zone entry
+    if (this.lastSocialTriggerAt === 0 && now - this.lastSocialAction >= NPCAIController.SOCIAL_IDLE_MS) {
+      return 'idle';
+    }
+
+    return null;
   }
 
   private shouldRespondToSituation(
@@ -175,8 +260,13 @@ export class NPCAIController {
     const triggerReason = this.combatTrigger.evaluate(snapshot, now);
 
     if (triggerReason) {
-      // Fire-and-forget LLM call (don't block the tick)
-      void this.requestSettingsUpdate(context, triggerReason);
+      if (this.onTrigger) {
+        // BYOLLM path: emit trigger to client, client handles LLM call
+        this.onTrigger('combat', triggerReason, this.buildCombatSnapshot(context));
+      } else {
+        // NPC path: fire-and-forget server-side LLM call (don't block the tick)
+        void this.requestSettingsUpdate(context, triggerReason);
+      }
     }
 
     // ── Tick the behavior tree ─────────────────────────────────────────────
@@ -274,6 +364,9 @@ export class NPCAIController {
     context: CombatContext,
     triggerReason: TriggerReason,
   ): Promise<void> {
+    // BYOLLM companions never use server-side LLM
+    if (!this.llmService) return;
+
     // Global LLM throttle — player_command bypasses, everything else respects cooldown
     const now = Date.now();
     if (triggerReason !== 'player_command' && now - this.lastLlmCallAt < NPCAIController.LLM_GLOBAL_COOLDOWN_MS) {
@@ -375,6 +468,10 @@ export class NPCAIController {
 
   get inCombat(): boolean {
     return this._inCombat;
+  }
+
+  get fightStartTime(): number {
+    return this.fightStartedAt;
   }
 
   get llmPending(): boolean {

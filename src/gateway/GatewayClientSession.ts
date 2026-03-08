@@ -673,6 +673,33 @@ export class GatewayClientSession {
       await this.routeEditorAction('close', { editorId });
     });
 
+    // ── Companion BYOLLM messages ────────────────────────────────────────
+    this.socket.on('companion_settings_update', async (data: unknown) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const channel = `zone:${this.currentZoneId}:input`;
+      await this.messageBus.publish(channel, {
+        type: MessageType.COMPANION_SETTINGS_UPDATE,
+        zoneId: this.currentZoneId,
+        characterId: this.characterId,
+        socketId: this.socket.id,
+        payload: data,
+        timestamp: Date.now(),
+      });
+    });
+
+    this.socket.on('companion_social_action', async (data: unknown) => {
+      if (!this.characterId || !this.currentZoneId) return;
+      const channel = `zone:${this.currentZoneId}:input`;
+      await this.messageBus.publish(channel, {
+        type: MessageType.COMPANION_SOCIAL_ACTION,
+        zoneId: this.currentZoneId,
+        characterId: this.characterId,
+        socketId: this.socket.id,
+        payload: data,
+        timestamp: Date.now(),
+      });
+    });
+
     // Ping/pong
     this.socket.on('ping', (data) => {
       this.updatePing();

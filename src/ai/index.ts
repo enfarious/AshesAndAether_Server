@@ -1,5 +1,5 @@
 export { NPCAIController } from './NPCAIController';
-export type { EngagementTarget } from './NPCAIController';
+export type { EngagementTarget, OnTriggerCallback } from './NPCAIController';
 export { LLMService } from './LLMService';
 export type { CombatSettingsContext, EngagementContext } from './LLMService';
 export { CompanionBehaviorTree } from './CompanionBehaviorTree';

@@ -27,6 +27,10 @@ export enum MessageType {
   // Script editor messages (Gateway -> Zone)
   EDITOR_ACTION = 'editor_action',
 
+  // Companion BYOLLM messages (Client -> Gateway -> Zone)
+  COMPANION_SETTINGS_UPDATE = 'companion_settings_update',
+  COMPANION_SOCIAL_ACTION = 'companion_social_action',
+
   // Guild events (cross-zone)
   GUILD_CHAT = 'guild_chat',
   GUILD_INVITE = 'guild_invite',

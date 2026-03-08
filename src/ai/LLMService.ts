@@ -181,7 +181,7 @@ export class LLMService {
    */
   async generateCompanionChat(
     companion: Companion,
-    ownerName: string,
+    partnerName: string,
     recentMessages: { sender: string; channel: string; message: string }[],
   ): Promise<{ message: string | null }> {
     if (!this.isConfigured()) {
@@ -195,7 +195,7 @@ export class LLMService {
     const systemPrompt =
       `You are ${companion.name}, ${description}. ` +
       `Personality: ${personality}. Traits: ${traits}. ` +
-      `You are speaking privately with your owner, ${ownerName}. ` +
+      `You are speaking privately with your partner, ${partnerName}. ` +
       `Respond in character with 1-2 short sentences. Do not include any prefixes or formatting — just speak naturally.`;
 
     let conversationPrompt = '';
@@ -465,7 +465,7 @@ Keep responses short (1-2 sentences). Stay in character.`;
 
       const familyStr = ctx.mobFamily ? ` (${ctx.mobFamily})` : '';
       const speciesStr = ctx.mobSpecies ? `, species: ${ctx.mobSpecies}` : '';
-      const ownerStr = ctx.ownerNearby ? 'Your owner is nearby.' : 'Your owner is not nearby.';
+      const ownerStr = ctx.ownerNearby ? 'Your partner is nearby.' : 'Your partner is not nearby.';
       const userPrompt = `A ${ctx.mobName}${familyStr}${speciesStr}, level ${ctx.mobLevel}, is nearby. You are level ${ctx.companionLevel}. ${ownerStr} ENGAGE or IGNORE?`;
 
       let responseText: string;

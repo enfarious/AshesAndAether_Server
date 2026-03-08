@@ -1130,6 +1130,107 @@ export interface EditorCloseMessage {
   };
 }
 
+// ========== Companion BYOLLM Protocol ==========
+
+import type { TriggerReason } from '@/ai/CompanionCombatTrigger';
+import type { CompanionCombatSettings } from '@/ai/CompanionCombatSettings';
+
+/** Server → Client: combat trigger — client runs LLM to decide settings update. */
+export interface CompanionCombatTriggerMessage {
+  type: 'companion_combat_trigger';
+  payload: {
+    companionId:    string;
+    triggerReason:  TriggerReason;
+    companion: {
+      id:              string;
+      name:            string;
+      archetype:       string;
+      personalityType: string | null;
+      currentSettings: CompanionCombatSettings;
+      healthRatio:     number;
+      manaRatio:       number;
+      staminaRatio:    number;
+    };
+    partner: {
+      id:          string;
+      name:        string;
+      healthRatio: number;
+      inCombat:    boolean;
+    };
+    party: Array<{
+      id:          string;
+      name:        string;
+      healthRatio: number;
+      role:        string;
+    }>;
+    enemies: Array<{
+      id:          string;
+      name:        string;
+      species:     string | null;
+      family:      string | null;
+      level:       number;
+      healthRatio: number;
+      isTaunted:   boolean;
+      isRooted:    boolean;
+    }>;
+    enmity: Array<{
+      targetId:   string;
+      attackers:  string[];
+    }>;
+    fightDurationSec: number;
+    playerCommand:    string | null;
+  };
+}
+
+/** Server → Client: social trigger — client runs LLM for social response. */
+export interface CompanionSocialTriggerMessage {
+  type: 'companion_social_trigger';
+  payload: {
+    companionId:   string;
+    triggerReason: 'player_spoke' | 'entity_nearby' | 'zone_change' | 'idle';
+    companion: {
+      id:              string;
+      name:            string;
+      archetype:       string;
+      personalityType: string | null;
+    };
+    zone: {
+      id:            string;
+      name:          string;
+      description:   string;
+      contentRating: 'T' | 'M' | 'AO';
+      lighting:      string;
+      weather:       string;
+    };
+    proximitySummary: {
+      sayCount:   number;
+      shoutCount: number;
+      partyCount: number;
+    };
+  };
+}
+
+/** Client → Server: companion settings update from client-side LLM. */
+export interface CompanionSettingsUpdateMessage {
+  type: 'companion_settings_update';
+  payload: {
+    companionId: string;
+    settings:    Partial<CompanionCombatSettings>;
+  };
+}
+
+/** Client → Server: social action from client-side LLM. */
+export interface CompanionSocialActionMessage {
+  type: 'companion_social_action';
+  payload: {
+    companionId: string;
+    action:      'say' | 'emote' | 'move';
+    message?:    string;
+    bearing?:    number;
+    distance?:   number;
+  };
+}
+
 // ========== Union Type for All Messages ==========
 
 export type ClientMessage =
@@ -1162,7 +1263,9 @@ export type ClientMessage =
   | EditorSaveMessage
   | EditorCompileMessage
   | EditorRevertMessage
-  | EditorCloseMessage;
+  | EditorCloseMessage
+  | CompanionSettingsUpdateMessage
+  | CompanionSocialActionMessage;
 
 export type ServerMessage =
   | HandshakeAckMessage
@@ -1197,7 +1300,9 @@ export type ServerMessage =
   | BeaconUpdateMessage
   | BeaconAlertMessage
   | LibraryStatusMessage
-  | LibraryAssaultAlertMessage;
+  | LibraryAssaultAlertMessage
+  | CompanionCombatTriggerMessage
+  | CompanionSocialTriggerMessage;
 
 // ========== Guild System ==========
 

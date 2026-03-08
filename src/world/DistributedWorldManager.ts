@@ -707,7 +707,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const companions = await ZoneService.getCompanionsInZone(zoneId);
 
     for (const companion of companions) {
-      const controller = new NPCAIController(companion, this.llmService);
+      const controller = new NPCAIController(
+        companion, null,
+        this._buildCompanionTriggerCallback(companion),
+      );
       this.npcControllers.set(companion.id, controller);
       this.companionToZone.set(companion.id, zoneId);
 
@@ -808,6 +811,12 @@ export class DistributedWorldManager implements IWildlifeWorld {
       case MessageType.EDITOR_ACTION:
         void this.handleEditorAction(message);
         break;
+      case MessageType.COMPANION_SETTINGS_UPDATE:
+        void this.handleCompanionSettingsUpdate(message);
+        break;
+      case MessageType.COMPANION_SOCIAL_ACTION:
+        void this.handleCompanionSocialAction(message);
+        break;
       default:
         logger.warn({ type: message.type }, 'Unhandled message type');
     }
@@ -901,7 +910,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
       this.combatManager.setHealPotencyMult(companion.id, mods.healPotencyMult);
     }
 
-    const controller = new NPCAIController(companion, this.llmService);
+    const controller = new NPCAIController(
+      companion, null,
+      this._buildCompanionTriggerCallback(companion),
+    );
 
     // ── Ability resolution: loadout > legacy abilityIds > archetype defaults ──
     const companionActiveLoadout = companion.activeLoadout as { slots: (string | null)[] } | null;
@@ -10561,6 +10573,29 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const compZoneId = this.companionToZone.get(companion.id);
     const compEntity = compZoneId ? this.zones.get(compZoneId)?.getEntity(companion.id) : null;
 
+    // Compute derived combat stats for client display
+    const compCoreStats = (companion.stats as Record<string, number>) || {};
+    const coreStats = {
+      strength: compCoreStats.strength ?? 10, vitality: compCoreStats.vitality ?? 10,
+      dexterity: compCoreStats.dexterity ?? 10, agility: compCoreStats.agility ?? 10,
+      intelligence: compCoreStats.intelligence ?? 10, wisdom: compCoreStats.wisdom ?? 10,
+    };
+    const archetype = (companion.archetype ?? 'opportunist') as import('@/ai/CompanionCombatSettings').CompanionArchetype;
+    const derived = StatCalculator.calculateDerivedStats(coreStats, companion.level);
+    const archetypeMods = ARCHETYPE_MODIFIERS[archetype]?.statMods ?? {};
+
+    const derivedStats = {
+      attackRating:      Math.round(derived.attackRating + (archetypeMods.attackRating ?? 0)),
+      defenseRating:     Math.round((derived.defenseRating + (archetypeMods.defenseRating ?? 0)) * 10) / 10,
+      magicAttack:       Math.round(derived.magicAttack),
+      magicDefense:      Math.round(derived.magicDefense * 10) / 10,
+      criticalHitChance: Math.round((derived.criticalHitChance + (archetypeMods.criticalHitChance ?? 0)) * 10) / 10,
+      evasion:           Math.round(derived.evasion),
+      movementSpeed:     Math.round(derived.movementSpeed * 10) / 10,
+      healPotencyMult:   archetypeMods.healPotencyMult ?? 1.0,
+      threatMultiplier:  archetypeMods.threatMultiplier ?? 1.0,
+    };
+
     const payload = {
       companionId:       companion.id,
       name:              companion.name,
@@ -10579,6 +10614,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
       abilities,
       harvestsCompleted: companion.harvestsCompleted,
       itemsGathered:     companion.itemsGathered,
+      coreStats,
+      derivedStats,
+      personalityType:   companion.personalityType || null,
+      traits:            (companion.traits as string[]) ?? [],
+      description:       companion.description || null,
     };
 
     void this.messageBus.publish('gateway:output', {
@@ -10588,6 +10628,326 @@ export class DistributedWorldManager implements IWildlifeWorld {
       payload: { socketId, event: 'companion_config', data: payload },
       timestamp: Date.now(),
     });
+  }
+
+  // ── Companion BYOLLM trigger + handler system ──────────────────────────
+
+  /**
+   * Build an onTrigger callback for a companion. When the NPCAIController
+   * evaluates a trigger condition, this callback assembles the full payload
+   * and emits it to the companion owner's socket.
+   */
+  private _buildCompanionTriggerCallback(
+    companion: import('@prisma/client').Companion,
+  ): import('@/ai/NPCAIController').OnTriggerCallback {
+    return (type, triggerReason, _snapshot) => {
+      if (type === 'combat') {
+        this._emitCombatTrigger(companion.id, triggerReason as import('@/ai/CompanionCombatTrigger').TriggerReason);
+      } else {
+        this._emitSocialTrigger(companion.id, triggerReason as 'player_spoke' | 'entity_nearby' | 'zone_change' | 'idle');
+      }
+    };
+  }
+
+  /**
+   * Build and emit a companion_combat_trigger to the owner client.
+   */
+  private _emitCombatTrigger(
+    companionId: string,
+    triggerReason: import('@/ai/CompanionCombatTrigger').TriggerReason,
+  ): void {
+    const controller = this.npcControllers.get(companionId);
+    if (!controller) return;
+
+    const companion = controller.getCompanion();
+    const ownerCharId = companion.ownerCharacterId;
+    if (!ownerCharId) return;
+
+    const socketId = this._charToSocket.get(ownerCharId);
+    if (!socketId) return;
+
+    const zoneId = this.companionToZone.get(companionId);
+    if (!zoneId) return;
+
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+
+    const companionEntity = zm.getEntity(companionId);
+    if (!companionEntity) return;
+
+    // Build the companion context
+    const maxHp = companionEntity.maxHealth ?? 100;
+    const maxMana = companionEntity.maxMana ?? 0;
+    const maxStamina = companionEntity.maxStamina ?? 0;
+
+    // Find owner entity
+    const ownerEntity = zm.getEntity(ownerCharId);
+
+    // Get all nearby entities for party/enemy info
+    const nearbyEntities = zm.getEntitiesInRangeForCombat(companionEntity.position, 30, companionId);
+    const hostiles = nearbyEntities.filter(e => e.isAlive && (e.type === 'mob' || e.faction === 'hostile'));
+
+    // Build party array (allies including owner)
+    const partyMembers: Array<{ id: string; name: string; healthRatio: number; role: string }> = [];
+    for (const e of nearbyEntities) {
+      if (!e.isAlive || e.id === companionId) continue;
+      if (e.type === 'player' || e.type === 'companion') {
+        partyMembers.push({
+          id: e.id,
+          name: e.name,
+          healthRatio: (e.maxHealth ?? 1) > 0 ? (e.currentHealth ?? 1) / (e.maxHealth ?? 1) : 1,
+          role: e.type === 'companion' ? 'companion' : 'player',
+        });
+      }
+    }
+
+    // Build enemy array
+    const enemies = hostiles.map(e => ({
+      id: e.id,
+      name: e.name,
+      species: e.species ?? null,
+      family: e.family ?? null,
+      level: e.level ?? 1,
+      healthRatio: (e.maxHealth ?? 1) > 0 ? (e.currentHealth ?? 1) / (e.maxHealth ?? 1) : 1,
+      isTaunted: this.combatManager.getAutoAttackTarget(e.id) === companionId,
+      isRooted: false, // placeholder — wire when CC status system exists
+    }));
+
+    // Build enmity table
+    const enmityTable = this.combatManager.getEnmityTable();
+    const enmity: Array<{ targetId: string; attackers: string[] }> = [];
+    for (const enemy of hostiles) {
+      const threatList = enmityTable.getSortedThreats(enemy.id);
+      if (threatList.length > 0) {
+        enmity.push({
+          targetId: enemy.id,
+          attackers: threatList.map(t => t.entityId),
+        });
+      }
+    }
+
+    const payload = {
+      companionId,
+      triggerReason,
+      companion: {
+        id: companion.id,
+        name: companion.name,
+        archetype: companion.archetype ?? 'opportunist',
+        personalityType: companion.personalityType ?? null,
+        currentSettings: controller.getCurrentSettings(),
+        healthRatio: maxHp > 0 ? (companionEntity.currentHealth ?? maxHp) / maxHp : 1,
+        manaRatio: maxMana > 0 ? (companionEntity.currentMana ?? 0) / maxMana : 0,
+        staminaRatio: maxStamina > 0 ? (companionEntity.currentStamina ?? 0) / maxStamina : 0,
+      },
+      partner: {
+        id: ownerCharId,
+        name: ownerEntity?.name ?? 'Unknown',
+        healthRatio: ownerEntity
+          ? ((ownerEntity.maxHealth ?? 1) > 0 ? (ownerEntity.currentHealth ?? 1) / (ownerEntity.maxHealth ?? 1) : 1)
+          : 1,
+        inCombat: ownerEntity?.inCombat ?? false,
+      },
+      party: partyMembers,
+      enemies,
+      enmity,
+      fightDurationSec: controller.inCombat
+        ? (Date.now() - controller.fightStartTime) / 1000
+        : 0,
+      playerCommand: null as string | null, // player commands are handled inline
+    };
+
+    void this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId: ownerCharId,
+      socketId,
+      payload: { socketId, event: 'companion_combat_trigger', data: payload },
+      timestamp: Date.now(),
+    });
+
+    logger.debug({ companionId, triggerReason }, '[BYOLLM] Combat trigger emitted to client');
+  }
+
+  /**
+   * Build and emit a companion_social_trigger to the owner client.
+   */
+  private _emitSocialTrigger(
+    companionId: string,
+    triggerReason: 'player_spoke' | 'entity_nearby' | 'zone_change' | 'idle',
+  ): void {
+    const controller = this.npcControllers.get(companionId);
+    if (!controller) return;
+
+    const companion = controller.getCompanion();
+    const ownerCharId = companion.ownerCharacterId;
+    if (!ownerCharId) return;
+
+    const socketId = this._charToSocket.get(ownerCharId);
+    if (!socketId) return;
+
+    const zoneId = this.companionToZone.get(companionId);
+    if (!zoneId) return;
+
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+
+    // Build zone info
+    const zone = zm.getZone();
+    const companionEntity = zm.getEntity(companionId);
+
+    // Proximity summary — count nearby entities in each channel range
+    const position = companionEntity?.position ?? { x: 0, y: 0, z: 0 };
+    const nearbyEntities = zm.getEntitiesInRangeForCombat(position, 30, companionId);
+    const players = nearbyEntities.filter(e => e.type === 'player' && e.isAlive);
+
+    const payload = {
+      companionId,
+      triggerReason,
+      companion: {
+        id: companion.id,
+        name: companion.name,
+        archetype: companion.archetype ?? 'opportunist',
+        personalityType: companion.personalityType ?? null,
+      },
+      zone: {
+        id: zone.id,
+        name: zone.name,
+        description: zone.description ?? '',
+        contentRating: (zone.contentRating ?? 'T') as 'T' | 'M' | 'AO',
+        lighting: zm.getLighting(),
+        weather: zm.getWeather(),
+      },
+      proximitySummary: {
+        sayCount: players.length,
+        shoutCount: 0, // TODO: wider-range count if needed
+        partyCount: 0, // TODO: wire party system
+      },
+    };
+
+    void this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId: ownerCharId,
+      socketId,
+      payload: { socketId, event: 'companion_social_trigger', data: payload },
+      timestamp: Date.now(),
+    });
+
+    logger.debug({ companionId, triggerReason }, '[BYOLLM] Social trigger emitted to client');
+  }
+
+  /**
+   * Handle incoming companion_settings_update from client (BYOLLM response).
+   * Validates shape, applies to companion's behavior tree settings.
+   */
+  private async handleCompanionSettingsUpdate(message: MessageEnvelope): Promise<void> {
+    const characterId = message.characterId;
+    if (!characterId) return;
+
+    const payload = message.payload as {
+      companionId?: string;
+      settings?: Partial<CompanionCombatSettings>;
+    };
+    if (!payload?.companionId || !payload?.settings) {
+      logger.warn({ characterId }, '[BYOLLM] Invalid companion_settings_update payload');
+      return;
+    }
+
+    // Verify the companion belongs to this character
+    const controller = this.npcControllers.get(payload.companionId);
+    if (!controller) return;
+
+    const companion = controller.getCompanion();
+    if (companion.ownerCharacterId !== characterId) {
+      logger.warn({ characterId, companionId: payload.companionId }, '[BYOLLM] Settings update from non-owner');
+      return;
+    }
+
+    // Apply settings — same path as manual panel settings
+    const current = controller.getCurrentSettings();
+    const merged = mergePartialSettings(current, payload.settings);
+    controller.applyManualSettings(merged);
+
+    logger.info({
+      companionId: payload.companionId,
+      settingsUpdate: payload.settings,
+    }, '[BYOLLM] Combat settings update applied from client LLM');
+  }
+
+  /**
+   * Handle incoming companion_social_action from client (BYOLLM response).
+   * Validates action is plausible, then executes (broadcast chat/emote or move).
+   */
+  private async handleCompanionSocialAction(message: MessageEnvelope): Promise<void> {
+    const characterId = message.characterId;
+    if (!characterId) return;
+
+    const payload = message.payload as {
+      companionId?: string;
+      action?: 'say' | 'emote' | 'move';
+      message?: string;
+      bearing?: number;
+      distance?: number;
+    };
+    if (!payload?.companionId || !payload?.action) {
+      logger.warn({ characterId }, '[BYOLLM] Invalid companion_social_action payload');
+      return;
+    }
+
+    // Verify ownership
+    const controller = this.npcControllers.get(payload.companionId);
+    if (!controller) return;
+
+    const companion = controller.getCompanion();
+    if (companion.ownerCharacterId !== characterId) {
+      logger.warn({ characterId, companionId: payload.companionId }, '[BYOLLM] Social action from non-owner');
+      return;
+    }
+
+    // Verify companion is alive and in a zone
+    const zoneId = this.companionToZone.get(payload.companionId);
+    if (!zoneId) return;
+
+    const zm = this.zones.get(zoneId);
+    if (!zm) return;
+
+    const companionEntity = zm.getEntity(payload.companionId);
+    if (!companionEntity?.isAlive) return;
+
+    // Execute the action
+    switch (payload.action) {
+      case 'say':
+      case 'emote': {
+        if (!payload.message) return;
+        // Broadcast as companion chat/emote in say range (15m)
+        const channel = payload.action === 'say' ? 'say' : 'emote';
+        void this.broadcastChatFromCharacter(
+          zm, payload.companionId, companion.name,
+          companionEntity.position, channel as 'say' | 'emote',
+          payload.message, 15,
+        );
+        break;
+      }
+      case 'move': {
+        // Enqueue a short movement in the given bearing
+        if (payload.bearing === undefined) return;
+        const distance = Math.min(payload.distance ?? 5, 10); // cap at 10m
+        const rad = (payload.bearing * Math.PI) / 180;
+        const newPos = {
+          x: companionEntity.position.x + Math.sin(rad) * distance,
+          y: companionEntity.position.y,
+          z: companionEntity.position.z + Math.cos(rad) * distance,
+        };
+        const physics = zm.getPhysicsSystem();
+        const wallResolved = physics.resolveAgainstStructures(newPos, 0.5);
+        const snapped = zm.updateCompanionPosition(payload.companionId, wallResolved, payload.bearing);
+        void this.broadcastPositionUpdate(payload.companionId, zoneId, snapped, 2.0, 500);
+        break;
+      }
+    }
+
+    logger.debug({
+      companionId: payload.companionId,
+      action: payload.action,
+    }, '[BYOLLM] Social action executed from client LLM');
   }
 
   // ── Companion loadout handlers ──────────────────────────────────────────
