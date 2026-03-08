@@ -592,8 +592,16 @@ Available fields:
 - preferredRange: "melee" | "close" | "mid" | "far"
 - priority: "weakest" | "nearest" | "threatening_player"
 - stance: "aggressive" | "cautious" | "support"
+- engagementMode: "aggressive" | "defensive" | "passive" (aggressive = charge hostiles, defensive = only if attacked, passive = wait for orders)
 - abilityWeights: { "heal": 0-1, "damage": 0-1, "cc": 0-1 }
 - retreatThreshold: 0-1 (fraction of max HP to trigger retreat)
+- healAllyThreshold: 0-1 (switch to healing allies below this HP%)
+- minHealTarget: 0-1 (don't heal targets above this HP% — prevents overhealing)
+- healPriorityMode: "lowest_hp" | "most_damage_taken" | "tank_first"
+- saveCooldownsForElites: true/false (hold long-CD abilities for elites/bosses)
+- minEnemyHpForBuffs: 0-1 (don't use buffs if mob below this HP%)
+- resourceReservePercent: 0-100 (keep this % of mana/stamina reserved for emergencies)
+- defensiveThreshold: 0-1 (use defensive abilities when own HP below this)
 
 Example response: {"stance": "support", "abilityWeights": {"heal": 0.9, "damage": 0.1}}
 Example response: {"preferredRange": "far", "priority": "weakest"}
@@ -646,6 +654,9 @@ Stay in character. A scrappy fighter rarely switches to support. A cautious heal
       if (raw.stance && ['aggressive', 'cautious', 'support'].includes(raw.stance)) {
         result.stance = raw.stance;
       }
+      if (raw.engagementMode && ['aggressive', 'defensive', 'passive'].includes(raw.engagementMode)) {
+        result.engagementMode = raw.engagementMode;
+      }
       if (typeof raw.retreatThreshold === 'number') {
         result.retreatThreshold = Math.max(0, Math.min(1, raw.retreatThreshold));
       }
@@ -656,6 +667,35 @@ Stay in character. A scrappy fighter rarely switches to support. A cautious heal
             result.abilityWeights[key] = Math.max(0, Math.min(1, value));
           }
         }
+      }
+
+      // Healing rules
+      if (typeof raw.healAllyThreshold === 'number') {
+        result.healAllyThreshold = Math.max(0, Math.min(1, raw.healAllyThreshold));
+      }
+      if (typeof raw.minHealTarget === 'number') {
+        result.minHealTarget = Math.max(0, Math.min(1, raw.minHealTarget));
+      }
+      if (raw.healPriorityMode && ['lowest_hp', 'most_damage_taken', 'tank_first'].includes(raw.healPriorityMode)) {
+        result.healPriorityMode = raw.healPriorityMode;
+      }
+
+      // Buff / cooldown rules
+      if (typeof raw.saveCooldownsForElites === 'boolean') {
+        result.saveCooldownsForElites = raw.saveCooldownsForElites;
+      }
+      if (typeof raw.minEnemyHpForBuffs === 'number') {
+        result.minEnemyHpForBuffs = Math.max(0, Math.min(1, raw.minEnemyHpForBuffs));
+      }
+
+      // Resource management
+      if (typeof raw.resourceReservePercent === 'number') {
+        result.resourceReservePercent = Math.max(0, Math.min(100, raw.resourceReservePercent));
+      }
+
+      // Recovery
+      if (typeof raw.defensiveThreshold === 'number') {
+        result.defensiveThreshold = Math.max(0, Math.min(1, raw.defensiveThreshold));
       }
 
       // If nothing valid was parsed, return null

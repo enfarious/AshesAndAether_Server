@@ -25,6 +25,19 @@ export type TargetPriority = 'weakest' | 'nearest' | 'threatening_player';
 
 export type CombatStance = 'aggressive' | 'cautious' | 'support';
 
+// ── Engagement mode ─────────────────────────────────────────────────────────
+
+/** Three-state engagement gate:
+ *  - aggressive: charge any hostile mob within detection range
+ *  - defensive:  only fight mobs attacking the owner or companion (uses enmity tracker)
+ *  - passive:    never auto-engage; only fight when player explicitly commands
+ */
+export type EngagementMode = 'aggressive' | 'defensive' | 'passive';
+
+// ── Heal priority ─────────────────────────────────────────────────────────
+
+export type HealPriorityMode = 'lowest_hp' | 'most_damage_taken' | 'tank_first';
+
 // ── The settings object ─────────────────────────────────────────────────────
 
 export interface CompanionCombatSettings {
@@ -36,18 +49,46 @@ export interface CompanionCombatSettings {
   /** Pull back if HP ratio drops below this (0–1). e.g. 0.25 = retreat at 25% HP. */
   retreatThreshold: number;
 
-  // ── Engagement rules (three-tier gate) ──────────────────────────────────
+  /** Three-state engagement mode — controls when the companion auto-engages. */
+  engagementMode: EngagementMode;
+
+  // ── Engagement overrides (applied on top of engagementMode) ────────────
   // Species-level overrides trump family-level.
-  // Anything not on either list goes to the LLM for an engage/ignore decision.
 
   /** Mob families to never initiate combat against. */
   ignoreFamily: string[];
-  /** Mob families to always engage (no LLM needed). */
+  /** Mob families to always engage (overrides engagementMode). */
   alwaysEngageFamily: string[];
   /** Mob species to never initiate combat against (overrides family rules). */
   ignoreSpecies: string[];
-  /** Mob species to always engage (overrides family rules, no LLM needed). */
+  /** Mob species to always engage (overrides family rules and engagementMode). */
   alwaysEngageSpecies: string[];
+
+  // ── Healing rules ──────────────────────────────────────────────────────
+
+  /** Switch focus to healing allies when their HP ratio drops below this (0–1). */
+  healAllyThreshold: number;
+  /** Don't heal targets above this HP ratio (0–1). Prevents overhealing. */
+  minHealTarget: number;
+  /** How to prioritize multiple injured allies. */
+  healPriorityMode: HealPriorityMode;
+
+  // ── Buff / cooldown rules ──────────────────────────────────────────────
+
+  /** Hold long-cooldown abilities for elites/bosses. */
+  saveCooldownsForElites: boolean;
+  /** Don't use buffs/CDs if target mob below this HP ratio (0–1). */
+  minEnemyHpForBuffs: number;
+
+  // ── Resource management ────────────────────────────────────────────────
+
+  /** Keep this % of mana/stamina reserved for emergencies (0–100). */
+  resourceReservePercent: number;
+
+  // ── Recovery ───────────────────────────────────────────────────────────
+
+  /** Use defensive abilities when own HP drops below this ratio (0–1). */
+  defensiveThreshold: number;
 }
 
 // ── Archetypes ──────────────────────────────────────────────────────────────
@@ -65,10 +106,18 @@ export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettin
     stance: 'aggressive',
     abilityWeights: { damage: 0.8, cc: 0.3, heal: 0.1 },
     retreatThreshold: 0.1,
+    engagementMode: 'aggressive',
     ignoreFamily: [],
     alwaysEngageFamily: ['beast', 'hare'],
     ignoreSpecies: [],
     alwaysEngageSpecies: [],
+    healAllyThreshold: 0.6,
+    minHealTarget: 0.85,
+    healPriorityMode: 'lowest_hp',
+    saveCooldownsForElites: false,
+    minEnemyHpForBuffs: 0.2,
+    resourceReservePercent: 10,
+    defensiveThreshold: 0.2,
   },
   cautious_healer: {
     preferredRange: 'mid',
@@ -76,10 +125,18 @@ export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettin
     stance: 'support',
     abilityWeights: { heal: 0.8, damage: 0.2, cc: 0.4 },
     retreatThreshold: 0.5,
+    engagementMode: 'defensive',
     ignoreFamily: ['aberration'],
     alwaysEngageFamily: [],
     ignoreSpecies: [],
     alwaysEngageSpecies: [],
+    healAllyThreshold: 0.75,
+    minHealTarget: 0.85,
+    healPriorityMode: 'lowest_hp',
+    saveCooldownsForElites: false,
+    minEnemyHpForBuffs: 0.2,
+    resourceReservePercent: 20,
+    defensiveThreshold: 0.5,
   },
   opportunist: {
     preferredRange: 'mid',
@@ -87,10 +144,18 @@ export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettin
     stance: 'cautious',
     abilityWeights: { damage: 0.5, cc: 0.4, heal: 0.3 },
     retreatThreshold: 0.25,
+    engagementMode: 'defensive',
     ignoreFamily: [],
     alwaysEngageFamily: [],
     ignoreSpecies: [],
     alwaysEngageSpecies: [],
+    healAllyThreshold: 0.6,
+    minHealTarget: 0.85,
+    healPriorityMode: 'lowest_hp',
+    saveCooldownsForElites: true,
+    minEnemyHpForBuffs: 0.2,
+    resourceReservePercent: 15,
+    defensiveThreshold: 0.4,
   },
   tank: {
     preferredRange: 'melee',
@@ -98,10 +163,18 @@ export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettin
     stance: 'aggressive',
     abilityWeights: { cc: 0.7, damage: 0.5, heal: 0.2 },
     retreatThreshold: 0.15,
+    engagementMode: 'aggressive',
     ignoreFamily: [],
     alwaysEngageFamily: ['beast'],
     ignoreSpecies: [],
     alwaysEngageSpecies: [],
+    healAllyThreshold: 0.5,
+    minHealTarget: 0.85,
+    healPriorityMode: 'tank_first',
+    saveCooldownsForElites: false,
+    minEnemyHpForBuffs: 0.2,
+    resourceReservePercent: 10,
+    defensiveThreshold: 0.15,
   },
 };
 
@@ -132,6 +205,7 @@ export function mergePartialSettings(
   if (partial.preferredRange !== undefined) merged.preferredRange = partial.preferredRange;
   if (partial.priority !== undefined) merged.priority = partial.priority;
   if (partial.stance !== undefined) merged.stance = partial.stance;
+  if (partial.engagementMode !== undefined) merged.engagementMode = partial.engagementMode;
   if (partial.retreatThreshold !== undefined) {
     merged.retreatThreshold = Math.max(0, Math.min(1, partial.retreatThreshold));
   }
@@ -147,6 +221,31 @@ export function mergePartialSettings(
   if (partial.alwaysEngageFamily !== undefined) merged.alwaysEngageFamily = [...partial.alwaysEngageFamily];
   if (partial.ignoreSpecies !== undefined) merged.ignoreSpecies = [...partial.ignoreSpecies];
   if (partial.alwaysEngageSpecies !== undefined) merged.alwaysEngageSpecies = [...partial.alwaysEngageSpecies];
+
+  // Healing rules
+  if (partial.healAllyThreshold !== undefined) {
+    merged.healAllyThreshold = Math.max(0, Math.min(1, partial.healAllyThreshold));
+  }
+  if (partial.minHealTarget !== undefined) {
+    merged.minHealTarget = Math.max(0, Math.min(1, partial.minHealTarget));
+  }
+  if (partial.healPriorityMode !== undefined) merged.healPriorityMode = partial.healPriorityMode;
+
+  // Buff / cooldown rules
+  if (partial.saveCooldownsForElites !== undefined) merged.saveCooldownsForElites = partial.saveCooldownsForElites;
+  if (partial.minEnemyHpForBuffs !== undefined) {
+    merged.minEnemyHpForBuffs = Math.max(0, Math.min(1, partial.minEnemyHpForBuffs));
+  }
+
+  // Resource management
+  if (partial.resourceReservePercent !== undefined) {
+    merged.resourceReservePercent = Math.max(0, Math.min(100, partial.resourceReservePercent));
+  }
+
+  // Recovery
+  if (partial.defensiveThreshold !== undefined) {
+    merged.defensiveThreshold = Math.max(0, Math.min(1, partial.defensiveThreshold));
+  }
 
   return merged;
 }

@@ -84,6 +84,14 @@ export interface CombatContext {
   atbCurrent: number;
   /** Whether companion has an auto-attack target already set. */
   hasAutoAttackTarget: boolean;
+  /** Current mana pool (for filtering abilities by manaCost). */
+  currentMana: number;
+  /** Max mana pool (for resource reserve calculations). */
+  maxMana: number;
+  /** Current stamina pool (for filtering abilities by staminaCost). */
+  currentStamina: number;
+  /** Max stamina pool (for resource reserve calculations). */
+  maxStamina: number;
 }
 
 // ── Movement speed ───────────────────────────────────────────────────────────
@@ -196,6 +204,34 @@ export class CompanionBehaviorTree {
     _deltaTime: number,
     result: BehaviorTickResult,
   ): void {
+    // 0a. Defensive self-heal — when own HP drops below defensiveThreshold, prioritize self-heal
+    const selfHpRatio = context.self.maxHealth > 0
+      ? context.self.currentHealth / context.self.maxHealth
+      : 1;
+    if (selfHpRatio < settings.defensiveThreshold) {
+      const selfHeal = this.findBestHealAbility(context, context.self.id);
+      if (selfHeal) {
+        result.abilityAction = { abilityId: selfHeal.id, targetId: context.self.id };
+        return;
+      }
+    }
+
+    // 0b. Proactive heal check — if any ally is injured, try to heal before attacking
+    const injuredAlly = this.findMostInjuredAlly(context, settings);
+    if (injuredAlly) {
+      const healAbility = this.findBestHealAbility(context, injuredAlly.id);
+      if (healAbility) {
+        const healDist = distance2D(context.self.position, injuredAlly.position);
+        if (healDist > healAbility.range) {
+          const heading = headingTo(context.self.position, injuredAlly.position);
+          result.movement = { heading, speed: COMPANION_MOVE_SPEED };
+          result.heading = heading;
+        }
+        result.abilityAction = { abilityId: healAbility.id, targetId: injuredAlly.id };
+        return;
+      }
+    }
+
     // 1. Select target
     const target = this.selectTarget(settings, context);
     if (!target) return;
@@ -265,7 +301,7 @@ export class CompanionBehaviorTree {
     // Support priority: heal injured allies > CC enemies > damage
 
     // 1. Check if any ally needs healing
-    const injuredAlly = this.findMostInjuredAlly(context);
+    const injuredAlly = this.findMostInjuredAlly(context, settings);
     if (injuredAlly) {
       const healAbility = this.findBestHealAbility(context, injuredAlly.id);
       if (healAbility) {
@@ -377,7 +413,10 @@ export class CompanionBehaviorTree {
       return { heading: facing, speed };
     }
 
-    // Too close — back away
+    // Too close — back away (but never for melee range, min=0 means get in their face)
+    if (rangeBand.min <= 0) {
+      return { heading: facing, speed: 0 };
+    }
     const dx = selfPos.x - targetPos.x;
     const dz = selfPos.z - targetPos.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
@@ -397,12 +436,45 @@ export class CompanionBehaviorTree {
     target: CombatEntity,
     distToTarget: number,
   ): { abilityId: string; targetId: string } | null {
-    // Filter to usable abilities: in range, off cooldown, enough ATB
+    // Resource reserve floors — keep this % in reserve for emergencies
+    const manaFloor = context.maxMana > 0
+      ? context.maxMana * (settings.resourceReservePercent / 100)
+      : 0;
+    const staminaFloor = context.maxStamina > 0
+      ? context.maxStamina * (settings.resourceReservePercent / 100)
+      : 0;
+
+    // Target HP ratio — used for minEnemyHpForBuffs check
+    const targetHpRatio = (target.maxHealth ?? 1) > 0
+      ? (target.currentHealth ?? 1) / (target.maxHealth ?? 1)
+      : 1;
+
+    // Filter to usable abilities: in range, off cooldown, enough ATB + resources
     const usable = context.abilities.filter(ability => {
       if (distToTarget > ability.range) return false;
       const cdRemaining = context.cooldowns.get(ability.id) ?? 0;
       if (cdRemaining > 0) return false;
       if (!ability.isFree && context.atbCurrent < ability.atbCost) return false;
+      if (ability.manaCost && context.currentMana < ability.manaCost) return false;
+      if (ability.staminaCost && context.currentStamina < ability.staminaCost) return false;
+
+      // Resource reserve — don't spend below the reserve floor (heals bypass this)
+      if (!ability.healing) {
+        if (ability.manaCost && (context.currentMana - ability.manaCost) < manaFloor) return false;
+        if (ability.staminaCost && (context.currentStamina - ability.staminaCost) < staminaFloor) return false;
+      }
+
+      // Save long-cooldown abilities for elites/bosses (single-target hard fights)
+      // Heuristic: multi-enemy pulls are trash packs — don't burn big CDs on them
+      if (settings.saveCooldownsForElites && ability.cooldown >= 10 && context.enemies.length > 1) {
+        return false;
+      }
+
+      // Don't waste buffs/CDs on nearly-dead enemies
+      if (ability.tags?.includes('buff') || ability.tags?.includes('cc')) {
+        if (targetHpRatio < settings.minEnemyHpForBuffs) return false;
+      }
+
       return true;
     });
 
@@ -421,12 +493,19 @@ export class CompanionBehaviorTree {
     scored.sort((a, b) => b.score - a.score);
     const chosen = scored[0].ability;
 
-    // Determine target (healing targets self/ally, damage targets enemy)
-    const targetId = chosen.healing
-      ? this.findMostInjuredAlly(context)?.id ?? context.self.id
-      : target.id;
+    // Determine target (healing targets injured ally/self, damage targets enemy)
+    if (chosen.healing) {
+      const injuredAlly = this.findMostInjuredAlly(context, settings);
+      if (injuredAlly) {
+        return { abilityId: chosen.id, targetId: injuredAlly.id };
+      }
+      // Nobody needs healing — fall back to best non-heal ability
+      const nonHeal = scored.find(s => !s.ability.healing);
+      if (nonHeal) return { abilityId: nonHeal.ability.id, targetId: target.id };
+      return null;
+    }
 
-    return { abilityId: chosen.id, targetId };
+    return { abilityId: chosen.id, targetId: target.id };
   }
 
   private categorizeAbility(ability: CombatAbilityDefinition): string {
@@ -438,25 +517,33 @@ export class CompanionBehaviorTree {
 
   // ── Healing helpers ──────────────────────────────────────────────────────
 
-  private findMostInjuredAlly(context: CombatContext): CombatEntity | null {
+  private findMostInjuredAlly(
+    context: CombatContext,
+    settings?: CompanionCombatSettings,
+  ): CombatEntity | null {
+    // Use settings thresholds if available, fall back to legacy 0.8
+    const threshold = settings?.healAllyThreshold ?? 0.8;
+    const minTarget = settings?.minHealTarget ?? 1.0;
+    const mode = settings?.healPriorityMode ?? 'lowest_hp';
+
     const candidates: CombatEntity[] = [];
 
     // Check owner
     if (context.owner?.isAlive) {
       const ownerHpRatio = (context.owner.currentHealth ?? 1) / (context.owner.maxHealth ?? 1);
-      if (ownerHpRatio < 0.8) candidates.push(context.owner);
+      if (ownerHpRatio < threshold) candidates.push(context.owner);
     }
 
     // Check other allies
     for (const ally of context.allies) {
       if (!ally.isAlive) continue;
       const hpRatio = (ally.currentHealth ?? 1) / (ally.maxHealth ?? 1);
-      if (hpRatio < 0.8) candidates.push(ally);
+      if (hpRatio < threshold) candidates.push(ally);
     }
 
     // Check self
     const selfRatio = context.self.currentHealth / context.self.maxHealth;
-    if (selfRatio < 0.8) {
+    if (selfRatio < threshold) {
       candidates.push({
         id: context.self.id,
         name: '',
@@ -470,14 +557,49 @@ export class CompanionBehaviorTree {
 
     if (candidates.length === 0) return null;
 
-    // Return most injured
-    let most = candidates[0];
+    // Filter out targets that are already healthy enough (prevent overhealing)
+    const needsHeal = candidates.filter(c => {
+      const ratio = (c.currentHealth ?? 1) / (c.maxHealth ?? 1);
+      return ratio < minTarget;
+    });
+
+    if (needsHeal.length === 0) return null;
+
+    // Pick based on priority mode
+    switch (mode) {
+      case 'tank_first': {
+        // Prioritize owner, then lowest HP
+        const owner = needsHeal.find(c => c.id === context.owner?.id);
+        if (owner) return owner;
+        return this.pickLowestHpFrom(needsHeal);
+      }
+      case 'most_damage_taken': {
+        // Sort by absolute missing HP (maxHealth - currentHealth) descending
+        let most = needsHeal[0];
+        let maxMissing = (most.maxHealth ?? 1) - (most.currentHealth ?? 0);
+        for (let i = 1; i < needsHeal.length; i++) {
+          const missing = (needsHeal[i].maxHealth ?? 1) - (needsHeal[i].currentHealth ?? 0);
+          if (missing > maxMissing) {
+            maxMissing = missing;
+            most = needsHeal[i];
+          }
+        }
+        return most;
+      }
+      case 'lowest_hp':
+      default:
+        return this.pickLowestHpFrom(needsHeal);
+    }
+  }
+
+  private pickLowestHpFrom(entities: CombatEntity[]): CombatEntity {
+    let most = entities[0];
     let lowestRatio = (most.currentHealth ?? 1) / (most.maxHealth ?? 1);
-    for (let i = 1; i < candidates.length; i++) {
-      const ratio = (candidates[i].currentHealth ?? 1) / (candidates[i].maxHealth ?? 1);
+    for (let i = 1; i < entities.length; i++) {
+      const ratio = (entities[i].currentHealth ?? 1) / (entities[i].maxHealth ?? 1);
       if (ratio < lowestRatio) {
         lowestRatio = ratio;
-        most = candidates[i];
+        most = entities[i];
       }
     }
     return most;
@@ -492,6 +614,8 @@ export class CompanionBehaviorTree {
       const cdRemaining = context.cooldowns.get(a.id) ?? 0;
       if (cdRemaining > 0) return false;
       if (!a.isFree && context.atbCurrent < a.atbCost) return false;
+      if (a.manaCost && context.currentMana < a.manaCost) return false;
+      if (a.staminaCost && context.currentStamina < a.staminaCost) return false;
       return true;
     });
 

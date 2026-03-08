@@ -34,11 +34,12 @@
 
 import { logger } from '@/utils/logger';
 import { randomUUID } from 'crypto';
-import type { VaultTemplateDefinition, VaultRoomDef } from './VaultTemplates';
+import { buildRoomsFromTier, type VaultTemplateDefinition, type VaultRoomDef } from './VaultTemplates';
 import {
   generateVaultGrid,
   getSpawnPositions,
   lerpPoint,
+  Tile,
   TILE_SIZE,
   type VaultTileGridData,
 } from './VaultTileGrid';
@@ -109,8 +110,12 @@ export interface VaultInstance {
   cleanupTimer: NodeJS.Timeout | null;
   combatLog: VaultCombatLogEntry[];
   lootAwarded: VaultLootRecord[];
+  /** Gold reward for completing the vault (from template). */
+  completionGold: number;
   /** Procedural tile grid (null if template has no generation params). */
   tileGrid: VaultTileGridData | null;
+  /** Gate states — parallel to tileGrid.gates. true = open (passable). */
+  gateStates: boolean[];
 }
 
 export interface VaultSummary {
@@ -146,6 +151,7 @@ export type VaultSpawnMobFn = (
   position: { x: number; y: number; z: number },
   level: number,
   scalingModifiers: VaultScalingModifiers,
+  wanderRadius?: number,
 ) => Promise<string>; // Returns spawned mob entity ID
 
 export type VaultCreateZoneFn = (
@@ -159,6 +165,11 @@ export type VaultDestroyZoneFn = (
 
 export type VaultEjectPlayerFn = (
   characterId: string,
+) => Promise<void>;
+
+export type VaultAwardGoldFn = (
+  characterId: string,
+  amount: number,
 ) => Promise<void>;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -189,6 +200,7 @@ export class VaultManager {
     private createZone: VaultCreateZoneFn,
     private destroyZone: VaultDestroyZoneFn,
     private ejectPlayer: VaultEjectPlayerFn,
+    private awardGold: VaultAwardGoldFn,
   ) {}
 
   // ── Instance lifecycle ─────────────────────────────────────────────────────
@@ -215,8 +227,13 @@ export class VaultManager {
     // Create the zone DB record
     const zoneId = await this.createZone(instanceId, template);
 
-    // Build room state from template
-    const rooms: VaultRoom[] = template.rooms.map((def, i) => ({
+    // Build room state — use tier-based generation when available, else static template
+    const roomDefs: VaultRoomDef[] =
+      template.tierMobDefs && template.generation?.tier != null
+        ? buildRoomsFromTier(template.generation.tier, template.tierMobDefs)
+        : template.rooms;
+
+    const rooms: VaultRoom[] = roomDefs.map((def, i) => ({
       index: i,
       name: def.name,
       def,
@@ -242,6 +259,12 @@ export class VaultManager {
       const widthTiles  = Math.floor(template.zoneDimensions.sizeX / TILE_SIZE);
       const heightTiles = Math.floor(template.zoneDimensions.sizeZ / TILE_SIZE);
       tileGrid = generateVaultGrid(widthTiles, heightTiles, template.generation, instanceId);
+
+      // Attach 3D geometry metadata so the client can build walls + ceiling
+      if (template.geometry) {
+        tileGrid.geometry = template.geometry;
+      }
+
       logger.info(
         { instanceId, widthTiles, heightTiles, entrance: tileGrid.entrance, exit: tileGrid.exit },
         'Vault tile grid generated',
@@ -264,7 +287,9 @@ export class VaultManager {
       cleanupTimer: null,
       combatLog: [],
       lootAwarded: [],
+      completionGold: template.completionGold,
       tileGrid,
+      gateStates: new Array(tileGrid?.gates?.length ?? 0).fill(false),
     };
 
     this.instances.set(instanceId, instance);
@@ -304,15 +329,25 @@ export class VaultManager {
     const totalMobs = room.def.mobs.reduce((sum, m) => sum + m.count, 0);
     let mobPositions: Array<{ x: number; y: number; z: number }>;
 
-    if (instance.tileGrid) {
-      // Progression: mobs spawn deeper along entrance→exit axis per room
+    // Compute room-aware radius from stored room dimensions
+    const roomSize = instance.tileGrid?.roomSizes?.[roomIndex];
+    const roomRadius = roomSize
+      ? Math.max(roomSize.width, roomSize.height) / 2
+      : 18;
+
+    if (instance.tileGrid?.roomCenters?.[roomIndex]) {
+      // Multi-room: each room has its own center anchor.
+      // maxDistance keeps spawns inside the room.
+      const anchor = instance.tileGrid.roomCenters[roomIndex]!;
+      mobPositions = getSpawnPositions(instance.tileGrid, anchor, totalMobs, 3, roomRadius);
+    } else if (instance.tileGrid) {
+      // Single-room fallback: distribute mobs along entrance→exit axis
       const totalRooms = instance.rooms.length;
-      const t0 = (roomIndex + 0.2) / totalRooms;       // start ratio
-      const t1 = (roomIndex + 0.8) / totalRooms;       // end ratio
-      const anchor = lerpPoint(instance.tileGrid.entrance, instance.tileGrid.exit, (t0 + t1) / 2);
+      const t = (roomIndex + 0.5) / totalRooms;
+      const anchor = lerpPoint(instance.tileGrid.entrance, instance.tileGrid.exit, t);
       mobPositions = getSpawnPositions(instance.tileGrid, anchor, totalMobs, 3);
     } else {
-      // Fallback: use hardcoded template positions
+      // No tile grid: use hardcoded template positions
       mobPositions = room.def.spawnPositions.mob.slice();
     }
 
@@ -331,6 +366,7 @@ export class VaultManager {
             pos,
             level,
             scaling,
+            roomRadius,
           );
           room.activeMobIds.add(entityId);
         } catch (err) {
@@ -408,6 +444,10 @@ export class VaultManager {
 
       logger.info({ instanceId, roomIndex: instance.currentRoom }, 'Vault room cleared');
 
+      // ── Open any gates unlocked by clearing this room ─────────────
+      // Gate at corridor i opens when room i is cleared.
+      this.tryOpenGate(instance, instance.currentRoom, allIds);
+
       // Advance to next room or complete
       const nextRoomIndex = instance.currentRoom + 1;
       if (nextRoomIndex < instance.rooms.length) {
@@ -418,6 +458,61 @@ export class VaultManager {
         void this.completeVault(instanceId);
       }
     }
+  }
+
+  // ── Gate management ─────────────────────────────────────────────────────────
+
+  /**
+   * Open the gate at corridor `corridorIndex` if one exists.
+   * Swaps gate WALL tiles back to FLOOR in the live tile grid and
+   * broadcasts `vault_gate_opened` so clients can update.
+   */
+  private tryOpenGate(
+    instance: VaultInstance,
+    corridorIndex: number,
+    recipientIds: string[],
+  ): void {
+    if (!instance.tileGrid?.gates) return;
+
+    const gateIdx = instance.tileGrid.gates.findIndex(
+      g => g.corridorIndex === corridorIndex,
+    );
+    if (gateIdx === -1) return;
+    if (instance.gateStates[gateIdx]) return; // already open
+
+    const gate = instance.tileGrid.gates[gateIdx]!;
+
+    // Swap gate tiles from WALL → FLOOR in the live grid
+    for (const { row, col } of gate.tiles) {
+      const idx = row * instance.tileGrid.width + col;
+      instance.tileGrid.tiles[idx] = Tile.FLOOR;
+    }
+
+    instance.gateStates[gateIdx] = true;
+
+    this.broadcast(instance.instanceId, recipientIds, 'vault_gate_opened', {
+      instanceId: instance.instanceId,
+      corridorIndex,
+      gateIndex: gateIdx,
+      position: gate.position,
+      orientation: gate.orientation,
+      tiles: gate.tiles,
+      message: 'A gate has opened ahead!',
+    });
+
+    logger.info(
+      { instanceId: instance.instanceId, corridorIndex, gateIndex: gateIdx },
+      'Vault gate opened',
+    );
+  }
+
+  /**
+   * Check if a specific gate is open.
+   */
+  isGateOpen(instanceId: string, gateIndex: number): boolean {
+    const instance = this.instances.get(instanceId);
+    if (!instance) return false;
+    return instance.gateStates[gateIndex] ?? false;
   }
 
   // ── Completion / Failure ────────────────────────────────────────────────────
@@ -433,13 +528,33 @@ export class VaultManager {
 
     instance.phase = 'COMPLETE';
 
+    // ── Distribute completion gold to all online participants ────────────
+    const onlineParticipants = Array.from(instance.participants.values()).filter(p => p.isOnline);
+    const participantCount = Math.max(1, onlineParticipants.length);
+    const goldPerPlayer = Math.floor(instance.completionGold / participantCount);
+
+    if (goldPerPlayer > 0) {
+      for (const participant of onlineParticipants) {
+        try {
+          await this.awardGold(participant.characterId, goldPerPlayer);
+        } catch (err) {
+          logger.error({ characterId: participant.characterId, gold: goldPerPlayer, err }, 'Failed to award vault completion gold');
+        }
+      }
+      logger.info(
+        { instanceId, totalGold: instance.completionGold, perPlayer: goldPerPlayer, players: participantCount },
+        'Vault completion gold distributed',
+      );
+    }
+
     const summary = this.buildSummary(instance);
     const allIds = this.getOnlineParticipantIds(instance);
 
     this.broadcast(instanceId, allIds, 'vault_complete', {
       instanceId,
       summary,
-      message: 'Vault complete! Use /vault leave to return to the overworld.',
+      goldAwarded: goldPerPlayer,
+      message: `Vault complete! Each participant receives ${goldPerPlayer} gold. Use /vault leave to return to the overworld.`,
     });
 
     logger.info(

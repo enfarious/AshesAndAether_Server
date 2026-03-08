@@ -159,6 +159,17 @@ export const useCommand: CommandDefinition = {
         resource: resourceLabel,
         value: updatedValue,
       },
+      events: [{
+        type: 'use_item',
+        data: {
+          characterId: context.characterId,
+          resource: resourceLabel,
+          value: updatedValue,
+          maxHp: character.maxHp,
+          maxStamina: character.maxStamina,
+          maxMana: character.maxMana,
+        },
+      }],
     };
   },
 };

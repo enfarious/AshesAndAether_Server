@@ -80,6 +80,7 @@ export interface CommandContext {
 
   // Account flags
   isGuest?: boolean;
+  isGM?: boolean;
 }
 
 // ========== Command Result ==========

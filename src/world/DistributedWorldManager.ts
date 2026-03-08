@@ -1,5 +1,5 @@
 import { logger } from '@/utils/logger';
-import { AccountService, CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService, prisma } from '@/database';
+import { AccountService, CharacterService, CompanionService, MobService, ZoneService, InventoryService, LootService, WalletService, prisma } from '@/database';
 import { randomUUID } from 'crypto';
 import type { LootSessionStartPayload, LootItemResultPayload, LootSessionEndPayload, LootSessionItem } from '@/network/protocol/types';
 import { ZoneManager } from './ZoneManager';
@@ -131,6 +131,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private characterToZone: Map<string, string> = new Map();
   private companionToZone: Map<string, string> = new Map();
   private npcControllers: Map<string, NPCAIController> = new Map(); // companionId -> controller
+  /** Last companion_status broadcast time per companion ID (throttle ~1s). */
+  private _companionStatusLastSent = new Map<string, { time: number; state: string }>();
   private companionBehaviorExecutors: Map<string, BehaviorTreeExecutor> = new Map(); // companionId -> task executor
   private companionTaskService: CompanionTaskService = new CompanionTaskService();
   private llmService: LLMService;
@@ -400,8 +402,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
         }
       },
       // spawnMob: create a mob entity in the vault zone
-      async (zoneId, mobTag, position, level, scalingModifiers) => {
-        return this.spawnVaultMob(zoneId, mobTag, position, level, scalingModifiers);
+      async (zoneId, mobTag, position, level, scalingModifiers, wanderRadius) => {
+        return this.spawnVaultMob(zoneId, mobTag, position, level, scalingModifiers, wanderRadius);
       },
       // createZone: spin up vault zone instance
       async (instanceId, vaultTemplate) => {
@@ -415,6 +417,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
       async (characterId) => {
         await this.ejectPlayerFromVault(characterId);
       },
+      // awardGold: give completion gold to a participant
+      async (characterId, amount) => {
+        await WalletService.addGold(characterId, amount, 'vault_completion');
+      },
     );
     setVaultManager(this.vaultManager);
     logger.info('Vault system initialized');
@@ -425,6 +431,18 @@ export class DistributedWorldManager implements IWildlifeWorld {
    */
   async initialize(): Promise<void> {
     logger.info({ serverId: this.serverId, zoneCount: this.assignedZoneIds.length }, 'Initializing distributed world manager');
+
+    // Clean up stale ephemeral zone assignments left by a previous run of this
+    // server (e.g. crash/restart).  The serverId is static ('zoneserver-1'), so
+    // the heartbeat check passes even though the vault/village instances are gone.
+    const staleAssignments = await this.zoneRegistry.getAllZoneAssignments();
+    for (const assignment of staleAssignments) {
+      if (assignment.serverId !== this.serverId) continue;
+      if (assignment.zoneId.startsWith('vault:') || assignment.zoneId.startsWith('village:')) {
+        logger.info({ zoneId: assignment.zoneId }, 'Cleaning up stale ephemeral zone assignment from previous server run');
+        await this.zoneRegistry.unassignZone(assignment.zoneId);
+      }
+    }
 
     // If no zones assigned, load all zones (for single-server mode)
     if (this.assignedZoneIds.length === 0) {
@@ -688,6 +706,21 @@ export class DistributedWorldManager implements IWildlifeWorld {
       this.npcControllers.set(companion.id, controller);
       this.companionToZone.set(companion.id, zoneId);
 
+      // Compute max mana/stamina from companion stats for HUD resource bars
+      const zm = this.zones.get(zoneId);
+      if (zm) {
+        const cStats = (companion.stats as Record<string, number>) || {};
+        const derived = StatCalculator.calculateDerivedStats({
+          strength: cStats.strength ?? 10, vitality: cStats.vitality ?? 10,
+          dexterity: cStats.dexterity ?? 10, agility: cStats.agility ?? 10,
+          intelligence: cStats.intelligence ?? 10, wisdom: cStats.wisdom ?? 10,
+        }, companion.level);
+        zm.setEntityResources(companion.id, {
+          currentMana: derived.maxMana, maxMana: derived.maxMana,
+          currentStamina: derived.maxStamina, maxStamina: derived.maxStamina,
+        });
+      }
+
       // Resume behavior tree if companion was in TASKED mode with a stored tree
       if (companion.behaviorState === 'tasked' && companion.behaviorTree) {
         try {
@@ -815,12 +848,37 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     zm.addCompanion(companion);
 
+    // Compute max mana/stamina from companion stats so the HUD can show resource bars
+    const compStats = (companion.stats as Record<string, number>) || {};
+    const derived = StatCalculator.calculateDerivedStats({
+      strength: compStats.strength ?? 10, vitality: compStats.vitality ?? 10,
+      dexterity: compStats.dexterity ?? 10, agility: compStats.agility ?? 10,
+      intelligence: compStats.intelligence ?? 10, wisdom: compStats.wisdom ?? 10,
+    }, companion.level);
+    zm.setEntityResources(companion.id, {
+      currentMana: derived.maxMana, maxMana: derived.maxMana,
+      currentStamina: derived.maxStamina, maxStamina: derived.maxStamina,
+    });
+
     const controller = new NPCAIController(companion, this.llmService);
-    // Wire any saved abilities from DB
-    if (companion.abilityIds?.length) {
-      const resolved = T1_ABILITIES.filter(a => companion.abilityIds.includes(a.id));
-      if (resolved.length > 0) controller.setAbilities(resolved);
+    // Wire abilities — use saved DB list, or assign defaults if empty
+    let abilityIds = companion.abilityIds ?? [];
+    if (abilityIds.length === 0) {
+      // Every companion gets mend (healing) plus archetype-appropriate abilities
+      const archetype = companion.archetype ?? 'opportunist';
+      const defaultAbilities: Record<string, string[]> = {
+        scrappy_fighter: ['mend', 'power_strike'],
+        cautious_healer: ['mend', 'embolden'],
+        opportunist:     ['mend', 'shadow_bolt', 'ensnare'],
+        tank:            ['mend', 'provoke'],
+      };
+      abilityIds = defaultAbilities[archetype] ?? ['mend'];
+      // Persist so we don't re-derive next time
+      void CompanionService.updateCombatConfig(companion.id, { abilityIds });
+      logger.info({ companionId: companion.id, archetype, abilityIds }, 'Assigned default abilities to companion');
     }
+    const resolved = T1_ABILITIES.filter(a => abilityIds.includes(a.id));
+    if (resolved.length > 0) controller.setAbilities(resolved);
     this.npcControllers.set(companion.id, controller);
     this.companionToZone.set(companion.id, zoneId);
 
@@ -948,6 +1006,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
           const refreshed = await CompanionService.findById(ownedCompanion.id);
           if (refreshed) {
             await this.registerCompanionInZone(refreshed, character.zoneId);
+            this._pushCompanionConfig(character.id, refreshed);
             logger.info({ companionId: refreshed.id, ownerId: character.id, zoneId: character.zoneId },
               'Companion re-spawned — owner entered zone');
           }
@@ -961,6 +1020,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
             logger.info({ companionId: ownedCompanion.id, ownerId: character.id },
               'Companion teleported to owner on login');
           }
+          // Push config so the CompanionHUD populates immediately
+          this._pushCompanionConfig(character.id, ownedCompanion);
         }
       }
     } catch (err) {
@@ -1206,6 +1267,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const zoneManager = new ZoneManager(zone);
     await zoneManager.initialize();
 
+    // Vault zones use static indoor lighting (unaffected by time-of-day)
+    zoneManager.setLightingOverride('vault');
+
     // Subscribe to the vault zone's input channel
     const channel = `zone:${zoneId}:input`;
     await this.messageBus.subscribe(channel, (msg: MessageEnvelope) => this.handleZoneMessage(msg));
@@ -1222,6 +1286,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
     // Register in ZoneRegistry so gateway can find it
     await this.zoneRegistry.assignZone(zoneId, this.serverId);
+
+    // Create a wander system for vault mobs (mobs are added as they spawn)
+    this.mobWanderSystems.set(zoneId, new MobWanderSystem());
 
     // Publish entities to Redis for world_entry
     await this.publishZoneEntities(zoneId, zoneManager);
@@ -1259,6 +1326,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     this.movementSystem.unregisterZoneManager(zoneId);
     this.vaultInstances.delete(zoneId);
     this.movementQueue.delete(zoneId);
+    this.mobWanderSystems.delete(zoneId);
 
     // Delete the transient Zone DB record
     try {
@@ -1281,6 +1349,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
     return this.vaultManager.getTileGrid(instanceId);
   }
 
+  /** Per-mob-type loot table + gold mapping for vault mobs. */
+  private static readonly VAULT_LOOT_MAP: Record<string, { lootTableId: string; goldDrop: number }> = {
+    'vault.construct.overlord': { lootTableId: 'loot-table-vault-boss',     goldDrop: 50 },
+    'vault.construct.overseer': { lootTableId: 'loot-table-vault-overseer', goldDrop: 30 },
+    // drone + sentinel default to 'loot-table-vault-construct', goldDrop 10
+  };
+
   /**
    * Spawn a mob entity inside a vault zone with scaled stats.
    * Returns the entity ID for tracking by VaultManager.
@@ -1291,6 +1366,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     position: { x: number; y: number; z: number },
     level: number,
     scaling: VaultScalingModifiers,
+    wanderRadius?: number,
   ): Promise<string> {
     const zoneManager = this.zones.get(zoneId);
     if (!zoneManager) throw new Error(`Zone ${zoneId} not found for vault mob spawn`);
@@ -1299,12 +1375,19 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const baseHp = Math.round((150 + level * 50) * scaling.mobHpMultiplier);
     const entityId = `vault-mob:${randomUUID()}`;
 
+    // Derive family/species from mobTag (e.g. "mob.drone" → family "drone", species "drone")
+    const tagParts = mobTag.split('.');
+    const mobFamily = tagParts[1] ?? 'construct';
+    const mobSpecies = tagParts.slice(1).join('_') || 'construct';
+
     // Create mob in DB for combat system compatibility
     const mob = await prisma.mob.create({
       data: {
         id: entityId,
         name: mobTag.split('.').pop() ?? 'Construct',
         tag: `${mobTag}.${entityId.slice(-8)}`, // Unique tag per spawn
+        family: mobFamily,
+        species: mobSpecies,
         level,
         stats: {
           strength:     8 + level * 2,
@@ -1325,13 +1408,23 @@ export class DistributedWorldManager implements IWildlifeWorld {
         aiType: 'aggressive',
         aggroRadius: 15.0,
         respawnTime: 0, // Vault mobs don't respawn
-        lootTableId: mobTag.includes('overlord') ? 'loot-table-vault-boss' : 'loot-table-vault-construct',
-        goldDrop: mobTag.includes('overlord') ? 50 : 10,
+        lootTableId: DistributedWorldManager.VAULT_LOOT_MAP[mobTag]?.lootTableId ?? 'loot-table-vault-construct',
+        goldDrop: DistributedWorldManager.VAULT_LOOT_MAP[mobTag]?.goldDrop ?? 10,
       },
     });
 
     // Add to zone manager using existing spawnMob method
     zoneManager.spawnMob(mob);
+
+    // Register with wander system using room-scaled radius so mobs roam their room.
+    // wanderRadius is derived from the room's larger dimension (half the max side).
+    // noLeash = true: vault mobs are fully corrupted — they aggro and chase until
+    // death with no leash or max-chase-distance limit.
+    const mobWanderRadius = wanderRadius ?? 8;
+    const wanderSys = this.mobWanderSystems.get(zoneId);
+    if (wanderSys) {
+      wanderSys.register(entityId, position, mobWanderRadius, true);
+    }
 
     logger.debug({ entityId, mobTag, level, zoneId, hp: baseHp }, 'Vault mob spawned');
     return entityId;
@@ -1897,10 +1990,12 @@ export class DistributedWorldManager implements IWildlifeWorld {
   }
 
   private async handlePlayerCommand(message: MessageEnvelope): Promise<void> {
-    const { characterId, zoneId, command } = message.payload as {
+    const { characterId, zoneId, command, currentTarget, focusTarget } = message.payload as {
       characterId: string;
       zoneId: string;
       command: string;
+      currentTarget?: string;
+      focusTarget?: string;
     };
 
     if (!this.commandExecutor) {
@@ -1909,7 +2004,18 @@ export class DistributedWorldManager implements IWildlifeWorld {
     }
 
     const zoneManager = this.zones.get(zoneId);
-    if (!zoneManager) return;
+    if (!zoneManager) {
+      // Zone doesn't exist on this server — if it's an ephemeral zone (vault/village)
+      // that died (e.g. server restart), rescue the player instead of silently dropping.
+      const isEphemeral = zoneId.startsWith('vault:') || zoneId.startsWith('village:');
+      if (isEphemeral) {
+        const socketId = (message.payload as any).socketId ?? message.socketId;
+        if (socketId) {
+          await this.rescueFromDeadZone(characterId, zoneId, socketId, command);
+        }
+      }
+      return;
+    }
 
     const entity = zoneManager.getEntity(characterId);
     if (!entity || !entity.socketId) {
@@ -1923,9 +2029,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
       return null;
     }
 
-    // Detect guest accounts (non-bcrypt hash with guest- prefix)
+    // Detect guest accounts (non-bcrypt hash with guest- prefix) and GM role
     const account = await AccountService.findByIdWithCharacters(character.accountId);
     const isGuest = account?.passwordHash.startsWith('guest-') ?? false;
+    const isGM = account?.role === 'gm' || account?.role === 'admin';
 
     const context: CommandContext = {
       characterId,
@@ -1935,8 +2042,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
       position: entity.position,
       heading: character.heading,
       inCombat: entity.inCombat || false,
+      currentTarget,
+      focusTarget,
       socketId: entity.socketId,
       isGuest,
+      isGM,
     };
 
     const result = await this.commandExecutor.execute(command, context);
@@ -2149,12 +2259,19 @@ export class DistributedWorldManager implements IWildlifeWorld {
             };
           }
 
-          const targetEntity = this.resolveCombatTarget(zoneManager, target);
+          const targetEntity = this.resolveCombatTarget(zoneManager, target, context);
           if (!targetEntity) {
-            return {
-              success: false,
-              error: `Target '${target}' not found.`,
+            // Provide context-aware error for subtarget tokens
+            const tokenErrors: Record<string, string> = {
+              '<t>':  'No target selected.',
+              '<ft>': 'No focus target set. Press F to set one.',
+              '<bt>': 'Not auto-attacking anything.',
+              '<tt>': "Current target isn't attacking anything.",
+              '<me>': 'Self not found in zone.',
             };
+            const tokenKey = target.trim().toLowerCase();
+            const error = tokenErrors[tokenKey] ?? `Target '${target}' not found.`;
+            return { success: false, error };
           }
 
           const attackerEntity = zoneManager.getEntity(context.characterId);
@@ -2422,6 +2539,43 @@ export class DistributedWorldManager implements IWildlifeWorld {
             plantId,
           );
           overrideResponse = { success: harvestResult.success, message: harvestResult.message, data: harvestResult.data };
+          break;
+        }
+        case 'use_item': {
+          // Sync resource changes + inventory after /use command
+          const { characterId: useCharId, resource, value, maxHp, maxStamina, maxMana } = event.data as {
+            characterId: string;
+            resource: string;
+            value: number;
+            maxHp: number;
+            maxStamina: number;
+            maxMana: number;
+          };
+
+          // Update zone entity's in-memory health so state_update broadcasts pick it up
+          if (resource === 'health') {
+            zoneManager.setEntityHealth(useCharId, value, maxHp);
+          }
+
+          // Push resource update to client immediately (don't wait for next tick)
+          const useResources: { health?: { current: number; max: number }; stamina?: { current: number; max: number }; mana?: { current: number; max: number } } = {};
+          if (resource === 'health')  useResources.health  = { current: value, max: maxHp };
+          if (resource === 'stamina') useResources.stamina = { current: value, max: maxStamina };
+          if (resource === 'mana')    useResources.mana    = { current: value, max: maxMana };
+          await this.sendCharacterResourcesUpdate(zoneManager, useCharId, useResources);
+
+          // Push updated inventory (quantity decremented / item removed)
+          const invPayload = await InventoryService.buildPayload(useCharId, 1);
+          const useSocketId = zoneManager.getSocketIdForCharacter(useCharId);
+          if (useSocketId) {
+            await this.messageBus.publish('gateway:output', {
+              type: MessageType.CLIENT_MESSAGE,
+              characterId: useCharId,
+              socketId: useSocketId,
+              payload: { socketId: useSocketId, event: 'inventory_update', data: invPayload } as ClientMessagePayload,
+              timestamp: Date.now(),
+            });
+          }
           break;
         }
         case 'unstuck': {
@@ -2710,6 +2864,41 @@ export class DistributedWorldManager implements IWildlifeWorld {
         }
 
         // ── Vault system events ────────────────────────────────────────
+        // ── GM tool events ──────────────────────────────────────────
+        case 'gm_inventory_refresh': {
+          const { characterId: gmCharId } = event.data as { characterId: string };
+          const gmInvPayload = await InventoryService.buildPayload(gmCharId, 1);
+          await this._sendToSocket(gmCharId, 'inventory_update', gmInvPayload);
+          break;
+        }
+        case 'gm_state_refresh': {
+          const { characterId: gmStateCharId } = event.data as { characterId: string };
+          const gmChar = await CharacterService.findById(gmStateCharId);
+          if (gmChar) {
+            // Push full character state update
+            await this._sendToSocket(gmStateCharId, 'state_update', {
+              timestamp: Date.now(),
+              character: {
+                level:         gmChar.level,
+                experience:    gmChar.experience,
+                abilityPoints: gmChar.abilityPoints,
+                statPoints:    gmChar.statPoints,
+              },
+            });
+            // Push resource update
+            const gmEntity = zoneManager.getEntity(gmStateCharId);
+            if (gmEntity) {
+              zoneManager.setEntityHealth(gmStateCharId, gmChar.currentHp, gmChar.maxHp);
+            }
+            await this.sendCharacterResourcesUpdate(zoneManager, gmStateCharId, {
+              health:  { current: gmChar.currentHp,      max: gmChar.maxHp },
+              stamina: { current: gmChar.currentStamina,  max: gmChar.maxStamina },
+              mana:    { current: gmChar.currentMana,     max: gmChar.maxMana },
+            });
+          }
+          break;
+        }
+
         case 'vault_enter': {
           try {
             // Check not already in a vault or village
@@ -2802,7 +2991,11 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
             // ── Derive player spawn positions from tile grid ────────────
             let playerSpawns: Array<{ x: number; y: number; z: number }>;
-            if (tileGrid) {
+            if (tileGrid?.roomCenters?.[0]) {
+              // Multi-room: spawn near Room 0 center, constrained to room bounds
+              playerSpawns = getSpawnPositions(tileGrid, tileGrid.roomCenters[0], partyMembers.length, 2, 18);
+            } else if (tileGrid) {
+              // Single-room: spawn near entrance
               playerSpawns = getSpawnPositions(tileGrid, tileGrid.entrance, partyMembers.length, 2);
             } else {
               playerSpawns = template.rooms[0]!.spawnPositions.player;
@@ -2886,7 +3079,56 @@ export class DistributedWorldManager implements IWildlifeWorld {
               destZ = spawn?.position?.z ?? 0;
             }
 
-            // Remove from vault manager tracking
+            // ── Despawn owned companions BEFORE vault cleanup ──────────────
+            // removeParticipant() may trigger vault instance teardown which
+            // deletes the zone. If the zone is gone when handlePlayerLeaveZone
+            // fires, companion cleanup never runs and the controller lingers —
+            // causing handlePlayerJoinZone to take the wrong (teleport) branch.
+            const vaultZm = this.zones.get(context.zoneId);
+            if (vaultZm) {
+              const removedCompIds: string[] = [];
+              for (const [companionId, cZoneId] of this.companionToZone.entries()) {
+                if (cZoneId !== context.zoneId) continue;
+                const ctrl = this.npcControllers.get(companionId);
+                if (!ctrl) continue;
+                if (ctrl.getCompanion().ownerCharacterId !== context.characterId) continue;
+
+                // Exit combat cleanly if in-flight
+                if (ctrl.inCombat) ctrl.exitCombat();
+
+                vaultZm.removeCompanion(companionId);
+                this.npcControllers.delete(companionId);
+                this.companionToZone.delete(companionId);
+                this.companionBehaviorExecutors.delete(companionId);
+                this.companionChatHistory.delete(companionId);
+                removedCompIds.push(companionId);
+
+                logger.info({ companionId, ownerId: context.characterId, zoneId: context.zoneId },
+                  'Companion despawned — owner leaving vault');
+              }
+
+              // Notify remaining vault players that companion entities are gone
+              if (removedCompIds.length > 0) {
+                const removePayload = {
+                  timestamp: Date.now(),
+                  entities: { removed: removedCompIds },
+                };
+                for (const [charId, charZoneId] of this.characterToZone.entries()) {
+                  if (charZoneId !== context.zoneId || charId === context.characterId) continue;
+                  const socketId = vaultZm.getSocketIdForCharacter(charId);
+                  if (!socketId) continue;
+                  await this.messageBus.publish('gateway:output', {
+                    type: MessageType.CLIENT_MESSAGE,
+                    characterId: charId,
+                    socketId,
+                    payload: { socketId, event: 'state_update', data: removePayload },
+                    timestamp: Date.now(),
+                  });
+                }
+              }
+            }
+
+            // Remove from vault manager tracking (may destroy the vault zone)
             this.vaultManager.removeParticipant(context.characterId);
 
             // Decrement vault player count
@@ -3923,8 +4165,53 @@ export class DistributedWorldManager implements IWildlifeWorld {
     });
   }
 
-  private resolveCombatTarget(zoneManager: ZoneManager, target: string) {
+  private resolveCombatTarget(
+    zoneManager: ZoneManager,
+    target: string,
+    context?: CommandContext,
+  ) {
     if (!target) return null;
+
+    // ── Subtarget token resolution ──────────────────────────────────────────
+    const token = target.trim().toLowerCase();
+    switch (token) {
+      case '<t>': {
+        // Current target — entity the client has selected
+        if (!context?.currentTarget) return null;
+        const e = zoneManager.getEntity(context.currentTarget);
+        return e && e.isAlive ? e : null;
+      }
+      case '<ft>': {
+        // Focus target — secondary pinned target
+        if (!context?.focusTarget) return null;
+        const e = zoneManager.getEntity(context.focusTarget);
+        return e && e.isAlive ? e : null;
+      }
+      case '<bt>': {
+        // Battle target — the mob/entity the player is auto-attacking
+        const btId = this.combatManager.getAutoAttackTarget(context?.characterId ?? '');
+        if (!btId) return null;
+        const e = zoneManager.getEntity(btId);
+        return e && e.isAlive ? e : null;
+      }
+      case '<tt>': {
+        // Target's target — what the current target is attacking
+        const tId = context?.currentTarget;
+        if (!tId) return null;
+        const ttId = this.combatManager.getAutoAttackTarget(tId);
+        if (!ttId) return null;
+        const e = zoneManager.getEntity(ttId);
+        return e && e.isAlive ? e : null;
+      }
+      case '<me>': {
+        // Self-target
+        if (!context) return null;
+        const e = zoneManager.getEntity(context.characterId);
+        return e && e.isAlive ? e : null;
+      }
+    }
+
+    // ── Standard ID / name resolution ───────────────────────────────────────
     const direct = zoneManager.getEntity(target);
     if (direct && direct.isAlive) return direct;
     const byName = zoneManager.findEntityByName(target);
@@ -4830,12 +5117,15 @@ export class DistributedWorldManager implements IWildlifeWorld {
     }
 
     if (!this.validateRange(attackerEntity.position, targetEntity.position, ability, attackerSnapshot.weapon?.range)) {
-      await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
-        eventType: 'combat_error',
-        timestamp: now,
-        narrative: `Target out of range.`,
-        eventTypeData: { reason: 'out_of_range', attackerId: characterId },
-      });
+      // Only broadcast range errors for player-initiated actions (skip companion/mob noise)
+      if (attackerEntity.type === 'player') {
+        await this.broadcastCombatEvent(zoneManager.getZone().id, attackerEntity.position, {
+          eventType: 'combat_error',
+          timestamp: now,
+          narrative: `Target out of range.`,
+          eventTypeData: { reason: 'out_of_range', attackerId: characterId },
+        });
+      }
       return null;
     }
 
@@ -5137,10 +5427,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
         const newHp = Math.max(0, targetData.currentHealth - result.amount);
         await this.updateHealth(targetData, newHp);
 
-        // Mirror health into ZoneManager so publishZoneEntities stays current
-        if (!targetData.isPlayer) {
-          zoneManager.setEntityHealth(targetData.entityId, newHp, targetData.maxHealth);
-        }
+        // Mirror health into ZoneManager so publishZoneEntities and companion AI stay current
+        zoneManager.setEntityHealth(targetData.entityId, newHp, targetData.maxHealth);
 
         // Root-break: if target is rooted, check if damage breaks the root
         this.combatManager.checkRootBreak(target.id, result.amount);
@@ -5300,7 +5588,18 @@ export class DistributedWorldManager implements IWildlifeWorld {
             // Vault mob death: notify VaultManager for room clear tracking
             if (VaultManager.isVaultZone(deadMobZoneId)) {
               this.vaultManager.reportMobDeath(targetData.entityId, deadMobZoneId);
-              // Vault mobs don't respawn — skip scheduleMobRespawn
+              // Vault mobs don't respawn — but still need to despawn after death animation
+              const vaultMobId = targetData.entityId;
+              const vaultZoneId = deadMobZoneId;
+              setTimeout(async () => {
+                const zm = this.zones.get(vaultZoneId);
+                if (zm) {
+                  zm.removeMob(vaultMobId);
+                  await this.broadcastEntityRemoved(vaultZoneId, vaultMobId);
+                  await this.broadcastNearbyUpdate(vaultZoneId);
+                  await this.publishZoneEntities(vaultZoneId, zm);
+                }
+              }, 2500);
             } else {
               await this.scheduleMobRespawn(targetData.entityId, deadMobZoneId, targetData.maxHealth);
             }
@@ -5349,9 +5648,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
       const newHp = Math.min(healSnapshot.maxHealth, healSnapshot.currentHealth + healAmount);
       await this.updateHealth(healSnapshot, newHp);
 
-      if (!healSnapshot.isPlayer) {
-        zoneManager.setEntityHealth(targetId, newHp, healSnapshot.maxHealth);
-      }
+      // Mirror health into ZoneManager so companion AI can track ally HP
+      zoneManager.setEntityHealth(targetId, newHp, healSnapshot.maxHealth);
 
       if (healSnapshot.isPlayer) {
         await this.sendCharacterResourcesUpdate(zoneManager, targetId, {
@@ -5644,15 +5942,19 @@ export class DistributedWorldManager implements IWildlifeWorld {
         }
       }
 
+      // Read current mana/stamina from in-memory ZoneManager entity
+      const compZoneId = this.companionToZone.get(entityId);
+      const compEntity = compZoneId ? this.zones.get(compZoneId)?.getEntity(entityId) : null;
+
       return {
         entityId,
         isPlayer: false,
         currentHealth: companion.currentHealth,
         maxHealth: companion.maxHealth,
-        currentStamina: 0,
-        currentMana: 0,
-        maxStamina: 0,
-        maxMana: 0,
+        currentStamina: compEntity?.currentStamina ?? derived.maxStamina,
+        currentMana: compEntity?.currentMana ?? derived.maxMana,
+        maxStamina: compEntity?.maxStamina ?? derived.maxStamina,
+        maxMana: compEntity?.maxMana ?? derived.maxMana,
         coreStats,
         stats: compStats,
       };
@@ -6005,8 +6307,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
     if (ability.healthCost && snapshot.currentHealth <= ability.healthCost) return false;
     // Auto-attacks never cost stamina — skip the stamina gate entirely so low
     // stamina never blocks the weapon timer from firing.
-    if (!isAutoAttack && ability.staminaCost && snapshot.isPlayer && snapshot.currentStamina < ability.staminaCost) return false;
-    if (ability.manaCost && snapshot.isPlayer && snapshot.currentMana < ability.manaCost) return false;
+    if (!isAutoAttack && ability.staminaCost && snapshot.currentStamina < ability.staminaCost) return false;
+    if (ability.manaCost && snapshot.currentMana < ability.manaCost) return false;
     return true;
   }
 
@@ -6032,11 +6334,25 @@ export class DistributedWorldManager implements IWildlifeWorld {
       return;
     }
 
+    // Companion/mob: deduct health to DB, deduct mana/stamina in-memory via ZoneManager
     if (healthCost > 0) {
       await CompanionService.updateStatus(snapshot.entityId, {
         currentHealth: newHealth,
         isAlive: newHealth > 0,
       });
+    }
+    if (staminaCost > 0 || manaCost > 0) {
+      // Find the companion's zone and update in-memory resources
+      const compZoneId = this.companionToZone.get(snapshot.entityId);
+      if (compZoneId) {
+        const zm = this.zones.get(compZoneId);
+        if (zm) {
+          zm.setEntityResources(snapshot.entityId, {
+            currentStamina: Math.max(0, snapshot.currentStamina - staminaCost),
+            currentMana: Math.max(0, snapshot.currentMana - manaCost),
+          });
+        }
+      }
     }
   }
 
@@ -6601,6 +6917,59 @@ export class DistributedWorldManager implements IWildlifeWorld {
     return { success: true, message: 'Nudging you to a nearby clear spot…' };
   }
 
+  /**
+   * Rescue a player stuck in a dead ephemeral zone (vault/village whose server
+   * instance no longer exists). Sends them to their saved return point or
+   * Stephentown as a fallback, regardless of what command they ran.
+   */
+  private async rescueFromDeadZone(
+    characterId: string,
+    deadZoneId: string,
+    socketId: string,
+    command: string,
+  ): Promise<void> {
+    const character = await CharacterService.findById(characterId);
+
+    let destZoneId = character?.returnZoneId ?? null;
+    let destX = character?.returnPositionX ?? 0;
+    let destY = character?.returnPositionY ?? 0;
+    let destZ = character?.returnPositionZ ?? 0;
+
+    // If return point is missing or itself an ephemeral zone, fall back to starter
+    if (!destZoneId || destZoneId.startsWith('vault:') || destZoneId.startsWith('village:')) {
+      const fallbackZone = 'USA_NY_Stephentown';
+      const spawn = SpawnPointService.getStarterSpawn(fallbackZone);
+      destZoneId = fallbackZone;
+      destX = spawn?.position?.x ?? 12;
+      destY = spawn?.position?.y ?? 265;
+      destZ = spawn?.position?.z ?? -18;
+    }
+
+    await VillageService.updateCharacterZone(characterId, destZoneId, destX, destY, destZ);
+    await VillageService.clearReturnPoint(characterId);
+
+    logger.info({ characterId, from: deadZoneId, to: destZoneId }, '[DWM] Rescued player from dead ephemeral zone');
+
+    // Send zone transfer to move the client
+    await this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId,
+      socketId,
+      payload: {
+        socketId,
+        event: 'zone_transfer',
+        data: { zoneId: destZoneId },
+      },
+      timestamp: Date.now(),
+    });
+
+    // Also send a command response so the player sees feedback
+    await this.sendCommandResponse(socketId, command, {
+      success: true,
+      message: 'Instance no longer exists — returning you to safety.',
+    });
+  }
+
   private async processReturnCommand(
     characterId: string,
     zoneId: string,
@@ -6619,21 +6988,28 @@ export class DistributedWorldManager implements IWildlifeWorld {
     }
 
     // Determine destination — if in a village/vault instance, transfer back to
-    // the main world zone.  Otherwise teleport to the zone's city/starter spawn.
+    // the saved return point (where the player was before entering).
     const isEphemeral = VillageService.isVillageZone(zoneId) || VaultManager.isVaultZone(zoneId);
-    const destZoneId = isEphemeral
-      ? 'USA_NY_Stephentown'
-      : zoneId;
-
-    const spawn = SpawnPointService.getCitySpawn(destZoneId)
-      ?? SpawnPointService.getStarterSpawn(destZoneId);
-    const dest = spawn?.position ?? { x: 12, y: 265, z: -18 };
 
     if (isEphemeral) {
-      // Zone transfer: update DB, clear return point, trigger client reconnect
-      await VillageService.updateCharacterZone(
-        characterId, destZoneId, dest.x, dest.y, dest.z,
-      );
+      const character = await CharacterService.findById(characterId);
+
+      let destZoneId = character?.returnZoneId ?? null;
+      let destX = character?.returnPositionX ?? 0;
+      let destY = character?.returnPositionY ?? 0;
+      let destZ = character?.returnPositionZ ?? 0;
+
+      // If return point is missing or itself an ephemeral zone, fall back to starter
+      if (!destZoneId || destZoneId.startsWith('vault:') || destZoneId.startsWith('village:')) {
+        const fallbackZone = 'USA_NY_Stephentown';
+        const spawn = SpawnPointService.getStarterSpawn(fallbackZone);
+        destZoneId = fallbackZone;
+        destX = spawn?.position?.x ?? 12;
+        destY = spawn?.position?.y ?? 265;
+        destZ = spawn?.position?.z ?? -18;
+      }
+
+      await VillageService.updateCharacterZone(characterId, destZoneId, destX, destY, destZ);
       await VillageService.clearReturnPoint(characterId);
 
       if (socketId) {
@@ -6651,8 +7027,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
       }
 
       this.returnCooldowns.set(characterId, now);
-      logger.info({ characterId, from: zoneId, to: destZoneId, dest }, '[DWM] /return (zone transfer)');
-      return { success: true, message: `Returning to ${spawn?.name ?? 'Town Hall'}…` };
+      logger.info({ characterId, from: zoneId, to: destZoneId }, '[DWM] /return (zone transfer)');
+      return { success: true, message: 'Returning to where you were…' };
     }
 
     // Same-zone teleport
@@ -8207,6 +8583,14 @@ export class DistributedWorldManager implements IWildlifeWorld {
         const entity = zm.getEntity(id);
         if (!entity) continue;
         if (!entity.isAlive) continue; // Don't move corpses — wander system will be unregistered at despawn
+
+        // Root check: rooted mobs can't move — keep wander system in sync
+        // with the actual (unchanged) position so it doesn't desync.
+        if (this.combatManager.isRooted(id)) {
+          wanderSystem.updateCurrentPosition(id, entity.position);
+          continue;
+        }
+
         // Resolve candidate position against building walls before terrain snap,
         // so mobs obey the same structure collisions players do.
         const wallResolved = physics.resolveAgainstStructures(position, 0.5);
@@ -8769,24 +9153,27 @@ export class DistributedWorldManager implements IWildlifeWorld {
         const tdz = targetEntity.position.z - attackerEntity.position.z;
         if (Math.sqrt(tdx * tdx + tdz * tdz) > 100) {
           this.combatManager.clearAutoAttackTarget(attackerId);
-          const socketId = zoneManager.getSocketIdForEntity(attackerId);
-          if (socketId) {
-            await this.messageBus.publish('gateway:output', {
-              type: MessageType.CLIENT_MESSAGE,
-              characterId: attackerId,
-              socketId,
-              payload: {
+          // Only notify players — companion/mob range drops are silent
+          if (attackerEntity.type === 'player') {
+            const socketId = zoneManager.getSocketIdForEntity(attackerId);
+            if (socketId) {
+              await this.messageBus.publish('gateway:output', {
+                type: MessageType.CLIENT_MESSAGE,
+                characterId: attackerId,
                 socketId,
-                event: 'event',
-                data: {
-                  eventType: 'auto_attack_stopped',
-                  reason: 'target_out_of_range',
-                  narrative: 'Your target is too far away.',
-                  timestamp: Date.now(),
+                payload: {
+                  socketId,
+                  event: 'event',
+                  data: {
+                    eventType: 'auto_attack_stopped',
+                    reason: 'target_out_of_range',
+                    narrative: 'Your target is too far away.',
+                    timestamp: Date.now(),
+                  },
                 },
-              },
-              timestamp: Date.now(),
-            });
+                timestamp: Date.now(),
+              });
+            }
           }
           continue;
         }
@@ -8946,18 +9333,23 @@ export class DistributedWorldManager implements IWildlifeWorld {
         e.isAlive && (e.type === 'mob' || (e.faction === 'hostile'))
       );
 
-      // ── Engagement gate (three-tier: ignore → always-engage → ask LLM) ──
+      // ── Build attacker set for defensive mode ──────────────────────────
+      const ownerCharId = controller.getCompanion().ownerCharacterId;
+      const attackerIds = new Set<string>();
+      if (ownerCharId) {
+        for (const id of this.combatManager.getAttackersOf(ownerCharId)) attackerIds.add(id);
+      }
+      for (const id of this.combatManager.getAttackersOf(companionId)) attackerIds.add(id);
+      controller.setAttackerIds(attackerIds);
+
+      // ── Engagement gate (3-state: aggressive / defensive / passive) ──
       if (!controller.inCombat) {
         if (hostiles.length > 0) {
-          // Check if owner is nearby (for LLM engagement context)
-          const ownerNearby = nearbyEntities.some(e => e.type === 'player' && e.isAlive);
-
           // Filter through engagement rules
           const engageable: typeof hostiles = [];
           for (const enemy of hostiles) {
-            const shouldFight = await controller.shouldEngage(
-              { name: enemy.name, family: enemy.family, species: enemy.species, level: enemy.level },
-              ownerNearby,
+            const shouldFight = controller.shouldEngage(
+              { id: enemy.id, name: enemy.name, family: enemy.family, species: enemy.species, level: enemy.level },
             );
             if (shouldFight) engageable.push(enemy);
           }
@@ -8972,27 +9364,17 @@ export class DistributedWorldManager implements IWildlifeWorld {
         // No enemies left — exit combat
         controller.exitCombat();
         zm.setEntityCombatState(companionId, false);
+        // Send final status update so HUD reflects idle state
+        this._broadcastCompanionStatus(companionId, companionEntity, controller);
         continue;
       }
 
       if (!controller.inCombat) continue;
 
-      // Filter enemies to only those the companion has decided to fight
-      const engagedEnemies = hostiles.filter(e => {
-        // Re-check engagement lists for new mobs that wandered in mid-combat.
-        // Only engage explicitly listed mobs — unknown mobs are ignored.
-        const s = controller.getCurrentSettings();
-        if (e.species) {
-          if (s.alwaysEngageSpecies.includes(e.species)) return true;
-          if (s.ignoreSpecies.includes(e.species)) return false;
-        }
-        if (e.family) {
-          if (s.alwaysEngageFamily.includes(e.family)) return true;
-          if (s.ignoreFamily.includes(e.family)) return false;
-        }
-        // Unknown mid-combat — ignore (only fight what's on the engage lists)
-        return false;
-      });
+      // Filter enemies to only those the companion should fight (re-check for new mobs)
+      const engagedEnemies = hostiles.filter(e =>
+        controller.shouldEngage({ id: e.id, name: e.name, family: e.family, species: e.species, level: e.level }),
+      );
 
       // Build combat context for the behavior tree
       const combatContext = this.buildCompanionCombatContext(
@@ -9001,6 +9383,13 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
       // Tick the behavior tree
       const result = await controller.updateCombat(combatContext, deltaTime);
+
+      // Ensure auto-attack is set on the engagement target so the companion
+      // deals weapon damage even if its abilities are all ally-targeted (healer).
+      const engagementTarget = controller.getCurrentTargetId();
+      if (engagementTarget && !this.combatManager.hasAutoAttackTarget(companionId)) {
+        this.combatManager.setAutoAttackTarget(companionId, engagementTarget);
+      }
 
       // Apply movement intent — compute step from heading+speed, steer around buildings, wall-resolve
       if (result.movement) {
@@ -9025,11 +9414,74 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
       // Apply ability action output
       if (result.abilityAction) {
+        const abilityDef = controller.getAbilities().find(a => a.id === result.abilityAction!.abilityId);
+        if (abilityDef) {
+          controller.recordAbilityUse(abilityDef.id, abilityDef.name);
+        }
         void this.executeCompanionAbility(
           companionId, zoneId, result.abilityAction.abilityId, result.abilityAction.targetId, controller,
         );
       }
+
+      // ── Companion status broadcast (throttled ~1s or on state change) ──
+      this._broadcastCompanionStatus(companionId, companionEntity, controller);
     }
+  }
+
+  /**
+   * Send a lightweight companion_status event to the owner, throttled to ~1s
+   * or immediately on behavior state change.
+   */
+  private _broadcastCompanionStatus(
+    companionId: string,
+    entity: {
+      currentHealth?: number; maxHealth?: number; isAlive?: boolean;
+      currentMana?: number; maxMana?: number;
+      currentStamina?: number; maxStamina?: number;
+    },
+    controller: NPCAIController,
+  ): void {
+    const now = Date.now();
+    const behaviorState = controller.getBehaviorTreeState();
+    const prev = this._companionStatusLastSent.get(companionId);
+    const stateChanged = !prev || prev.state !== behaviorState;
+
+    if (!stateChanged && prev && now - prev.time < 1000) return;
+
+    this._companionStatusLastSent.set(companionId, { time: now, state: behaviorState });
+
+    const ownerCharId = controller.getCompanion().ownerCharacterId;
+    const socketId = this._charToSocket.get(ownerCharId);
+    if (!socketId) return;
+
+    const settings = controller.getCurrentSettings();
+    const lastAbility = controller.lastAbilityUsed;
+    const payload = {
+      companionId,
+      currentHealth:  entity.currentHealth ?? 0,
+      maxHealth:      entity.maxHealth ?? 0,
+      currentMana:    entity.currentMana ?? 0,
+      maxMana:        entity.maxMana ?? 0,
+      currentStamina: entity.currentStamina ?? 0,
+      maxStamina:     entity.maxStamina ?? 0,
+      isAlive:        entity.isAlive ?? true,
+      behaviorState,
+      engagementMode: settings.engagementMode,
+      llmPending:     controller.llmPending,
+      lastAbility:    lastAbility ? {
+        abilityId:   lastAbility.abilityId,
+        abilityName: lastAbility.abilityName,
+        timestamp:   lastAbility.timestamp,
+      } : null,
+    };
+
+    void this.messageBus.publish('gateway:output', {
+      type: MessageType.CLIENT_MESSAGE,
+      characterId: ownerCharId,
+      socketId,
+      payload: { socketId, event: 'companion_status', data: payload },
+      timestamp: now,
+    });
   }
 
   /**
@@ -9120,6 +9572,10 @@ export class DistributedWorldManager implements IWildlifeWorld {
       cooldowns,
       atbCurrent,
       hasAutoAttackTarget: this.combatManager.hasAutoAttackTarget(companionId),
+      currentMana: companionEntity.currentMana ?? 0,
+      maxMana: companionEntity.maxMana ?? 0,
+      currentStamina: companionEntity.currentStamina ?? 0,
+      maxStamina: companionEntity.maxStamina ?? 0,
     };
   }
 
@@ -9156,7 +9612,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
     await this.executeCombatAction(
       zoneManager,
       { id: companionEntity.id, position: companionEntity.position, type: companionEntity.type as 'companion' },
-      { id: targetEntity.id,   position: targetEntity.position,   type: targetEntity.type as 'mob' },
+      { id: targetEntity.id,   position: targetEntity.position,   type: targetEntity.type as 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' },
       ability,
     );
   }
@@ -9690,12 +10146,20 @@ export class DistributedWorldManager implements IWildlifeWorld {
       tags:        a.tags ?? [],
     }));
 
+    // Look up live entity resources (mana/stamina) from the zone
+    const compZoneId = this.companionToZone.get(companion.id);
+    const compEntity = compZoneId ? this.zones.get(compZoneId)?.getEntity(companion.id) : null;
+
     const payload = {
       companionId:       companion.id,
       name:              companion.name,
       level:             companion.level,
       currentHealth:     companion.currentHealth,
       maxHealth:         companion.maxHealth,
+      currentMana:       compEntity?.currentMana ?? 0,
+      maxMana:           compEntity?.maxMana ?? 0,
+      currentStamina:    compEntity?.currentStamina ?? 0,
+      maxStamina:        compEntity?.maxStamina ?? 0,
       isAlive:           companion.isAlive,
       archetype:         companion.archetype ?? 'opportunist',
       behaviorState:     companion.behaviorState ?? 'detached',

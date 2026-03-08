@@ -163,9 +163,25 @@ export const companionCommand: CommandDefinition = {
             case 'range':    settings.preferredRange = val; break;
             case 'priority': settings.priority = val; break;
             case 'retreat':  settings.retreatThreshold = parseFloat(val); break;
+            case 'engagementmode': settings.engagementMode = val; break;
             case 'damage': case 'cc': case 'heal':
               weights[key] = parseFloat(val);
               break;
+            // Healing / recovery
+            case 'healallyth':     settings.healAllyThreshold = parseFloat(val); break;
+            case 'minhealtarget':  settings.minHealTarget = parseFloat(val); break;
+            case 'healprio':       settings.healPriorityMode = val; break;
+            case 'defensiveth':    settings.defensiveThreshold = parseFloat(val); break;
+            // Buff / cooldown
+            case 'savecds':        settings.saveCooldownsForElites = val === 'true'; break;
+            case 'minenemyhp':     settings.minEnemyHpForBuffs = parseFloat(val); break;
+            // Resource
+            case 'reserve':        settings.resourceReservePercent = parseFloat(val); break;
+            // Engagement lists (comma-separated)
+            case 'ignorefamily':        settings.ignoreFamily = val.split(',').filter(Boolean); break;
+            case 'alwaysengagefamily':  settings.alwaysEngageFamily = val.split(',').filter(Boolean); break;
+            case 'ignorespecies':       settings.ignoreSpecies = val.split(',').filter(Boolean); break;
+            case 'alwaysengagespecies': settings.alwaysEngageSpecies = val.split(',').filter(Boolean); break;
           }
         }
         if (Object.keys(weights).length > 0) settings.abilityWeights = weights;

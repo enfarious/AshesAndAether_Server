@@ -12,6 +12,7 @@ model Account {
   email        String      @unique
   passwordHash String
   username     String      @unique
+  role         String      @default("player") // "player" | "gm" | "admin"
   createdAt    DateTime    @default(now())
   lastLoginAt  DateTime?
   characters   Character[]

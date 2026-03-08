@@ -72,3 +72,4 @@ dump.rdb
 /build_terrain.ps1
 /restart-distributed.ps1
 /AGENTS.md
+/*.lnk

@@ -43,6 +43,7 @@ import { marketCommand } from './market/market';
 import { guildCommand } from './social/guild';
 import { beaconCommand } from './world/beacon';
 import { libraryCommand } from './world/library';
+import { gmCommand } from './admin/gm';
 
 /**
  * Register all Phase 1 commands
@@ -99,6 +100,9 @@ export function registerAllCommands(registry: CommandRegistry): void {
   registry.register(attackCommand);
   registry.register(castCommand);
   registry.register(disengageCommand);
+
+  // Admin commands
+  registry.register(gmCommand);
 }
 
 /**

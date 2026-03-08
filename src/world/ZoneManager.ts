@@ -47,6 +47,10 @@ interface Entity {
   notorious?: boolean;   // Notorious Monster: client shows "??" for level + special marker
   currentHealth?: number;
   maxHealth?: number;
+  currentMana?: number;
+  maxMana?: number;
+  currentStamina?: number;
+  maxStamina?: number;
   // Wildlife-specific fields
   speciesId?: string;
   sprite?: string;
@@ -123,6 +127,8 @@ export class ZoneManager {
   private underwaterSeconds: Map<string, { seconds: number; lastUpdate: number }> = new Map();
   /** Vertical velocity (m/s) for entities currently in freefall. */
   private fallingVelocity: Map<string, number> = new Map();
+  /** Override for zone lighting (e.g. 'vault' for indoor vault zones). */
+  private lightingOverride: string | null = null;
 
   constructor(zone: Zone) {
     this.zone = zone;
@@ -304,11 +310,19 @@ export class ZoneManager {
 
   /**
    * Zone-level lighting modifier.
-   * Outdoor zones are 'normal'; dungeons or special zones could override this
-   * via config in the future.  For now always returns 'normal'.
+   * Outdoor zones return 'normal'; vault zones return 'vault' (static indoor
+   * lighting unaffected by time-of-day).
    */
   getLighting(): string {
-    return 'normal';
+    return this.lightingOverride ?? 'normal';
+  }
+
+  /**
+   * Set a lighting override for this zone (e.g. 'vault' for indoor vaults).
+   * When set, `getLighting()` returns this value instead of 'normal'.
+   */
+  setLightingOverride(lighting: string): void {
+    this.lightingOverride = lighting;
   }
 
   private _todString(): string {
@@ -355,6 +369,8 @@ export class ZoneManager {
         isMachine: true,
         isAlive: companion.isAlive ?? true,
         movementProfile: this.resolveMovementProfileFromTag(companion.tag),
+        currentHealth: companion.currentHealth,
+        maxHealth: companion.maxHealth,
       };
 
       this.entities.set(companion.id, entity);
@@ -460,6 +476,9 @@ export class ZoneManager {
       isMachine,
       isAlive: character.isAlive ?? true,
       movementProfile: this.resolveMovementProfileFromCharacter(character),
+      // Expose health so companion AI can evaluate healing targets
+      currentHealth: character.currentHp,
+      maxHealth: character.maxHp,
     };
 
     const freedive = this.resolveFreediveProfileFromCharacter(character);
@@ -573,6 +592,19 @@ export class ZoneManager {
     if (!entity) return;
     entity.currentHealth = current;
     entity.maxHealth     = max;
+  }
+
+  /** Set mana/stamina resources on an entity (used for companion resource tracking). */
+  setEntityResources(entityId: string, resources: {
+    currentMana?: number; maxMana?: number;
+    currentStamina?: number; maxStamina?: number;
+  }): void {
+    const entity = this.entities.get(entityId);
+    if (!entity) return;
+    if (resources.currentMana !== undefined) entity.currentMana = resources.currentMana;
+    if (resources.maxMana !== undefined) entity.maxMana = resources.maxMana;
+    if (resources.currentStamina !== undefined) entity.currentStamina = resources.currentStamina;
+    if (resources.maxStamina !== undefined) entity.maxStamina = resources.maxStamina;
   }
 
   teleportEntity(entityId: string, position: { x: number; y: number; z: number }): void {
@@ -1218,6 +1250,8 @@ export class ZoneManager {
       isMachine: true,
       isAlive: companion.isAlive ?? true,
       movementProfile: 'terrestrial' as MovementProfile,
+      currentHealth: companion.currentHealth,
+      maxHealth: companion.maxHealth,
     };
 
     this.entities.set(companion.id, entity);

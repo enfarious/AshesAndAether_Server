@@ -256,19 +256,21 @@ export class GatewayClientSession {
       this.sendDevAck('interact', routed, routed ? undefined : 'not_routed');
     });
 
-    this.socket.on('command', async (data: { command?: string } | string) => {
+    this.socket.on('command', async (data: { command?: string; currentTarget?: string; focusTarget?: string } | string) => {
       if (!this.characterId || !this.currentZoneId) {
         this.sendDevAck('command', false, 'not_in_world');
         return;
       }
 
-      const rawCommand = typeof data === 'string' ? data : data.command;
+      const rawCommand    = typeof data === 'string' ? data : data.command;
+      const currentTarget = typeof data === 'object' ? data.currentTarget : undefined;
+      const focusTarget   = typeof data === 'object' ? data.focusTarget   : undefined;
       if (!rawCommand || !rawCommand.trim()) {
         this.sendDevAck('command', false, 'empty_command');
         return;
       }
 
-      const routed = await this.routeCommandToZone(rawCommand);
+      const routed = await this.routeCommandToZone(rawCommand, currentTarget, focusTarget);
       this.sendDevAck('command', routed, routed ? undefined : 'not_routed');
     });
 
@@ -800,8 +802,34 @@ export class GatewayClientSession {
     return true;
   }
 
-  private async routeCommandToZone(rawCommand: string): Promise<boolean> {
+  private async routeCommandToZone(
+    rawCommand: string,
+    currentTarget?: string,
+    focusTarget?: string,
+  ): Promise<boolean> {
     if (!this.currentZoneId || !this.characterId) return false;
+
+    logger.info(
+      { characterId: this.characterId, zoneId: this.currentZoneId, command: rawCommand },
+      '[GCS] routeCommandToZone called',
+    );
+
+    // If in an ephemeral zone (vault/village) whose instance is dead,
+    // rescue the player instead of sending a command into the void.
+    const isEphemeral = this.currentZoneId.startsWith('vault:') || this.currentZoneId.startsWith('village:');
+    if (isEphemeral) {
+      const assignment = await this.zoneRegistry.getZoneAssignment(this.currentZoneId);
+      const alive = assignment ? await this.zoneRegistry.isServerAlive(assignment.serverId) : false;
+      logger.info(
+        { characterId: this.characterId, zoneId: this.currentZoneId, isEphemeral, hasAssignment: !!assignment, alive },
+        '[GCS] Ephemeral zone check',
+      );
+      if (!assignment || !alive) {
+        logger.info({ characterId: this.characterId, zoneId: this.currentZoneId }, '[GCS] Rescuing from dead zone');
+        await this.rescueFromDeadZone();
+        return true;
+      }
+    }
 
     const channel = `zone:${this.currentZoneId}:input`;
     await this.messageBus.publish(channel, {
@@ -814,11 +842,85 @@ export class GatewayClientSession {
         zoneId: this.currentZoneId,
         command: rawCommand,
         socketId: this.socket.id,
+        currentTarget,
+        focusTarget,
       },
       timestamp: Date.now(),
     });
 
     return true;
+  }
+
+  /**
+   * Rescue a player stuck in a dead ephemeral zone (vault/village).
+   * Uses their saved return point or falls back to Stephentown.
+   * Triggers a zone transfer to move them back to the live world.
+   */
+  private async rescueFromDeadZone(): Promise<void> {
+    if (!this.characterId) {
+      logger.warn('[GCS] rescueFromDeadZone called with no characterId');
+      return;
+    }
+
+    try {
+      const character = await CharacterService.findById(this.characterId);
+      if (!character) {
+        logger.warn({ characterId: this.characterId }, '[GCS] rescueFromDeadZone: character not found');
+        return;
+      }
+
+      logger.info(
+        { characterId: this.characterId, currentZoneId: this.currentZoneId, returnZoneId: character.returnZoneId },
+        '[GCS] rescueFromDeadZone starting',
+      );
+
+      let destZoneId = character.returnZoneId ?? null;
+      let destX = character.returnPositionX ?? 0;
+      let destY = character.returnPositionY ?? 0;
+      let destZ = character.returnPositionZ ?? 0;
+
+      // If return point is missing or itself ephemeral, fall back to starter
+      if (!destZoneId || destZoneId.startsWith('vault:') || destZoneId.startsWith('village:')) {
+        const fallbackZone = 'USA_NY_Stephentown';
+        const spawn = SpawnPointService.getStarterSpawn(fallbackZone);
+        destZoneId = fallbackZone;
+        destX = spawn?.position?.x ?? 12;
+        destY = spawn?.position?.y ?? 265;
+        destZ = spawn?.position?.z ?? -18;
+        logger.info({ characterId: this.characterId, destZoneId }, '[GCS] rescueFromDeadZone: using fallback zone');
+      }
+
+      // Clean up stale zone assignment
+      const staleAssignment = await this.zoneRegistry.getZoneAssignment(this.currentZoneId!);
+      if (staleAssignment) {
+        await this.zoneRegistry.unassignZone(this.currentZoneId!);
+      }
+
+      logger.info(
+        { characterId: this.characterId, from: this.currentZoneId, to: destZoneId, destX, destY, destZ },
+        '[GCS] Rescuing player from dead ephemeral zone',
+      );
+
+      await VillageService.updateCharacterZone(this.characterId, destZoneId, destX, destY, destZ);
+      await VillageService.clearReturnPoint(this.characterId);
+
+      // Send feedback + zone transfer
+      this.socket.emit('event', {
+        eventType: 'system_message',
+        narrative: 'Instance no longer exists — returning you to safety.',
+        timestamp: Date.now(),
+      });
+      this.socket.emit('zone_transfer', { zoneId: destZoneId });
+
+      logger.info({ characterId: this.characterId, destZoneId }, '[GCS] rescueFromDeadZone: zone_transfer emitted');
+    } catch (err: any) {
+      logger.error({ characterId: this.characterId, err: err.message, stack: err.stack }, '[GCS] rescueFromDeadZone failed');
+      this.socket.emit('event', {
+        eventType: 'system_message',
+        narrative: 'Failed to rescue from dead zone — try logging out and back in.',
+        timestamp: Date.now(),
+      });
+    }
   }
 
   private async routeEditorAction(action: string, data: Record<string, unknown>): Promise<void> {
@@ -1467,11 +1569,19 @@ export class GatewayClientSession {
     const isEphemeralZone = preCheck && (
       preCheck.zoneId.startsWith('village:') || preCheck.zoneId.startsWith('vault:')
     );
+    logger.info(
+      { characterId: this.characterId, zoneId: preCheck?.zoneId, isEphemeralZone },
+      '[GCS] enterWorld ephemeral zone pre-check',
+    );
     if (preCheck && isEphemeralZone) {
       const villageLive = await this.zoneRegistry.getZoneAssignment(preCheck.zoneId);
       const serverAlive = villageLive
         ? await this.zoneRegistry.isServerAlive(villageLive.serverId)
         : false;
+      logger.info(
+        { characterId: this.characterId, zoneId: preCheck.zoneId, hasAssignment: !!villageLive, serverId: villageLive?.serverId, serverAlive },
+        '[GCS] enterWorld ephemeral zone liveness check',
+      );
       if (!villageLive || !serverAlive) {
         // Clean up stale zone assignment left over from a previous server run
         if (villageLive && !serverAlive) {

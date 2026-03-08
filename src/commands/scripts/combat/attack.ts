@@ -7,32 +7,29 @@ import type { CommandDefinition, CommandContext, CommandResult, ParsedCommand } 
 export const attackCommand: CommandDefinition = {
   name: 'attack',
   aliases: ['atk'],
-  description: 'Attack a target using basic attack',
+  description: 'Attack a target using basic attack (defaults to current target)',
   category: 'combat',
-  usage: '/attack <target>',
+  usage: '/attack [target]',
   examples: [
     '/attack Old Merchant',
     '/atk bandit.1',
+    '/attack',          // defaults to current target (<t>)
+    '/attack <bt>',     // battle target
   ],
 
   parameters: {
     positional: [
       {
         type: 'string',
-        required: true,
-        description: 'Target name or ID',
+        required: false,
+        description: 'Target name, ID, or token (<t>, <ft>, <bt>, <tt>, <me>). Defaults to <t>.',
       },
     ],
   },
 
   handler: async (_context: CommandContext, args: ParsedCommand): Promise<CommandResult> => {
-    const target = args.positionalArgs.join(' ').trim();
-    if (!target) {
-      return {
-        success: false,
-        error: 'You must provide a target.',
-      };
-    }
+    // Default to <t> (current target) when no target is specified
+    const target = args.positionalArgs.join(' ').trim() || '<t>';
 
     return {
       success: true,

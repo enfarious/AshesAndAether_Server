@@ -54,6 +54,16 @@ export class NPCAIController {
   /** Cached engage/ignore decisions keyed by species (or family if no species). */
   private engagementCache = new Map<string, 'engage' | 'ignore'>();
 
+  /** Set of entity IDs currently attacking the owner or this companion.
+   *  Populated by DWM before calling shouldEngage() — used for 'defensive' mode. */
+  private _attackerIds = new Set<string>();
+
+  /** True while an LLM settings update call is in flight. */
+  private _llmPending = false;
+
+  /** Last ability the companion used — drives casting bar on the HUD. */
+  private _lastAbilityUsed: { abilityId: string; abilityName: string; timestamp: number } | null = null;
+
   constructor(companion: Companion, llmService: LLMService) {
     this.companion = companion;
     this.llmService = llmService;
@@ -101,50 +111,49 @@ export class NPCAIController {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // Engagement gate (three-tier: ignore → always-engage → ask LLM)
+  // Engagement gate (3-state: aggressive / defensive / passive)
   // ══════════════════════════════════════════════════════════════════════════
 
   /**
    * Should this companion/NPC engage a nearby enemy?
    *
-   * Resolution order (species overrides family):
-   * 1. species in alwaysEngageSpecies → engage
-   * 2. species in ignoreSpecies       → ignore
-   * 3. family in alwaysEngageFamily   → engage
-   * 4. family in ignoreFamily         → ignore
-   * 5. cache hit                      → return cached answer
-   * 6. Default: ignore (only fight what's explicitly listed)
+   * Resolution order:
+   * 1. Ignore-list overrides (always respected — species trumps family)
+   * 2. Always-engage overrides (always respected — species trumps family)
+   * 3. Engagement mode:
+   *    - aggressive → engage
+   *    - defensive  → only if mob is attacking owner or self (checked via _attackerIds)
+   *    - passive    → never auto-engage
    */
-  async shouldEngage(enemy: EngagementTarget, _ownerNearby: boolean): Promise<boolean> {
+  shouldEngage(enemy: EngagementTarget & { id?: string }): boolean {
     const { species, family } = enemy;
     const s = this.currentSettings;
 
-    // Species-level overrides (highest priority)
-    if (species) {
-      if (s.alwaysEngageSpecies.includes(species)) return true;
-      if (s.ignoreSpecies.includes(species)) return false;
+    // 1. Ignore-list overrides (always respected)
+    if (species && s.ignoreSpecies.includes(species)) return false;
+    if (family && s.ignoreFamily.includes(family)) return false;
+
+    // 2. Always-engage overrides (always respected)
+    if (species && s.alwaysEngageSpecies.includes(species)) return true;
+    if (family && s.alwaysEngageFamily.includes(family)) return true;
+
+    // 3. Engagement mode
+    switch (s.engagementMode) {
+      case 'aggressive':
+        return true;
+      case 'defensive':
+        // Only engage if the mob is attacking the owner or companion
+        return enemy.id ? this._attackerIds.has(enemy.id) : false;
+      case 'passive':
+        return false;
+      default:
+        return false;
     }
+  }
 
-    // Family-level rules
-    if (family) {
-      if (s.alwaysEngageFamily.includes(family)) return true;
-      if (s.ignoreFamily.includes(family)) return false;
-    }
-
-    // Cache check — keyed by species if available, else family, else mob name
-    const cacheKey = species ?? family ?? enemy.name;
-    const cached = this.engagementCache.get(cacheKey);
-    if (cached) return cached === 'engage';
-
-    // Default: ignore unlisted mobs. Only fight what's in alwaysEngage lists.
-    // The LLM or player can expand the lists via combat settings.
-    this.engagementCache.set(cacheKey, 'ignore');
-    logger.debug({
-      companionId: this.companion.id,
-      mob: enemy.name,
-      cacheKey,
-    }, '[CompanionAI] Engagement decision (default ignore — not on engage list)');
-    return false;
+  /** Update the set of entity IDs attacking owner + self. Called by DWM before shouldEngage(). */
+  setAttackerIds(ids: Set<string>): void {
+    this._attackerIds = ids;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -273,37 +282,42 @@ export class NPCAIController {
     this.lastLlmCallAt = now;
 
     this.combatMetrics.recordLlmCall();
+    this._llmPending = true;
 
-    const combatCtx: CombatSettingsContext = {
-      companionName: this.companion.name,
-      archetype: this.companion.archetype ?? 'opportunist',
-      personalityType: this.companion.personalityType,
-      companionHealthRatio: context.self.maxHealth > 0
-        ? context.self.currentHealth / context.self.maxHealth
-        : 1,
-      currentSettings: cloneSettings(this.currentSettings),
-      enemies: context.enemies.map(e => `${e.name}${e.level ? ` (level ${e.level})` : ''}`),
-      allyStates: [
-        ...(context.owner ? [`${context.owner.name}: ${Math.round(((context.owner.currentHealth ?? 1) / (context.owner.maxHealth ?? 1)) * 100)}%`] : []),
-        ...context.allies.map(a => `${a.name}: ${Math.round(((a.currentHealth ?? 1) / (a.maxHealth ?? 1)) * 100)}%`),
-      ],
-      fightDurationSec: (Date.now() - this.fightStartedAt) / 1000,
-      triggerReason,
-      playerCommand: this.pendingPlayerCommand ?? undefined,
-    };
-
-    const partial = await this.llmService.generateCombatSettingsUpdate(this.companion, combatCtx);
-
-    if (partial) {
-      this.currentSettings = mergePartialSettings(this.currentSettings, partial);
-      this.combatMetrics.recordSettingsChange();
-
-      logger.info({
-        companionId: this.companion.id,
+    try {
+      const combatCtx: CombatSettingsContext = {
+        companionName: this.companion.name,
+        archetype: this.companion.archetype ?? 'opportunist',
+        personalityType: this.companion.personalityType,
+        companionHealthRatio: context.self.maxHealth > 0
+          ? context.self.currentHealth / context.self.maxHealth
+          : 1,
+        currentSettings: cloneSettings(this.currentSettings),
+        enemies: context.enemies.map(e => `${e.name}${e.level ? ` (level ${e.level})` : ''}`),
+        allyStates: [
+          ...(context.owner ? [`${context.owner.name}: ${Math.round(((context.owner.currentHealth ?? 1) / (context.owner.maxHealth ?? 1)) * 100)}%`] : []),
+          ...context.allies.map(a => `${a.name}: ${Math.round(((a.currentHealth ?? 1) / (a.maxHealth ?? 1)) * 100)}%`),
+        ],
+        fightDurationSec: (Date.now() - this.fightStartedAt) / 1000,
         triggerReason,
-        settingsUpdate: partial,
-        newSettings: this.currentSettings,
-      }, '[CompanionAI] LLM settings update applied');
+        playerCommand: this.pendingPlayerCommand ?? undefined,
+      };
+
+      const partial = await this.llmService.generateCombatSettingsUpdate(this.companion, combatCtx);
+
+      if (partial) {
+        this.currentSettings = mergePartialSettings(this.currentSettings, partial);
+        this.combatMetrics.recordSettingsChange();
+
+        logger.info({
+          companionId: this.companion.id,
+          triggerReason,
+          settingsUpdate: partial,
+          newSettings: this.currentSettings,
+        }, '[CompanionAI] LLM settings update applied');
+      }
+    } finally {
+      this._llmPending = false;
     }
   }
 
@@ -363,6 +377,10 @@ export class NPCAIController {
     return this._inCombat;
   }
 
+  get llmPending(): boolean {
+    return this._llmPending;
+  }
+
   getCompanionId(): string {
     return this.companion.id;
   }
@@ -405,5 +423,13 @@ export class NPCAIController {
 
   getCurrentTargetId(): string | null {
     return this.behaviorTree.getCurrentTargetId();
+  }
+
+  recordAbilityUse(abilityId: string, abilityName: string): void {
+    this._lastAbilityUsed = { abilityId, abilityName, timestamp: Date.now() };
+  }
+
+  get lastAbilityUsed() {
+    return this._lastAbilityUsed;
   }
 }

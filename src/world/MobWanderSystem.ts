@@ -102,6 +102,13 @@ interface MobState {
 
   wanderRadius: number;
 
+  /**
+   * When true the mob ignores LEASH_RADIUS and CHASE_TARGET_MAX_DISTANCE —
+   * it will chase its target indefinitely and never transition to 'returning'.
+   * Used for vault mobs that should fight to the death.
+   */
+  noLeash: boolean;
+
   /** Current world position (X and Z managed here; Y supplied by terrain snap). */
   currentX: number;
   currentY: number;
@@ -184,12 +191,15 @@ export class MobWanderSystem {
    * @param id            Mob entity ID.
    * @param position      Spawn position (becomes the home/origin for roaming).
    * @param wanderRadius  Optional override; defaults to WANDER_RADIUS (50 m).
+   * @param noLeash       If true the mob ignores leash radius and chase-target
+   *                      distance limits — it chases until death.
    */
-  register(id: string, position: Vector3, wanderRadius: number = WANDER_RADIUS): void {
+  register(id: string, position: Vector3, wanderRadius: number = WANDER_RADIUS, noLeash: boolean = false): void {
     this.states.set(id, {
       homeX:      position.x,
       homeZ:      position.z,
       wanderRadius,
+      noLeash,
       currentX:   position.x,
       currentY:   position.y,
       currentZ:   position.z,
@@ -246,17 +256,28 @@ export class MobWanderSystem {
   }
 
   /**
-   * End the chase and begin returning home.
+   * End the chase and begin returning home (or idle in place for noLeash mobs).
    *
    * Call this when the mob's combat ends (timeout, target death, leash break).
-   * The mob will sprint home, then resume idle wandering on arrival.
+   * Normal mobs sprint home then resume wandering; noLeash mobs (vault mobs)
+   * simply idle where they stand — they never return home.
    */
   endChase(id: string): void {
     const state = this.states.get(id);
     if (!state) return;
-    state.aiState = 'returning';
     state.targetX = null;
     state.targetZ = null;
+
+    if (state.noLeash) {
+      // Vault mobs stay where they are — update home to current position
+      // so future wandering orbits their new location
+      state.homeX      = state.currentX;
+      state.homeZ      = state.currentZ;
+      state.aiState    = 'idle';
+      state.pauseUntil = Date.now() + PAUSE_MIN_MS + Math.random() * (PAUSE_MAX_MS - PAUSE_MIN_MS);
+    } else {
+      state.aiState = 'returning';
+    }
   }
 
   /** Get current AI state for a mob (undefined if not registered). */
@@ -324,14 +345,17 @@ export class MobWanderSystem {
     steerFn?:    SteerFn,
   ): void {
     // Leash check — bail out if mob has wandered too far from home
-    const homeDistX = state.currentX - state.homeX;
-    const homeDistZ = state.currentZ - state.homeZ;
-    if (Math.hypot(homeDistX, homeDistZ) > LEASH_RADIUS) {
-      leashBroken.push(id);
-      state.aiState = 'returning';
-      state.targetX = null;
-      state.targetZ = null;
-      return; // No move this tick — return phase handles next tick
+    // (skipped for noLeash mobs — they chase until death)
+    if (!state.noLeash) {
+      const homeDistX = state.currentX - state.homeX;
+      const homeDistZ = state.currentZ - state.homeZ;
+      if (Math.hypot(homeDistX, homeDistZ) > LEASH_RADIUS) {
+        leashBroken.push(id);
+        state.aiState = 'returning';
+        state.targetX = null;
+        state.targetZ = null;
+        return; // No move this tick — return phase handles next tick
+      }
     }
 
     const dx   = state.chaseX - state.currentX;
@@ -340,7 +364,8 @@ export class MobWanderSystem {
     if (dist < ARRIVE_DIST) return; // Right on top of target — wait for it to move
 
     // Drop chase target if it's too far away
-    if (dist > CHASE_TARGET_MAX_DISTANCE) {
+    // (skipped for noLeash mobs — they never give up the chase)
+    if (!state.noLeash && dist > CHASE_TARGET_MAX_DISTANCE) {
       state.aiState = 'returning';
       state.targetX = null;
       state.targetZ = null;

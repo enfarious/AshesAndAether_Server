@@ -148,14 +148,31 @@ export class CommandExecutor {
   }
 
   /**
-   * Check if character has required permissions
+   * Check if character has required permissions.
+   *
+   * Supported permission strings:
+   *  - 'gm'    — requires account role 'gm' or 'admin'
+   *  - 'admin' — requires account role 'admin'
    */
   private async checkPermissions(
-    _context: CommandContext,
-    _requiredPermissions: string[]
+    context: CommandContext,
+    requiredPermissions: string[]
   ): Promise<boolean> {
-    // TODO: Implement permission system
-    // For now, all commands are allowed
+    for (const perm of requiredPermissions) {
+      switch (perm) {
+        case 'gm':
+          if (!context.isGM) return false;
+          break;
+        case 'admin':
+          // admin is a stricter check — only accounts explicitly flagged 'admin'
+          // For now isGM covers both gm and admin roles; refine later if needed
+          if (!context.isGM) return false;
+          break;
+        default:
+          // Unknown permission — deny by default
+          return false;
+      }
+    }
     return true;
   }
 
