@@ -2,6 +2,7 @@ import { logger } from '@/utils/logger';
 import { AbilityService } from '@/database';
 import { CombatAbilityDefinition } from './types';
 import { T1_ABILITIES } from './AbilityData';
+import { MOB_ABILITIES } from './MobAbilityData';
 import { ACTIVE_WEB } from '@/game/abilities/tree/ActiveWeb';
 
 const BASIC_ATTACK: CombatAbilityDefinition = {
@@ -46,6 +47,7 @@ export class AbilitySystem {
   private inMemory: Map<string, CombatAbilityDefinition> = new Map([
     [BASIC_ATTACK.id, BASIC_ATTACK],
     ...T1_ABILITIES.map(a => [a.id, a] as [string, CombatAbilityDefinition]),
+    ...MOB_ABILITIES.map(a => [a.id, a] as [string, CombatAbilityDefinition]),
   ]);
 
   /** Maps ability-tree node IDs → combat ability slugs. */
@@ -116,5 +118,10 @@ export class AbilitySystem {
 
   getDefaultAbility(): CombatAbilityDefinition {
     return BASIC_ATTACK;
+  }
+
+  /** Expose the in-memory ability map for bulk lookup (e.g., MobAIController pre-resolution). */
+  getInMemoryMap(): Map<string, CombatAbilityDefinition> {
+    return this.inMemory;
   }
 }

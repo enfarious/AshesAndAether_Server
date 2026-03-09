@@ -7,6 +7,9 @@ import { MovementSystem, type MovementStartEvent } from './MovementSystem';
 import { MessageBus, MessageType, ZoneRegistry, type MessageEnvelope, type ClientMessagePayload } from '@/messaging';
 import { NPCAIController, LLMService, getBaselineForArchetype, mergePartialSettings } from '@/ai';
 import type { CompanionCombatSettings } from '@/ai';
+import { MobAIController } from '@/ai/MobAIController';
+import { getMobCombatProfile } from '@/ai/MobCombatProfile';
+import type { MobCombatEntity, MobCombatContext } from '@/ai/MobBehaviorTree';
 import { T1_ABILITIES, resolveAbilitiesFromLoadout } from '@/combat/AbilityData';
 import { ARCHETYPE_MODIFIERS } from '@/ai/CompanionArchetypeModifiers';
 import type { CompanionArchetype } from '@/ai/CompanionCombatSettings';
@@ -159,6 +162,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
   private wildlifeManagers: Map<string, WildlifeManager> = new Map();
   private floraManagers:   Map<string, FloraManager>    = new Map();
   private mobWanderSystems: Map<string, MobWanderSystem> = new Map();
+  /** Mob AI controllers for vault mobs with combat profiles (entityId → controller). */
+  private mobAIControllers: Map<string, MobAIController> = new Map();
   private weatherBridges:  Map<string, WeatherBridge>  = new Map();
   private climateBridges:  Map<string, ClimateBridge>  = new Map();
   private scriptedObjectControllers: Map<string, ScriptedObjectController> = new Map();
@@ -1600,6 +1605,26 @@ export class DistributedWorldManager implements IWildlifeWorld {
     const wanderSys = this.mobWanderSystems.get(zoneId);
     if (wanderSys) {
       wanderSys.register(entityId, position, mobWanderRadius, true);
+    }
+
+    // ── Mob AI Controller ───────────────────────────────────────────────
+    // Look up a combat profile for this mob type. If one exists, create a
+    // MobAIController that drives ATB-gated abilities + behavior tree.
+    const profile = getMobCombatProfile(mobTag);
+    if (profile) {
+      const abilityMap = this.abilitySystem.getInMemoryMap();
+      const controller = new MobAIController(entityId, profile, abilityMap);
+      this.mobAIControllers.set(entityId, controller);
+
+      // Apply profile-level threat multiplier to CombatManager state
+      if (profile.threatMultiplier && profile.threatMultiplier !== 1.0) {
+        this.combatManager.setThreatMultiplier(entityId, profile.threatMultiplier);
+      }
+
+      logger.debug(
+        { entityId, mobTag, profileTag: profile.mobTag, movementMode: profile.movementMode },
+        'Mob AI controller created',
+      );
     }
 
     logger.debug({ entityId, mobTag, level, zoneId, hp: baseHp }, 'Vault mob spawned');
@@ -5820,6 +5845,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
             // Vault mob death: notify VaultManager for room clear tracking
             if (VaultManager.isVaultZone(deadMobZoneId)) {
               this.vaultManager.reportMobDeath(targetData.entityId, deadMobZoneId);
+              // Clean up mob AI controller
+              this.mobAIControllers.delete(targetData.entityId);
               // Vault mobs don't respawn — but still need to despawn after death animation
               const vaultMobId = targetData.entityId;
               const vaultZoneId = deadMobZoneId;
@@ -7738,6 +7765,8 @@ export class DistributedWorldManager implements IWildlifeWorld {
         zm.removeMob(mobId);
         // Remove from wander system so it isn't ticked while despawned
         this.mobWanderSystems.get(zoneId)?.unregister(mobId);
+        // Clean up mob AI controller (if any)
+        this.mobAIControllers.delete(mobId);
         // Tell clients to remove the entity from their scene
         await this.broadcastEntityRemoved(zoneId, mobId);
         await this.broadcastNearbyUpdate(zoneId);
@@ -8802,11 +8831,19 @@ export class DistributedWorldManager implements IWildlifeWorld {
         if (isInCombat) {
           // Mob is actively in combat — feed the latest target position so it
           // chases a moving player.
+          // Mobs with AI controllers that aren't in 'chase' mode skip wander-driven
+          // chase: stationary mobs never move, kiting mobs use BT-driven movement.
+          const aiController = this.mobAIControllers.get(id);
+          const aiMovementMode = aiController?.getMovementMode();
+          const btDrivenMovement = aiMovementMode && aiMovementMode !== 'chase';
+
           const targetId = this.combatManager.getAutoAttackTarget(id);
           if (targetId) {
             const targetEntity = zm.getEntity(targetId);
             if (targetEntity && targetEntity.isAlive) {
-              wanderSystem.setChaseTarget(id, targetEntity.position);
+              if (!btDrivenMovement) {
+                wanderSystem.setChaseTarget(id, targetEntity.position);
+              }
             } else {
               // Target died or left the zone — end combat immediately
               wanderSystem.endChase(id);
@@ -8887,6 +8924,9 @@ export class DistributedWorldManager implements IWildlifeWorld {
 
       if (anyMoved) void this.publishZoneEntities(zoneId, zm);
     }
+
+    // ── Update mob combat AI (ATB-gated abilities + behavior trees) ──────
+    void this.tickMobCombatAI(deltaTime);
 
     // ── Update companion combat AI ────────────────────────────────────────
     void this.tickCompanionCombat(deltaTime);
@@ -9755,6 +9795,157 @@ export class DistributedWorldManager implements IWildlifeWorld {
   // ══════════════════════════════════════════════════════════════════════════
   // Companion Combat AI Tick
   // ══════════════════════════════════════════════════════════════════════════
+
+  // ─── Mob AI Tick ──────────────────────────────────────────────────────────────
+
+  /**
+   * Tick mob combat AI controllers.
+   *
+   * For each mob with a MobAIController that's currently in combat:
+   *   1. Build MobCombatContext (HP, nearby enemies/allies, abilities, cooldowns, ATB)
+   *   2. Call controller.tick() to run the behavior tree
+   *   3. If phase changed → broadcast boss_phase_change event
+   *   4. If abilityAction returned → execute via executeCombatAction()
+   *   5. Movement is handled by the wander system (chase target injection above)
+   *      except for kiting mobs whose movement is BT-driven
+   */
+  private async tickMobCombatAI(deltaTime: number): Promise<void> {
+    for (const [mobId, controller] of this.mobAIControllers) {
+      if (!this.combatManager.isInCombat(mobId)) continue;
+
+      // Find which zone this mob is in
+      const zoneId = this.findZoneForEntity(mobId);
+      if (!zoneId) continue;
+
+      const zm = this.zones.get(zoneId);
+      if (!zm) continue;
+
+      const mobEntity = zm.getEntity(mobId);
+      if (!mobEntity || !mobEntity.isAlive) continue;
+
+      // ── Build combat context ──────────────────────────────────────────
+      const atbState = this.combatManager.getAtbState(mobId);
+      const atbCurrent = atbState?.current ?? 0;
+
+      // Nearby entities within perception range (30m)
+      const nearbyEntities = zm.getEntitiesInRangeForCombat(mobEntity.position, 30, mobId);
+
+      // Enemies = players + companions
+      const enemies: MobCombatEntity[] = nearbyEntities
+        .filter(e => e.isAlive && (e.type === 'player' || e.type === 'companion'))
+        .map(e => ({
+          id: e.id,
+          position: e.position,
+          isAlive: e.isAlive,
+          currentHealth: e.currentHealth,
+          maxHealth: e.maxHealth,
+          type: e.type as MobCombatEntity['type'],
+        }));
+
+      // Allies = other mobs in the same zone that are alive
+      const allies: MobCombatEntity[] = nearbyEntities
+        .filter(e => e.isAlive && e.type === 'mob' && e.id !== mobId)
+        .map(e => ({
+          id: e.id,
+          position: e.position,
+          isAlive: e.isAlive,
+          currentHealth: e.currentHealth,
+          maxHealth: e.maxHealth,
+          type: e.type as MobCombatEntity['type'],
+        }));
+
+      // Build cooldown map from each ability the controller knows about
+      const cooldowns = new Map<string, number>();
+      const now = Date.now();
+      for (const ability of controller.getAllAbilities()) {
+        const remaining = this.combatManager.getCooldownRemaining(mobId, ability.id, now);
+        if (remaining > 0) cooldowns.set(ability.id, remaining);
+      }
+
+      const context: MobCombatContext = {
+        self: {
+          id: mobId,
+          position: mobEntity.position,
+          currentHealth: mobEntity.currentHealth ?? 100,
+          maxHealth: mobEntity.maxHealth ?? 100,
+        },
+        enemies,
+        allies,
+        abilities: controller.getAllAbilities(),
+        cooldowns,
+        atbCurrent,
+        // Mobs have effectively unlimited mana/stamina — ATB + cooldowns are the gates
+        currentMana: 9999,
+        currentStamina: 9999,
+        enmityTable: this.combatManager.getEnmityTable(),
+      };
+
+      // ── Tick the controller ───────────────────────────────────────────
+      const { result, phaseChange } = controller.tick(context, deltaTime);
+
+      // ── Phase change broadcast ────────────────────────────────────────
+      if (phaseChange) {
+        await this.broadcastCombatEvent(zoneId, mobEntity.position, {
+          eventType: 'combat_effect',
+          timestamp: Date.now(),
+          narrative: `${mobEntity.name ?? 'Boss'} enters ${phaseChange.newPhase} phase!`,
+          eventTypeData: {
+            effectType: 'boss_phase_change',
+            mobId: phaseChange.mobId,
+            previousPhase: phaseChange.previousPhase,
+            newPhase: phaseChange.newPhase,
+            hpPercent: phaseChange.hpPercent,
+          },
+        });
+      }
+
+      // ── Execute ability action ────────────────────────────────────────
+      if (result.abilityAction) {
+        const ability = await this.abilitySystem.getAbility(result.abilityAction.abilityId);
+        if (ability) {
+          const targetEntity = zm.getEntity(result.abilityAction.targetId);
+          if (targetEntity && targetEntity.isAlive) {
+            await this.executeCombatAction(
+              zm,
+              { id: mobId, position: mobEntity.position, type: 'mob' },
+              { id: targetEntity.id, position: targetEntity.position, type: targetEntity.type as 'player' | 'npc' | 'companion' | 'mob' | 'wildlife' },
+              ability,
+            );
+          }
+        }
+      }
+
+      // ── Movement for kiting/BT-driven mobs ───────────────────────────
+      // For 'chase' mobs, movement is already handled by the wander system's
+      // chase target injection. For 'kite' mobs, the BT generates movement
+      // intents that we need to apply here (wander system is bypassed).
+      // For 'stationary' mobs, no movement is ever applied.
+      if (result.movement && controller.getMovementMode() !== 'chase') {
+        // BT-driven movement: apply heading + speed via physics pipeline
+        const speed = result.movement.speed;
+        const headingRad = result.movement.heading * (Math.PI / 180);
+        const dx = Math.sin(headingRad) * speed * deltaTime;
+        const dz = Math.cos(headingRad) * speed * deltaTime;
+        const newPos = {
+          x: mobEntity.position.x + dx,
+          y: mobEntity.position.y,
+          z: mobEntity.position.z + dz,
+        };
+
+        const physics = zm.getPhysicsSystem();
+        const wallResolved = physics.resolveAgainstStructures(newPos, 0.5);
+        const snapped = zm.updateMobPosition(mobId, wallResolved, result.movement.heading);
+
+        // Keep wander system in sync with actual position
+        const wanderSys = this.mobWanderSystems.get(zoneId);
+        if (wanderSys) {
+          wanderSys.updateCurrentPosition(mobId, snapped);
+        }
+
+        this._queueEntityBroadcast(mobId, zoneId, snapped);
+      }
+    }
+  }
 
   /**
    * Tick all companion combat controllers.
