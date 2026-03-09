@@ -2,7 +2,7 @@ import { Socket } from 'socket.io';
 import { logger } from '@/utils/logger';
 import { AccountService, CharacterService, CompanionService, ZoneService, InventoryService, prisma } from '@/database';
 import { VillageService } from '@/village';
-import { StatCalculator } from '@/game/stats/StatCalculator';
+import { StatCalculator, STAT_POINTS_PER_LEVEL } from '@/game/stats/StatCalculator';
 import { SpawnPointService } from '@/world/SpawnPointService';
 import { MessageBus, MessageType, ZoneRegistry } from '@/messaging';
 import { randomUUID } from 'crypto';
@@ -550,8 +550,8 @@ export class GatewayClientSession {
         }
       }
 
-      // Total stat points = level - 1 (1 per level gained, starting at level 1 with 0)
-      const totalStatPoints = character.level - 1;
+      // Total stat points = (level - 1) × points per level
+      const totalStatPoints = (character.level - 1) * STAT_POINTS_PER_LEVEL;
 
       // Reset all core stats to 10, refund all points
       const coreStats = {

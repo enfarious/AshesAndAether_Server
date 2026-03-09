@@ -169,7 +169,11 @@ export const companionCommand: CommandDefinition = {
           const val = token.substring(eq + 1);
           switch (key) {
             case 'stance':   settings.stance = val; break;
-            case 'range':    settings.preferredRange = val; break;
+            case 'range':
+              if (['close', 'mid', 'long'].includes(val)) {
+                settings.preferredRange = val;
+              }
+              break;
             case 'priority': settings.priority = val; break;
             case 'retreat':  settings.retreatThreshold = parseFloat(val); break;
             case 'engagementmode': settings.engagementMode = val; break;

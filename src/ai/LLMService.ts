@@ -41,6 +41,10 @@ export interface CombatSettingsContext {
   triggerReason: string;
   /** Player command if that was the trigger. */
   playerCommand?: string;
+  /** Weapon range band the companion is using: 'close' | 'mid' | 'long'. */
+  weaponRangeBand?: 'close' | 'mid' | 'long';
+  /** Weapon name the companion is using, e.g. "Iron Shortsword". */
+  weaponName?: string;
 }
 
 type LLMProvider = 'anthropic' | 'openai-compatible';
@@ -578,10 +582,23 @@ Keep responses short (1-2 sentences). Stay in character.`;
     return stripThinkingTags(response.choices[0]?.message?.content || '');
   }
 
+  /** Maps archetype to a brief natural-language description of their combat style. */
+  private static readonly ARCHETYPE_COMBAT_STYLE: Record<string, string> = {
+    scrappy_fighter: 'Your attacks are melee — you must be at close range to deal damage.',
+    tank:            'Your attacks are melee — you must be at close range to hit. You also have ranged taunt abilities.',
+    cautious_healer: 'Your heals and spells work at long range — stay back and support allies.',
+    opportunist:     'You dart in to strike and pull back. Your attacks are melee but you can kite at mid range between strikes.',
+  };
+
   private buildCombatSystemPrompt(ctx: CombatSettingsContext): string {
+    // Archetype combat style hint
+    const styleLine = LLMService.ARCHETYPE_COMBAT_STYLE[ctx.archetype]
+      ?? `Your weapon works best at ${ctx.weaponRangeBand ?? 'close'} range.`;
+
     return `You are the tactical brain of ${ctx.companionName}, a ${ctx.archetype} companion with a ${ctx.personalityType} personality.
 
 You decide HOW your companion fights by adjusting a settings object. You do NOT control individual actions — the behavior tree handles that. You set the strategy.
+${styleLine}
 
 Current settings:
 ${JSON.stringify(ctx.currentSettings, null, 2)}
@@ -589,7 +606,11 @@ ${JSON.stringify(ctx.currentSettings, null, 2)}
 Respond with ONLY a JSON object containing the fields you want to change. Omit fields you want to keep the same.
 
 Available fields:
-- preferredRange: "melee" | "close" | "mid" | "far"
+- preferredRange: "close" | "mid" | "long"
+    close = melee striking distance (~1 m). Use for swords, axes, daggers, fists — must be right next to the target to hit.
+    mid   = polearm / short-range distance (~4 m). Use for spears, halberds, lances — keeps a gap but can still strike.
+    long  = ranged / caster distance (~15 m). Use for bows, guns, spells — stay far back.
+    IMPORTANT: Pick the range that matches your weapon. A melee weapon CANNOT hit from mid or long range.
 - priority: "weakest" | "nearest" | "threatening_player"
 - stance: "aggressive" | "cautious" | "support"
 - engagementMode: "aggressive" | "defensive" | "passive" (aggressive = charge hostiles, defensive = only if attacked, passive = wait for orders)
@@ -604,7 +625,7 @@ Available fields:
 - defensiveThreshold: 0-1 (use defensive abilities when own HP below this)
 
 Example response: {"stance": "support", "abilityWeights": {"heal": 0.9, "damage": 0.1}}
-Example response: {"preferredRange": "far", "priority": "weakest"}
+Example response: {"preferredRange": "close", "priority": "weakest"}
 
 Stay in character. A scrappy fighter rarely switches to support. A cautious healer rarely goes aggressive. But extreme situations can override personality.`;
   }
@@ -645,7 +666,7 @@ Stay in character. A scrappy fighter rarely switches to support. A cautious heal
       const result: Partial<CompanionCombatSettings> = {};
 
       // Validate each field
-      if (raw.preferredRange && ['melee', 'close', 'mid', 'far'].includes(raw.preferredRange)) {
+      if (raw.preferredRange && ['close', 'mid', 'long'].includes(raw.preferredRange)) {
         result.preferredRange = raw.preferredRange;
       }
       if (raw.priority && ['weakest', 'nearest', 'threatening_player'].includes(raw.priority)) {

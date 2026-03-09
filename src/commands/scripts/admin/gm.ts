@@ -9,6 +9,7 @@
  *   /gm heal                       — full heal (HP / stamina / mana)
  *   /gm items [search]             — list available item tags
  *   /gm promote <player> <role>    — set a player's account role
+ *   /gm gate                       — open the next closed vault gate
  *
  * All subcommands require the 'gm' permission (account.role = 'gm' | 'admin').
  */
@@ -19,6 +20,7 @@ import { InventoryService } from '@/database/services/InventoryService';
 import { WalletService } from '@/database/services/WalletService';
 import { CharacterService } from '@/database/services/CharacterService';
 import { StatCalculator } from '@/game/stats/StatCalculator';
+import { getVaultManager } from '../world/vault-command';
 import { logger } from '@/utils/logger';
 
 export const gmCommand: CommandDefinition = {
@@ -44,14 +46,15 @@ export const gmCommand: CommandDefinition = {
       return {
         success: false,
         error:
-          'Usage: /gm <give|giveto|gold|level|heal|items|promote>\n' +
+          'Usage: /gm <give|giveto|gold|level|heal|items|promote|gate>\n' +
           '  give <tag> [qty]        — give item by tag\n' +
           '  giveto <player> <tag> [qty]\n' +
           '  gold <amount>\n' +
           '  level <level>\n' +
           '  heal\n' +
           '  items [search]\n' +
-          '  promote <player> <role>',
+          '  promote <player> <role>\n' +
+          '  gate                    — open next vault gate',
       };
     }
 
@@ -236,10 +239,16 @@ export const gmCommand: CommandDefinition = {
         };
       }
 
+      // ── /gm gate ──────────────────────────────────────────────────────────
+      case 'gate': {
+        const msg = getVaultManager().gmOpenNextGate(context.characterId);
+        return { success: true, message: msg };
+      }
+
       default:
         return {
           success: false,
-          error: `Unknown GM subcommand "${sub}". Use: give, giveto, gold, level, heal, items, promote`,
+          error: `Unknown GM subcommand "${sub}". Use: give, giveto, gold, level, heal, items, promote, gate`,
         };
     }
   },

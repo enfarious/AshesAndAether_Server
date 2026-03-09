@@ -24,7 +24,7 @@ import { CollisionLayer } from '@/physics/types';
 import type { PhysicsEntity } from '@/physics/types';
 import type { CommandContext, CommandEvent } from '@/commands/types';
 import type { Character, Companion, Prisma } from '@prisma/client';
-import { StatCalculator } from '@/game/stats/StatCalculator';
+import { StatCalculator, STAT_POINTS_PER_LEVEL } from '@/game/stats/StatCalculator';
 import {
   unlockAbility,
   slotActiveAbility,
@@ -425,6 +425,29 @@ export class DistributedWorldManager implements IWildlifeWorld {
       // awardGold: give completion gold to a participant
       async (characterId, amount) => {
         await WalletService.addGold(characterId, amount, 'vault_completion');
+      },
+      // rebuildCollision: re-register wall segments after gate opens
+      (zoneId, tileGrid) => {
+        const zm = this.zones.get(zoneId);
+        if (!zm) return;
+        const physics = zm.getPhysicsSystem();
+        // Remove all existing vault wall entities
+        for (const id of physics.getAllEntityIds()) {
+          if (id.startsWith('vault_wall_')) physics.unregisterEntity(id);
+        }
+        // Re-register from updated tile grid
+        const wallSegs = getWallSegments(tileGrid);
+        for (let i = 0; i < wallSegs.length; i++) {
+          const seg = wallSegs[i]!;
+          physics.registerEntity({
+            id: `vault_wall_${i}`,
+            position: { x: (seg.ax + seg.bx) / 2, y: 0, z: (seg.az + seg.bz) / 2 },
+            boundingVolume: seg,
+            type: 'static',
+            collisionLayer: CollisionLayer.STRUCTURES,
+          } as PhysicsEntity);
+        }
+        logger.info({ zoneId, wallCount: wallSegs.length }, 'Vault wall collision rebuilt after gate open');
       },
     );
     setVaultManager(this.vaultManager);
@@ -950,30 +973,31 @@ export class DistributedWorldManager implements IWildlifeWorld {
     }, 'Player companion registered in running zone');
   }
 
+  // Companion base stats at level 1 (before archetype growth)
+  private static readonly COMPANION_BASE_STATS = {
+    strength: 8, vitality: 10, dexterity: 10,
+    agility: 10, intelligence: 8, wisdom: 8,
+  };
+
   /**
    * Sync a companion's level and stats to match a target level.
-   * Scales core stats proportionally and recomputes derived stats.
+   * Computes stats from constants (base + archetype growth × levels) to avoid
+   * compounding errors from reading already-scaled DB values.
    */
   private async syncCompanionLevel(companion: Companion, targetLevel: number, zm: ZoneManager): Promise<void> {
-    const currentStats = (companion.stats as Record<string, number>) || {};
-    // Base stats at level 1, then +2 per level for each core stat
-    const baseStats = {
-      strength:     (currentStats.strength ?? 8),
-      vitality:     (currentStats.vitality ?? 10),
-      dexterity:    (currentStats.dexterity ?? 10),
-      agility:      (currentStats.agility ?? 10),
-      intelligence: (currentStats.intelligence ?? 8),
-      wisdom:       (currentStats.wisdom ?? 8),
-    };
-    // Scale: each stat gets +2 per level beyond 1
-    const levelBonus = (targetLevel - 1) * 2;
+    const archetype = (companion.archetype ?? 'opportunist') as CompanionArchetype;
+    const growth = (ARCHETYPE_MODIFIERS[archetype] ?? ARCHETYPE_MODIFIERS.opportunist).statGrowth;
+    const levelsGained = targetLevel - 1;
+    const base = DistributedWorldManager.COMPANION_BASE_STATS;
+
+    // Compute from constants — never reads current stats, so no compounding
     const scaledStats = {
-      strength:     baseStats.strength + levelBonus,
-      vitality:     baseStats.vitality + levelBonus,
-      dexterity:    baseStats.dexterity + levelBonus,
-      agility:      baseStats.agility + levelBonus,
-      intelligence: baseStats.intelligence + levelBonus,
-      wisdom:       baseStats.wisdom + levelBonus,
+      strength:     base.strength     + growth.strength     * levelsGained,
+      vitality:     base.vitality     + growth.vitality     * levelsGained,
+      dexterity:    base.dexterity    + growth.dexterity    * levelsGained,
+      agility:      base.agility      + growth.agility      * levelsGained,
+      intelligence: base.intelligence + growth.intelligence * levelsGained,
+      wisdom:       base.wisdom       + growth.wisdom       * levelsGained,
     };
     const derived = StatCalculator.calculateDerivedStats(scaledStats, targetLevel);
     const newMaxHealth = derived.maxHp;
@@ -7508,7 +7532,7 @@ export class DistributedWorldManager implements IWildlifeWorld {
               await this._sendToSocket(memberId, 'event', {
                 eventType: 'level_up',
                 level:     xpResult.newLevel,
-                message:   `You have reached level ${xpResult.newLevel}! You gain 1 ability point and 1 stat point.`,
+                message:   `You have reached level ${xpResult.newLevel}! You gain 1 ability point and ${STAT_POINTS_PER_LEVEL} stat points.`,
               });
 
               // ── Companion level sync on player level-up ────────────────

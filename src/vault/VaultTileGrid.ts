@@ -23,6 +23,16 @@ export type TileValue = (typeof Tile)[keyof typeof Tile];
 
 // ── Generation parameters ───────────────────────────────────────────────────
 
+/**
+ * Per-room cellular-automata overrides.
+ * Any field left undefined falls back to the parent VaultGenParams value.
+ */
+export interface RoomDigOverrides {
+  wallChance?: number;
+  smoothIterations?: number;
+  minFloorRatio?: number;
+}
+
 export interface VaultGenParams {
   /** Probability (0-1) a cell starts as wall in initial fill. Default 0.45. */
   wallChance: number;
@@ -30,6 +40,11 @@ export interface VaultGenParams {
   smoothIterations: number;
   /** Minimum floor ratio — retry if below. Default 0.35. */
   minFloorRatio: number;
+  /**
+   * Per-room-type CA overrides. Each key maps a RoomType to dig params
+   * that override the base wallChance / smoothIterations / minFloorRatio.
+   */
+  roomDigOverrides?: Partial<Record<RoomType, RoomDigOverrides>>;
   /** Optional deterministic seed. */
   seed?: number;
   /** Total number of rooms to generate. Default 1 (single cave). */
@@ -39,13 +54,23 @@ export interface VaultGenParams {
   /** Width of corridors connecting rooms, in tiles. Default 3. */
   corridorWidth?: number;
   /**
-   * Random size range [min, max] in tiles for regular rooms.
+   * Random size range [min, max] in tiles for regular (TRASH) rooms.
    * Each room gets an independent random width and height from this range.
    * When omitted, rooms are sized uniformly from the grid dimensions.
    */
   roomSizeRange?: [number, number];
   /**
-   * Random size range [min, max] in tiles for boss rooms.
+   * Random size range [min, max] for the ENTRY room.
+   * Falls back to roomSizeRange if omitted.
+   */
+  entryRoomSizeRange?: [number, number];
+  /**
+   * Random size range [min, max] for the SUB_BOSS room.
+   * Falls back to bossRoomSizeRange → roomSizeRange if omitted.
+   */
+  subBossRoomSizeRange?: [number, number];
+  /**
+   * Random size range [min, max] in tiles for the BOSS room.
    * Falls back to roomSizeRange if omitted.
    */
   bossRoomSizeRange?: [number, number];
@@ -64,6 +89,17 @@ export interface VaultGenParams {
   tier?: number;
   /** Use chain-based layout instead of serpentine grid. Default false. */
   chain?: boolean;
+  /**
+   * Per-room-index dig overrides (highest priority).
+   * Set by trash variant system — overrides both base and per-type values.
+   * Index matches room order from _buildRoomTypeSequence().
+   */
+  perRoomDigOverrides?: Array<RoomDigOverrides | undefined>;
+  /**
+   * Per-room-index size range overrides.
+   * Index matches room order from _buildRoomTypeSequence().
+   */
+  perRoomSizeOverrides?: Array<[number, number] | undefined>;
   /** Length of corridors between rooms in tiles. Default 8. */
   corridorLength?: number;
 }
@@ -760,6 +796,12 @@ export function generateMultiRoomGrid(
     }
   }
 
+  // ── Ensure all rooms are reachable from the first room ───────────────
+  {
+    const centerTiles = roomPositions.map(rp => ({ col: rp.centerCol, row: rp.centerRow }));
+    _ensureConnectivity(tiles, widthTiles, heightTiles, centerTiles[0]!, centerTiles, corridorWidth);
+  }
+
   // ── Place gates in gated corridors ──────────────────────────────────────
   //
   // A gate is a 2-tile-thick band of WALL placed at the midpoint of a
@@ -880,6 +922,145 @@ function _nearestFloor(
 
   // Should never happen if rooms have floor tiles
   return { col: startCol, row: startRow };
+}
+
+// ── Post-generation connectivity validation ─────────────────────────────────
+
+/**
+ * Flood-fill from a floor tile, returning the set of all reachable tile indices.
+ */
+function _floodFillSet(
+  tiles: Uint8Array, w: number, h: number,
+  startCol: number, startRow: number,
+): Set<number> {
+  const startIdx = startRow * w + startCol;
+  if (tiles[startIdx] !== Tile.FLOOR) return new Set();
+
+  const visited = new Set<number>();
+  const queue: number[] = [startIdx];
+  visited.add(startIdx);
+
+  while (queue.length > 0) {
+    const idx = queue.pop()!;
+    const col = idx % w;
+    const row = (idx - col) / w;
+
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+      const nc = col + dx;
+      const nr = row + dy;
+      if (nc < 0 || nc >= w || nr < 0 || nr >= h) continue;
+      const ni = nr * w + nc;
+      if (tiles[ni] === Tile.FLOOR && !visited.has(ni)) {
+        visited.add(ni);
+        queue.push(ni);
+      }
+    }
+  }
+
+  return visited;
+}
+
+/**
+ * BFS from a point through ALL tiles (floor and wall) to find the nearest
+ * tile whose index exists in `targetSet`. Used to bridge disconnected regions.
+ */
+function _findNearestInSet(
+  w: number, h: number,
+  startCol: number, startRow: number,
+  targetSet: Set<number>,
+): { col: number; row: number } | null {
+  const startIdx = startRow * w + startCol;
+  if (targetSet.has(startIdx)) return { col: startCol, row: startRow };
+
+  const visited = new Set<number>();
+  const queue: Array<{ col: number; row: number }> = [{ col: startCol, row: startRow }];
+  visited.add(startIdx);
+
+  while (queue.length > 0) {
+    const { col, row } = queue.shift()!;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+      const nc = col + dx;
+      const nr = row + dy;
+      if (nc < 0 || nc >= w || nr < 0 || nr >= h) continue;
+      const ni = nr * w + nc;
+      if (visited.has(ni)) continue;
+      visited.add(ni);
+      if (targetSet.has(ni)) return { col: nc, row: nr };
+      queue.push({ col: nc, row: nr });
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Carve an L-shaped corridor between two tile positions.
+ * Goes horizontal first (from → corner), then vertical (corner → to).
+ */
+function _carveLCorridor(
+  tiles: Uint8Array, w: number, h: number,
+  fromCol: number, fromRow: number,
+  toCol: number, toRow: number,
+  halfW: number,
+): void {
+  // Horizontal leg
+  const colMin = Math.min(fromCol, toCol);
+  const colMax = Math.max(fromCol, toCol);
+  for (let col = colMin; col <= colMax; col++) {
+    for (let d = -halfW; d <= halfW; d++) {
+      const row = fromRow + d;
+      if (row >= 0 && row < h && col >= 0 && col < w) {
+        tiles[row * w + col] = Tile.FLOOR;
+      }
+    }
+  }
+
+  // Vertical leg
+  const rowMin = Math.min(fromRow, toRow);
+  const rowMax = Math.max(fromRow, toRow);
+  for (let row = rowMin; row <= rowMax; row++) {
+    for (let d = -halfW; d <= halfW; d++) {
+      const col = toCol + d;
+      if (row >= 0 && row < h && col >= 0 && col < w) {
+        tiles[row * w + col] = Tile.FLOOR;
+      }
+    }
+  }
+}
+
+/**
+ * Ensure every room center is reachable from the entrance via flood-fill.
+ * If any room is disconnected, carve an L-shaped corridor to connect it.
+ * Call BEFORE placing gates.
+ */
+function _ensureConnectivity(
+  tiles: Uint8Array,
+  w: number, h: number,
+  entranceTile: { col: number; row: number },
+  roomCenterTiles: Array<{ col: number; row: number }>,
+  corridorWidth: number,
+): void {
+  const start = _nearestFloor(tiles, w, h, entranceTile.col, entranceTile.row);
+  let reachable = _floodFillSet(tiles, w, h, start.col, start.row);
+
+  const halfW = Math.floor(corridorWidth / 2);
+
+  for (const center of roomCenterTiles) {
+    const floorNear = _nearestFloor(tiles, w, h, center.col, center.row);
+    const idx = floorNear.row * w + floorNear.col;
+
+    if (reachable.has(idx)) continue;
+
+    // Find the nearest reachable tile to this disconnected room
+    const bridge = _findNearestInSet(w, h, floorNear.col, floorNear.row, reachable);
+    if (!bridge) continue;
+
+    // Carve an L-shaped corridor to connect
+    _carveLCorridor(tiles, w, h, bridge.col, bridge.row, floorNear.col, floorNear.row, halfW);
+
+    // Re-flood to include newly connected areas
+    reachable = _floodFillSet(tiles, w, h, start.col, start.row);
+  }
 }
 
 // ── Chain-based generation ───────────────────────────────────────────────────
@@ -1005,20 +1186,34 @@ export function generateChainVault(
   const roomTypes = _buildRoomTypeSequence(tier);
   const roomCount = roomTypes.length;
 
-  // ── 2. Determine room sizes ──────────────────────────────────────────────
-  const [rMin, rMax] = params.roomSizeRange ?? [30, 50];
-  const [bMin, bMax] = params.bossRoomSizeRange ?? params.roomSizeRange ?? [40, 80];
+  // ── 2. Determine room sizes (per–room-type ranges) ──────────────────────
+  const trashRange:   [number, number] = params.roomSizeRange        ?? [25, 45];
+  const entryRange:   [number, number] = params.entryRoomSizeRange   ?? [20, 28];
+  const subBossRange: [number, number] = params.subBossRoomSizeRange ?? params.bossRoomSizeRange ?? [32, 42];
+  const bossRange:    [number, number] = params.bossRoomSizeRange    ?? [36, 48];
+
+  function sizeFromRange([lo, hi]: [number, number]): { w: number; h: number } {
+    return {
+      w: lo + Math.floor(rng() * (hi - lo + 1)),
+      h: lo + Math.floor(rng() * (hi - lo + 1)),
+    };
+  }
 
   interface RoomSize { w: number; h: number }
   const roomSizes: RoomSize[] = [];
   for (let i = 0; i < roomCount; i++) {
-    const isBig = roomTypes[i] === 'SUB_BOSS' || roomTypes[i] === 'BOSS';
-    const lo = isBig ? bMin : rMin;
-    const hi = isBig ? bMax : rMax;
-    roomSizes.push({
-      w: lo + Math.floor(rng() * (hi - lo + 1)),
-      h: lo + Math.floor(rng() * (hi - lo + 1)),
-    });
+    // Per-room size override (from trash variants) takes highest priority
+    const perRoomSize = params.perRoomSizeOverrides?.[i];
+    if (perRoomSize) {
+      roomSizes.push(sizeFromRange(perRoomSize));
+    } else {
+      switch (roomTypes[i]) {
+        case 'ENTRY':    roomSizes.push(sizeFromRange(entryRange));   break;
+        case 'SUB_BOSS': roomSizes.push(sizeFromRange(subBossRange)); break;
+        case 'BOSS':     roomSizes.push(sizeFromRange(bossRange));    break;
+        default:         roomSizes.push(sizeFromRange(trashRange));   break;
+      }
+    }
   }
 
   // ── 3. Place rooms sequentially in abstract space ────────────────────────
@@ -1041,12 +1236,23 @@ export function generateChainVault(
     const nextW = roomSizes[i]!.w;
     const nextH = roomSizes[i]!.h;
 
-    // Shuffle directions, excluding the reverse of how we arrived (no U-turns)
-    const exclude = lastDir ? _oppositeDir(lastDir) : undefined;
-    const dirs: Direction[] = _shuffle(
-      (['N', 'S', 'E', 'W'] as Direction[]).filter(d => d !== exclude),
-      rng,
-    );
+    // Build direction priority: perpendicular first (for variety), then
+    // same direction, and U-turn excluded entirely.
+    const uTurn = lastDir ? _oppositeDir(lastDir) : undefined;
+    const perpendicular: Direction[] = [];
+    const sameDir: Direction[] = [];
+    for (const d of ['N', 'S', 'E', 'W'] as Direction[]) {
+      if (d === uTurn) continue;
+      if (d === lastDir) {
+        sameDir.push(d);
+      } else {
+        perpendicular.push(d);
+      }
+    }
+    const dirs: Direction[] = [
+      ..._shuffle(perpendicular, rng),
+      ..._shuffle(sameDir, rng),
+    ];
 
     let placed = false;
 
@@ -1153,21 +1359,31 @@ export function generateChainVault(
   const tiles = new Uint8Array(widthTiles * heightTiles);
   tiles.fill(Tile.WALL);
 
-  for (const room of chain) {
+  const typeDigOverrides = params.roomDigOverrides ?? {};
+
+  for (let roomIdx = 0; roomIdx < chain.length; roomIdx++) {
+    const room = chain[roomIdx]!;
     const { w: rw, h: rh } = room;
     let tempTiles: Uint8Array | null = null;
     const roomTotal = rw * rh;
 
+    // Resolve CA params: per-room override → per-type override → base
+    const perRoom      = params.perRoomDigOverrides?.[roomIdx];
+    const perType      = typeDigOverrides[room.type];
+    const wallChance   = perRoom?.wallChance       ?? perType?.wallChance       ?? params.wallChance;
+    const smoothIter   = perRoom?.smoothIterations ?? perType?.smoothIterations ?? params.smoothIterations;
+    const minFloor     = perRoom?.minFloorRatio    ?? perType?.minFloorRatio    ?? params.minFloorRatio;
+
     for (let attempt = 0; attempt < 10; attempt++) {
-      const temp = _randomFill(rw, rh, params.wallChance, rng);
-      _smoothCA(temp, rw, rh, params.smoothIterations);
+      const temp = _randomFill(rw, rh, wallChance, rng);
+      _smoothCA(temp, rw, rh, smoothIter);
       _keepLargestCave(temp, rw, rh);
 
       let floorCount = 0;
       for (let i = 0; i < roomTotal; i++) {
         if (temp[i] === Tile.FLOOR) floorCount++;
       }
-      if (floorCount / roomTotal >= params.minFloorRatio) {
+      if (floorCount / roomTotal >= minFloor) {
         tempTiles = temp;
         break;
       }
@@ -1252,13 +1468,21 @@ export function generateChainVault(
     }
   }
 
+  // ── 7b. Ensure all rooms are reachable from the entrance ────────────
+  {
+    const centerTiles = chain.map(r => roomCenter(r));
+    _ensureConnectivity(tiles, widthTiles, heightTiles, centerTiles[0]!, centerTiles, corridorWidth);
+  }
+
   // ── 8. Place gates before SUB_BOSS and BOSS rooms ──────────────────────
 
   const gates: VaultGateDef[] = [];
 
   for (let i = 0; i < chain.length - 1; i++) {
-    const nextType = chain[i + 1]!.type;
-    if (nextType !== 'SUB_BOSS' && nextType !== 'BOSS') continue;
+    const currentType = chain[i]!.type;
+    const nextType    = chain[i + 1]!.type;
+    // Gate before SUB_BOSS, after SUB_BOSS, and before BOSS
+    if (nextType !== 'SUB_BOSS' && nextType !== 'BOSS' && currentType !== 'SUB_BOSS') continue;
 
     const a = chain[i]!;
     const b = chain[i + 1]!;

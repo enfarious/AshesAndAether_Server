@@ -6,7 +6,7 @@
  * VaultTemplate Prisma model.
  */
 
-import type { RoomType, VaultGenParams, VaultGeometry } from './VaultTileGrid';
+import type { RoomDigOverrides, RoomType, VaultGenParams, VaultGeometry } from './VaultTileGrid';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,25 @@ export interface VaultRoomDef {
     player: Array<{ x: number; y: number; z: number }>;
     mob: Array<{ x: number; y: number; z: number }>;
   };
+  /** Per-room CA overrides (set by trash variants, overrides the type-level defaults). */
+  digOverrides?: RoomDigOverrides;
+  /** Per-room size range override (set by trash variants). */
+  sizeRange?: [number, number];
+}
+
+/**
+ * A trash room variant — pairs a mob composition with optional dig/size
+ * overrides so the room shape matches the tactical intent.
+ */
+export interface VaultTrashVariant {
+  /** Human-readable label (used for room name pool). */
+  label: string;
+  /** Mob composition for this variant. */
+  mobs: VaultMobSpawnDef[];
+  /** CA overrides — tight corridors for melee, open arenas for ranged, etc. */
+  digOverrides?: RoomDigOverrides;
+  /** Size range override — small ambush rooms vs. large killboxes. */
+  sizeRange?: [number, number];
 }
 
 /**
@@ -38,8 +57,14 @@ export interface VaultRoomDef {
 export interface VaultTierMobDefs {
   /** Mobs spawned in the ENTRY room (lighter resistance). */
   entry: VaultMobSpawnDef[];
-  /** Mobs spawned in each TRASH room. */
+  /** Mobs spawned in each TRASH room (fallback when trashVariants is absent). */
   trash: VaultMobSpawnDef[];
+  /**
+   * When present, each TRASH room cycles through these variants instead of
+   * using the flat `trash` list. Each variant can override dig params and
+   * size range so the room geometry matches the mob composition.
+   */
+  trashVariants?: VaultTrashVariant[];
   /** Mobs spawned in the SUB_BOSS room. */
   subBoss: VaultMobSpawnDef[];
   /** Mobs spawned in the BOSS room. */
@@ -112,19 +137,35 @@ export function buildRoomsFromTier(tier: number, mobDefs: VaultTierMobDefs): Vau
   // Track how many rooms of each type we've seen (for name cycling)
   const typeCounts: Record<RoomType, number> = { ENTRY: 0, TRASH: 0, SUB_BOSS: 0, BOSS: 0 };
 
+  let trashVariantIdx = 0;
+
   return types.map((type) => {
     const namePool = ROOM_NAMES[type];
-    const name = namePool[typeCounts[type] % namePool.length]!;
-    typeCounts[type]++;
-
     const isBossRoom = type === 'SUB_BOSS' || type === 'BOSS';
 
     let mobs: VaultMobSpawnDef[];
-    switch (type) {
-      case 'ENTRY':    mobs = mobDefs.entry;   break;
-      case 'TRASH':    mobs = mobDefs.trash;   break;
-      case 'SUB_BOSS': mobs = mobDefs.subBoss; break;
-      case 'BOSS':     mobs = mobDefs.boss;    break;
+    let digOverrides: RoomDigOverrides | undefined;
+    let sizeRange: [number, number] | undefined;
+    let name: string;
+
+    if (type === 'TRASH' && mobDefs.trashVariants && mobDefs.trashVariants.length > 0) {
+      // Cycle through trash variants deterministically
+      const variant = mobDefs.trashVariants[trashVariantIdx % mobDefs.trashVariants.length]!;
+      trashVariantIdx++;
+      mobs = variant.mobs;
+      digOverrides = variant.digOverrides;
+      sizeRange = variant.sizeRange;
+      name = variant.label;
+    } else {
+      name = namePool[typeCounts[type] % namePool.length]!;
+      typeCounts[type]++;
+
+      switch (type) {
+        case 'ENTRY':    mobs = mobDefs.entry;   break;
+        case 'TRASH':    mobs = mobDefs.trash;   break;
+        case 'SUB_BOSS': mobs = mobDefs.subBoss; break;
+        case 'BOSS':     mobs = mobDefs.boss;    break;
+      }
     }
 
     return {
@@ -132,6 +173,8 @@ export function buildRoomsFromTier(tier: number, mobDefs: VaultTierMobDefs): Vau
       isBossRoom,
       mobs,
       spawnPositions: { player: DEFAULT_PLAYER_SPAWNS, mob: DEFAULT_MOB_SPAWNS },
+      digOverrides,
+      sizeRange,
     };
   });
 }
@@ -142,16 +185,51 @@ const LAB_MOB_DEFS: VaultTierMobDefs = {
   entry: [
     { mobTag: 'vault.construct.drone', count: 3, levelOffset: 0, isBoss: false },
   ],
+
+  // Fallback for trash rooms when trashVariants isn't used
   trash: [
     { mobTag: 'vault.construct.drone', count: 2, levelOffset: 0, isBoss: false },
     { mobTag: 'vault.construct.sentinel', count: 1, levelOffset: 1, isBoss: false },
   ],
+
+  // ── Trash room variants — each pairs mob composition with room shape ──
+  trashVariants: [
+    {
+      // Open killbox — ranged mobs that exploit long sight-lines
+      label: 'Targeting Range',
+      mobs: [
+        { mobTag: 'vault.construct.turret',    count: 2, levelOffset: 0, isBoss: false },
+        { mobTag: 'vault.construct.drone',     count: 1, levelOffset: 0, isBoss: false },
+      ],
+      digOverrides: { wallChance: 0.28, smoothIterations: 7, minFloorRatio: 0.50 },
+      sizeRange: [30, 42],
+    },
+    {
+      // Tight ambush — melee-heavy swarm in cramped corridors
+      label: 'Collapsed Tunnels',
+      mobs: [
+        { mobTag: 'vault.construct.drone',     count: 4, levelOffset: 0, isBoss: false },
+      ],
+      digOverrides: { wallChance: 0.48, smoothIterations: 4, minFloorRatio: 0.25 },
+      sizeRange: [22, 32],
+    },
+    {
+      // Mixed patrol — balanced composition, standard room
+      label: 'Nexus Junction',
+      mobs: [
+        { mobTag: 'vault.construct.drone',     count: 2, levelOffset: 0, isBoss: false },
+        { mobTag: 'vault.construct.sentinel',  count: 1, levelOffset: 1, isBoss: false },
+      ],
+      // No overrides — uses the TRASH type defaults
+    },
+  ],
+
   subBoss: [
-    { mobTag: 'vault.construct.sentinel', count: 1, levelOffset: 1, isBoss: false },
+    { mobTag: 'vault.construct.sentinel', count: 2, levelOffset: 1, isBoss: false },
     { mobTag: 'vault.construct.overseer', count: 1, levelOffset: 2, isBoss: true },
   ],
   boss: [
-    { mobTag: 'vault.construct.drone', count: 2, levelOffset: 0, isBoss: false },
+    { mobTag: 'vault.construct.sentinel', count: 2, levelOffset: 1, isBoss: false },
     { mobTag: 'vault.construct.overlord', count: 1, levelOffset: 3, isBoss: true },
   ],
 };
@@ -180,8 +258,17 @@ export const TEST_VAULT_TEMPLATE: VaultTemplateDefinition = {
     smoothIterations: 5,
     minFloorRatio: 0.30,
     corridorWidth: 3,
-    roomSizeRange: [30, 50],
-    bossRoomSizeRange: [40, 80],
+    entryRoomSizeRange:   [20, 28],   // compact starting chamber
+    roomSizeRange:        [25, 45],   // trash rooms — wide variety
+    subBossRoomSizeRange: [32, 42],   // sub-boss — noticeably bigger
+    bossRoomSizeRange:    [36, 48],   // boss — largest, but not absurd
+    // Per-room-type cellular-automata overrides
+    roomDigOverrides: {
+      ENTRY:    { wallChance: 0.35, minFloorRatio: 0.40 }, // more open, welcoming
+      TRASH:    { wallChance: 0.42 },                       // slightly more chaotic
+      SUB_BOSS: { wallChance: 0.38, smoothIterations: 6 },  // smoother, arena-like
+      BOSS:     { wallChance: 0.32, smoothIterations: 7, minFloorRatio: 0.45 }, // open arena
+    },
     // Chain-based layout
     chain: true,
     tier: 1,

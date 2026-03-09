@@ -1,5 +1,5 @@
 import { prisma } from '../DatabaseService';
-import { StatCalculator } from '@/game/stats/StatCalculator';
+import { StatCalculator, STAT_POINTS_PER_LEVEL } from '@/game/stats/StatCalculator';
 import type { Character, Zone, Prisma } from '@prisma/client';
 
 export class CharacterService {
@@ -340,7 +340,7 @@ export class CharacterService {
     const newLevel    = Math.min(MAX_LEVEL, rawLevel);
     const levelsGained = Math.max(0, newLevel - prevLevel);
     const newAP       = char.abilityPoints + levelsGained;
-    const newSP       = (char.statPoints ?? 0) + levelsGained;
+    const newSP       = (char.statPoints ?? 0) + levelsGained * STAT_POINTS_PER_LEVEL;
 
     await prisma.character.update({
       where: { id: characterId },

@@ -327,8 +327,8 @@ export class CompanionBehaviorTree {
     this.currentTargetId = target.id;
     const dist = distance2D(context.self.position, target.position);
 
-    // Support stance uses mid range regardless of settings
-    const rangeBand = RANGE_DISTANCES.mid;
+    // Support stance stays at long range (safe distance) regardless of settings
+    const rangeBand = RANGE_DISTANCES.long;
     const m = this.manageRange(
       context.self.position,
       target.position,

@@ -78,6 +78,13 @@ export class PhysicsSystem {
   }
 
   /**
+   * Return all registered entity IDs (both dynamic and static).
+   */
+  getAllEntityIds(): string[] {
+    return [...this.entities.keys(), ...this.staticEntities.keys()];
+  }
+
+  /**
    * Update entity position and bounding volume
    */
   updateEntity(entityId: string, position: Vector3): void {

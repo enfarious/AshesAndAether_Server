@@ -71,6 +71,10 @@ export class NPCAIController {
   /** Last ability the companion used — drives casting bar on the HUD. */
   private _lastAbilityUsed: { abilityId: string; abilityName: string; timestamp: number } | null = null;
 
+  /** Weapon info for LLM context — set by DWM when equipping/registering. */
+  private _weaponRangeBand: 'close' | 'mid' | 'long' = 'close';
+  private _weaponName: string | null = null;
+
   /** Track last zone ID for zone_change social triggers. */
   private _lastZoneId: string | null = null;
 
@@ -99,6 +103,12 @@ export class NPCAIController {
   /** Whether this controller uses BYOLLM (client-side LLM). */
   get isBYOLLM(): boolean {
     return this.onTrigger !== null;
+  }
+
+  /** Update weapon info so the LLM knows what range band to prefer. */
+  setWeaponInfo(name: string | null, rangeBand: 'close' | 'mid' | 'long'): void {
+    this._weaponName = name;
+    this._weaponRangeBand = rangeBand;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -394,6 +404,8 @@ export class NPCAIController {
         fightDurationSec: (Date.now() - this.fightStartedAt) / 1000,
         triggerReason,
         playerCommand: this.pendingPlayerCommand ?? undefined,
+        weaponRangeBand: this._weaponRangeBand,
+        weaponName: this._weaponName ?? undefined,
       };
 
       const partial = await this.llmService.generateCombatSettingsUpdate(this.companion, combatCtx);

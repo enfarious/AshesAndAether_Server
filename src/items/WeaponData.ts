@@ -111,6 +111,25 @@ export function getWeaponRange(
   return best > 0 ? best : UNARMED_RANGE;
 }
 
+/**
+ * Map a weapon's effective reach to one of three combat range bands.
+ * Matches the PreferredRange tiers in CompanionCombatSettings:
+ *   close — melee striking distance  (effective reach ≤ 5 m)
+ *   mid   — polearm / short-ranged   (effective reach ≤ 10 m)
+ *   long  — ranged / caster          (effective reach > 10 m)
+ *
+ * "effectiveReach" is the raw weapon reach, NOT the full combat effective
+ * range (which adds BASE_REACH + radii). The thresholds here account for
+ * that: a spear at 2.25 m reach → ~4.25 m effective → close/mid border.
+ */
+export function getWeaponRangeBand(weaponReach: number): 'close' | 'mid' | 'long' {
+  // Polearms (halberd 2.25, spear 2.25, lance 3.0) should be "mid"
+  // Ranged weapons (sling 15+) should be "long"
+  if (weaponReach >= 10) return 'long';
+  if (weaponReach >= 2.0) return 'mid';
+  return 'close';
+}
+
 type ItemProperties = {
   weapon?: WeaponDefinition;
 };

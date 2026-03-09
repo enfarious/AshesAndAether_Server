@@ -2,6 +2,9 @@
  * Stat Calculator - Computes derived stats from core stats
  */
 
+/** Stat points awarded to both players and companions per level. */
+export const STAT_POINTS_PER_LEVEL = 5;
+
 export interface CoreStats {
   strength: number;
   vitality: number;

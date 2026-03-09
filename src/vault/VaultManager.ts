@@ -172,6 +172,11 @@ export type VaultAwardGoldFn = (
   amount: number,
 ) => Promise<void>;
 
+export type VaultRebuildCollisionFn = (
+  zoneId: string,
+  tileGrid: VaultTileGridData,
+) => void;
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const EMPTY_TIMEOUT_MS = 120_000; // 2 minutes
@@ -201,6 +206,7 @@ export class VaultManager {
     private destroyZone: VaultDestroyZoneFn,
     private ejectPlayer: VaultEjectPlayerFn,
     private awardGold: VaultAwardGoldFn,
+    private rebuildCollision: VaultRebuildCollisionFn,
   ) {}
 
   // ── Instance lifecycle ─────────────────────────────────────────────────────
@@ -256,9 +262,17 @@ export class VaultManager {
     // ── Generate tile grid if template has generation params ──────────────
     let tileGrid: VaultTileGridData | null = null;
     if (template.generation) {
+      // Inject per-room overrides from resolved room defs (e.g. trash variants)
+      const genParams = { ...template.generation };
+      const hasPerRoom = roomDefs.some(r => r.digOverrides || r.sizeRange);
+      if (hasPerRoom) {
+        genParams.perRoomDigOverrides  = roomDefs.map(r => r.digOverrides);
+        genParams.perRoomSizeOverrides = roomDefs.map(r => r.sizeRange);
+      }
+
       const widthTiles  = Math.floor(template.zoneDimensions.sizeX / TILE_SIZE);
       const heightTiles = Math.floor(template.zoneDimensions.sizeZ / TILE_SIZE);
-      tileGrid = generateVaultGrid(widthTiles, heightTiles, template.generation, instanceId);
+      tileGrid = generateVaultGrid(widthTiles, heightTiles, genParams, instanceId);
 
       // Attach 3D geometry metadata so the client can build walls + ceiling
       if (template.geometry) {
@@ -490,6 +504,9 @@ export class VaultManager {
 
     instance.gateStates[gateIdx] = true;
 
+    // Rebuild server-side wall collision from updated tile grid
+    this.rebuildCollision(instance.zoneId, instance.tileGrid);
+
     this.broadcast(instance.instanceId, recipientIds, 'vault_gate_opened', {
       instanceId: instance.instanceId,
       corridorIndex,
@@ -513,6 +530,53 @@ export class VaultManager {
     const instance = this.instances.get(instanceId);
     if (!instance) return false;
     return instance.gateStates[gateIndex] ?? false;
+  }
+
+  /**
+   * GM debug: open the next closed gate and advance to the next room.
+   * Returns a human-readable message describing what happened.
+   */
+  gmOpenNextGate(characterId: string): string {
+    const instanceId = this.characterToInstance.get(characterId);
+    if (!instanceId) return 'Not in a vault.';
+
+    const instance = this.instances.get(instanceId);
+    if (!instance) return 'Vault instance not found.';
+    if (!instance.tileGrid?.gates || instance.tileGrid.gates.length === 0) {
+      return 'This vault has no gates.';
+    }
+
+    // Find the first closed gate
+    const gateIdx = instance.gateStates.findIndex(open => !open);
+    if (gateIdx === -1) return 'All gates are already open.';
+
+    const gate = instance.tileGrid.gates[gateIdx]!;
+    const allIds = this.getOnlineParticipantIds(instance);
+
+    // Mark current room as cleared (so progression logic stays consistent)
+    const room = instance.rooms[instance.currentRoom];
+    if (room && !room.cleared) {
+      room.activeMobIds.clear();
+      room.cleared = true;
+
+      this.broadcast(instance.instanceId, allIds, 'vault_room_cleared', {
+        instanceId: instance.instanceId,
+        roomIndex: instance.currentRoom,
+        roomName: room.name,
+        message: `[GM] ${room.name} cleared!`,
+      });
+    }
+
+    // Open the gate
+    this.tryOpenGate(instance, gate.corridorIndex, allIds);
+
+    // Advance to next room and spawn it
+    const nextRoomIndex = instance.currentRoom + 1;
+    if (nextRoomIndex < instance.rooms.length) {
+      void this.spawnRoom(instance.instanceId, nextRoomIndex);
+    }
+
+    return `[GM] Gate ${gateIdx + 1}/${instance.tileGrid.gates.length} opened (corridor ${gate.corridorIndex}).`;
   }
 
   // ── Completion / Failure ────────────────────────────────────────────────────

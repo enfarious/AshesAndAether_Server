@@ -7,14 +7,19 @@
  */
 
 // ── Range bands (meters from target) ────────────────────────────────────────
+//
+// Three clear tiers so the LLM never confuses "close" with "not-quite-melee":
+//   close — melee striking distance (~1 m).  Swords, axes, fists.
+//   mid   — polearm / short-ranged distance (~4 m).  Spears, halberds, lances.
+//   long  — ranged / caster distance (~15 m).  Bows, guns, spells.
+//
 
-export type PreferredRange = 'melee' | 'close' | 'mid' | 'far';
+export type PreferredRange = 'close' | 'mid' | 'long';
 
 export const RANGE_DISTANCES: Record<PreferredRange, { min: number; ideal: number; max: number }> = {
-  melee: { min: 0, ideal: 2.5, max: 3.5 },
-  close: { min: 3, ideal: 5, max: 8 },
-  mid:   { min: 8, ideal: 15, max: 20 },
-  far:   { min: 20, ideal: 30, max: 40 },
+  close: { min: 0, ideal: 1,  max: 3   },   // melee weapons — get right on top of them
+  mid:   { min: 2, ideal: 4,  max: 6   },   // polearms / short-range — arms-length gap
+  long:  { min: 8, ideal: 15, max: 20  },   // ranged weapons & spells
 };
 
 // ── Target priority ─────────────────────────────────────────────────────────
@@ -101,7 +106,7 @@ export type CompanionArchetype = 'scrappy_fighter' | 'cautious_healer' | 'opport
  */
 export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettings> = {
   scrappy_fighter: {
-    preferredRange: 'melee',
+    preferredRange: 'close',
     priority: 'nearest',
     stance: 'aggressive',
     abilityWeights: { damage: 0.8, cc: 0.3, heal: 0.1 },
@@ -120,7 +125,7 @@ export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettin
     defensiveThreshold: 0.2,
   },
   cautious_healer: {
-    preferredRange: 'mid',
+    preferredRange: 'long',
     priority: 'threatening_player',
     stance: 'support',
     abilityWeights: { heal: 0.8, damage: 0.2, cc: 0.4 },
@@ -158,7 +163,7 @@ export const BASELINE_SETTINGS: Record<CompanionArchetype, CompanionCombatSettin
     defensiveThreshold: 0.4,
   },
   tank: {
-    preferredRange: 'melee',
+    preferredRange: 'close',
     priority: 'threatening_player',
     stance: 'aggressive',
     abilityWeights: { cc: 0.7, damage: 0.5, heal: 0.2 },

@@ -21,7 +21,7 @@ export function setVaultManager(manager: VaultManager): void {
   _vaultManager = manager;
 }
 
-function getManager(): VaultManager {
+export function getVaultManager(): VaultManager {
   if (!_vaultManager) {
     throw new Error('VaultManager not initialized. Call setVaultManager() at startup.');
   }
@@ -52,7 +52,7 @@ export const vaultCommand: CommandDefinition = {
   },
 
   handler: async (context, args) => {
-    const manager = getManager();
+    const manager = getVaultManager();
     const sub = (args.positionalArgs[0] ?? '').toLowerCase();
 
     try {
